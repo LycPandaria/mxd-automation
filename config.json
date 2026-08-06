@@ -1,0 +1,36 @@
+{
+  "window_title": "Navicat Premium",
+  "model_path": "",
+  "confidence": 0.5,
+  "monster_classes": "monster",
+  "fps": 13,
+  "hp_key": "f",
+  "hp_threshold": 0.5,
+  "hp_region": null,
+  "hp_color": [
+    255,
+    0,
+    0
+  ],
+  "hp_tolerance": 20,
+  "target_key": "tab",
+  "skills": [
+    {
+      "name": "技能1",
+      "key": "1",
+      "cooldown": 1.0
+    },
+    {
+      "name": "技能2",
+      "key": "2",
+      "cooldown": 3.0
+    },
+    {
+      "name": "技能3",
+      "key": "3",
+      "cooldown": 8.0
+    }
+  ],
+  "move_to_monster": false,
+  "start_stop_hotkey": "f12"
+}
