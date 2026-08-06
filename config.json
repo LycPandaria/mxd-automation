@@ -1,5 +1,5 @@
 {
-  "window_title": "图色脚本_百度搜索 - Google Chrome",
+  "window_title": "opreation_01.jpg (670×521) - Google Chrome",
   "model_path": "",
   "confidence": 0.5,
   "monster_classes": "monster",
@@ -13,6 +13,15 @@
     0
   ],
   "hp_tolerance": 20,
+  "mp_key": "g",
+  "mp_threshold": 0.3,
+  "mp_region": null,
+  "mp_color": [
+    0,
+    120,
+    255
+  ],
+  "mp_tolerance": 20,
   "target_key": "tab",
   "skills": [
     {

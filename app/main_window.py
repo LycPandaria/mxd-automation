@@ -113,29 +113,45 @@ class ColorPickerOverlay(QWidget):
         self.setWindowFlags(
             Qt.FramelessWindowHint | Qt.WindowStaysOnTopHint | Qt.Tool
         )
-        self.setAttribute(Qt.WA_TranslucentBackground, True)
+        self.setWindowState(Qt.WindowFullScreen)
         self.setCursor(Qt.CrossCursor)
+        self.setMouseTracking(True)
+        self.setAttribute(Qt.WA_TranslucentBackground, True)
 
-        # 获取整个虚拟桌面（多显示器支持）
-        screen = QApplication.primaryScreen().virtualGeometry()
-        self.setGeometry(screen)
+        self._mag_size = 150
+        self._last_pixel = None  # 缓存上次像素颜色
 
-        self._mag_size = 150  # 放大镜尺寸
+        # 用 QTimer 节流放大镜更新（30fps），避免 paintEvent 卡顿
+        self._timer = QTimer(self)
+        self._timer.setInterval(33)
+        self._timer.timeout.connect(self._tick)
+
+    def showEvent(self, event):
+        super().showEvent(event)
+        self.grabMouse()
+        self.setFocus()
+        self.setFocusPolicy(Qt.StrongFocus)
+        self._timer.start()
+
+    def closeEvent(self, event):
+        self._timer.stop()
+        self.releaseMouse()
+        super().closeEvent(event)
+
+    def _tick(self):
+        """定时器回调：刷新放大镜区域。"""
+        self.update()
 
     def keyPressEvent(self, event):
         if event.key() == Qt.Key_Escape:
             self.cancelled.emit()
             self.close()
 
-    def mouseMoveEvent(self, event):
-        # 实时更新
-        self.update()
-
     def mousePressEvent(self, event):
         if event.button() == Qt.LeftButton:
-            global_pos = self.mapToGlobal(event.pos())
+            gp = event.globalPos()
             try:
-                r, g, b = self._get_pixel_color(global_pos.x(), global_pos.y())
+                r, g, b = self._get_pixel_color(gp.x(), gp.y())
                 self.color_picked.emit(r, g, b)
             except Exception:
                 self.cancelled.emit()
@@ -143,61 +159,63 @@ class ColorPickerOverlay(QWidget):
 
     def paintEvent(self, event):
         painter = QPainter(self)
-        painter.fillRect(self.rect(), QColor(0, 0, 0, 30))
+        # 半透明黑色背景
+        painter.fillRect(self.rect(), QColor(0, 0, 0, 80))
 
-        # 获取全局鼠标位置
-        cursor_pos = QCursor.pos()
-        local_pos = self.mapFromGlobal(cursor_pos)
+        cursor_pos = self.mapFromGlobal(QCursor.pos())
 
-        # 绘制放大镜
-        self._draw_magnifier(painter, local_pos)
+        # 放大镜
+        self._draw_magnifier(painter, cursor_pos)
 
-        # 绘制十字准星
-        painter.setPen(QPen(QColor(255, 255, 0), 1))
-        cx, cy = local_pos.x(), local_pos.y()
-        painter.drawLine(cx - 20, cy, cx - 5, cy)
-        painter.drawLine(cx + 5, cy, cx + 20, cy)
-        painter.drawLine(cx, cy - 20, cx, cy - 5)
-        painter.drawLine(cx, cy + 5, cx, cy + 20)
+        # 十字准星
+        painter.setPen(QPen(QColor(255, 255, 0), 2))
+        cx, cy = cursor_pos.x(), cursor_pos.y()
+        painter.drawLine(cx - 25, cy, cx - 6, cy)
+        painter.drawLine(cx + 6, cy, cx + 25, cy)
+        painter.drawLine(cx, cy - 25, cx, cy - 6)
+        painter.drawLine(cx, cy + 6, cx, cy + 25)
 
-        # 显示提示文本
+        # 准星中心点
+        painter.setBrush(QColor(255, 0, 0))
+        painter.drawEllipse(cx - 2, cy - 2, 4, 4)
+
+        # 顶部提示
         painter.setPen(QPen(QColor(255, 255, 255)))
         font = painter.font()
-        font.setPointSize(10)
+        font.setPointSize(11)
+        font.setBold(True)
         painter.setFont(font)
-        painter.drawText(10, 20, "点击鼠标取色 | ESC 取消")
+        painter.drawText(20, 30, "点击鼠标取色  |  ESC 取消")
 
-        # 显示当前 RGB 值
-        try:
-            r, g, b = self._get_pixel_color(cursor_pos.x(), cursor_pos.y())
-            color_text = f"RGB: ({r}, {g}, {b}) | #{r:02X}{g:02X}{b:02X}"
-            painter.drawText(10, self.height() - 10, color_text)
-        except Exception:
-            pass
+        # 底部 RGB 信息（使用缓存颜色，避免每次 paintEvent 都调用 pixel()）
+        if self._last_pixel:
+            r, g, b = self._last_pixel
+            font.setBold(False)
+            font.setPointSize(10)
+            painter.setFont(font)
+            gp = QCursor.pos()
+            color_text = f"RGB: ({r}, {g}, {b})    HEX: #{r:02X}{g:02X}{b:02X}    坐标: ({gp.x()}, {gp.y()})"
+            painter.drawText(20, self.height() - 20, color_text)
 
     def _draw_magnifier(self, painter, local_pos):
-        """在鼠标旁边绘制放大镜效果。"""
-        global_pos = self.mapToGlobal(local_pos)
+        """在鼠标旁边绘制放大镜。"""
+        gp = QCursor.pos()
+        size = 20
 
-        # 获取 15x15 像素的小区域
-        size = 15
         try:
-            from PIL import Image
-            import io
             img = ImageGrab.grab(bbox=(
-                global_pos.x() - size // 2,
-                global_pos.y() - size // 2,
-                global_pos.x() + size // 2,
-                global_pos.y() + size // 2,
+                gp.x() - size // 2,
+                gp.y() - size // 2,
+                gp.x() + size // 2,
+                gp.y() + size // 2,
             ))
+            # 同时更新缓存颜色
+            arr = np.array(img)
+            center = arr[arr.shape[0] // 2, arr.shape[1] // 2]
+            self._last_pixel = (int(center[0]), int(center[1]), int(center[2]))
         except Exception:
             return
 
-        # 放大显示
-        from PyQt5.QtGui import QPixmap, QImage
-        import numpy as np
-
-        arr = np.array(img)
         h, w = arr.shape[:2]
         qimg = QImage(arr.tobytes(), w, h, w * 3, QImage.Format_RGB888)
         pixmap = QPixmap.fromImage(qimg).scaled(
@@ -205,36 +223,35 @@ class ColorPickerOverlay(QWidget):
             Qt.KeepAspectRatio, Qt.FastTransformation
         )
 
-        # 绘制位置（鼠标右侧）
-        mag_x = local_pos.x() + 20
-        mag_y = local_pos.y() + 20
+        # 放大镜显示位置（鼠标右下侧）
+        margin = 30
+        mag_x = local_pos.x() + margin
+        mag_y = local_pos.y() + margin
 
-        # 边界检查
+        # 如果超出右/下边界，放到左上
         if mag_x + self._mag_size > self.width():
-            mag_x = local_pos.x() - self._mag_size - 20
+            mag_x = local_pos.x() - self._mag_size - margin
         if mag_y + self._mag_size > self.height():
-            mag_y = local_pos.y() - self._mag_size - 20
+            mag_y = local_pos.y() - self._mag_size - margin
 
-        # 绘制放大镜背景
-        painter.setPen(QPen(QColor(255, 255, 255), 2))
+        # 白色外边框
+        painter.setPen(QPen(QColor(255, 255, 255), 3))
         painter.setBrush(QColor(0, 0, 0))
         painter.drawEllipse(mag_x, mag_y, self._mag_size, self._mag_size)
 
-        # 绘制放大的图像
-        painter.setClipRegion(
-            QPainterPath().addEllipse(
-                mag_x, mag_y, self._mag_size, self._mag_size
-            )
-        )
+        # 圆形裁剪后绘制放大图像
+        path = QPainterPath()
+        path.addEllipse(mag_x, mag_y, self._mag_size, self._mag_size)
+        painter.setClipPath(path)
         painter.drawPixmap(mag_x, mag_y, pixmap)
         painter.setClipping(False)
 
-        # 绘制中心标记
+        # 中心十字标记
         center_x = mag_x + self._mag_size // 2
         center_y = mag_y + self._mag_size // 2
         painter.setPen(QPen(QColor(255, 0, 0), 2))
-        painter.drawLine(center_x - 5, center_y, center_x + 5, center_y)
-        painter.drawLine(center_x, center_y - 5, center_x, center_y + 5)
+        painter.drawLine(center_x - 8, center_y, center_x + 8, center_y)
+        painter.drawLine(center_x, center_y - 8, center_x, center_y + 8)
 
     @staticmethod
     def _get_pixel_color(x, y):
@@ -423,10 +440,6 @@ class MainWindow(QMainWindow):
         h.addWidget(self.hp_thr_spin)
 
         h.addWidget(QLabel("颜色:"))
-        self.hp_color_btn = QPushButton("  屏幕取色  ")
-        self.hp_color_btn.setFixedWidth(85)
-        self.hp_color_btn.clicked.connect(lambda: self._start_color_picker("hp"))
-        h.addWidget(self.hp_color_btn)
         self.hp_swatch = QLabel()
         self.hp_swatch.setFixedSize(24, 24)
         self.hp_swatch.setStyleSheet("background-color: rgb(255,0,0); border:1px solid #333;")
@@ -457,10 +470,6 @@ class MainWindow(QMainWindow):
         h.addWidget(self.mp_thr_spin)
 
         h.addWidget(QLabel("颜色:"))
-        self.mp_color_btn = QPushButton("  屏幕取色  ")
-        self.mp_color_btn.setFixedWidth(85)
-        self.mp_color_btn.clicked.connect(lambda: self._start_color_picker("mp"))
-        h.addWidget(self.mp_color_btn)
         self.mp_swatch = QLabel()
         self.mp_swatch.setFixedSize(24, 24)
         self.mp_swatch.setStyleSheet("background-color: rgb(0,120,255); border:1px solid #333;")
@@ -630,12 +639,17 @@ class MainWindow(QMainWindow):
 
     def _start_color_picker(self, target):
         """启动屏幕拾色器，点击后获取颜色。"""
-        self.hide()  # 隐藏主窗口，避免遮挡
         self._color_target = target
+        # 不传 parent，作为独立窗口显示，避免被主窗口遮挡
         self._color_picker = ColorPickerOverlay()
         self._color_picker.color_picked.connect(self._on_color_picked)
-        self._color_picker.cancelled.connect(lambda: self.showNormal())
-        self._color_picker.show()
+        self._color_picker.cancelled.connect(self._on_color_pick_cancelled)
+        self._color_picker.showFullScreen()
+
+    def _on_color_pick_cancelled(self):
+        self.showNormal()
+        self.activateWindow()
+        self.raise_()
 
     def _on_color_picked(self, r, g, b):
         color = [r, g, b]
@@ -648,6 +662,7 @@ class MainWindow(QMainWindow):
         self._log(f"[取色] {self._color_target.upper()} 颜色已设置为 RGB({r},{g},{b})")
         self.showNormal()
         self.activateWindow()
+        self.raise_()
 
     @staticmethod
     def _set_swatch(swatch, rgb):
@@ -659,11 +674,54 @@ class MainWindow(QMainWindow):
         if target == "mp":
             self.config.mp_region = [x, y, w, h]
             self.mp_region_label.setText(f"{x},{y} {w}x{h}")
-            self._log(f"[蓝量] 蓝条区域已设置: ({x},{y}) {w}x{h}")
+            # 自动识别颜色
+            color = self._detect_region_color(x, y, w, h)
+            if color:
+                self.config.mp_color = color
+                self._set_swatch(self.mp_swatch, color)
+                self._log(f"[蓝量] 区域已设置: ({x},{y}) {w}x{h} | 自动识别颜色: RGB{tuple(color)}")
+            else:
+                self._log(f"[蓝量] 区域已设置: ({x},{y}) {w}x{h} | 颜色识别失败")
         else:
             self.config.hp_region = [x, y, w, h]
             self.hp_region_label.setText(f"{x},{y} {w}x{h}")
-            self._log(f"[血量] 血条区域已设置: ({x},{y}) {w}x{h}")
+            # 自动识别颜色
+            color = self._detect_region_color(x, y, w, h)
+            if color:
+                self.config.hp_color = color
+                self._set_swatch(self.hp_swatch, color)
+                self._log(f"[血量] 区域已设置: ({x},{y}) {w}x{h} | 自动识别颜色: RGB{tuple(color)}")
+            else:
+                self._log(f"[血量] 区域已设置: ({x},{y}) {w}x{h} | 颜色识别失败")
+
+    @staticmethod
+    def _detect_region_color(x, y, w, h):
+        """截取指定区域并识别主颜色（取中间行像素的平均 RGB）。"""
+        try:
+            from PIL import ImageGrab
+            import numpy as np
+            # 截取区域
+            img = ImageGrab.grab(bbox=(x, y, x + w, y + h))
+            arr = np.array(img)  # RGB
+            
+            # 取中间行的所有像素
+            mid_row = arr[arr.shape[0] // 2, :, :]  # shape: (w, 3)
+            
+            # 计算平均颜色（排除接近黑色的背景像素）
+            # 血条/蓝条中间行应该大部分是彩色像素，黑色是背景
+            pixels = mid_row.reshape(-1, 3)
+            # 只考虑亮度大于 30 的像素（排除黑色背景）
+            mask = np.mean(pixels, axis=1) > 30
+            if mask.sum() > 0:
+                valid_pixels = pixels[mask]
+            else:
+                valid_pixels = pixels
+            
+            # 计算平均颜色
+            avg_color = np.mean(valid_pixels, axis=0).astype(int)
+            return [int(avg_color[0]), int(avg_color[1]), int(avg_color[2])]
+        except Exception:
+            return None
 
     def _toggle_run(self):
         if self.automation.running:
