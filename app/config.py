@@ -23,6 +23,13 @@ class Config:
     hp_color: List[int] = field(default_factory=lambda: [255, 0, 0])  # RGB
     hp_tolerance: int = 20
 
+    # ---- 蓝量 ----
+    mp_key: str = "g"
+    mp_threshold: float = 0.3          # MP 比例低于此值则加蓝
+    mp_region: Optional[List[int]] = None  # [x, y, w, h] 窗口内坐标
+    mp_color: List[int] = field(default_factory=lambda: [0, 120, 255])  # RGB
+    mp_tolerance: int = 20
+
     # ---- 战斗 ----
     target_key: str = "tab"            # 选中目标按键
     skills: List[dict] = field(default_factory=lambda: [
