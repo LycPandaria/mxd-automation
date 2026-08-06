@@ -86,28 +86,28 @@ def create_detector(model_path: str, conf: float = 0.5,
     return MockDetector()
 
 
-def detect_hp_ratio(frame: np.ndarray, hp_region, hp_color, tolerance=20) -> Optional[float]:
-    """通过颜色检测血条剩余比例。
+def detect_bar_ratio(frame: np.ndarray, region, color, tolerance=20) -> Optional[float]:
+    """通过颜色检测血/蓝条剩余比例（通用）。
 
     Args:
         frame: 窗口截图 BGR
-        hp_region: (x, y, w, h) 血条在窗口内的区域，None 表示不检测
-        hp_color: (r, g, b) 血条颜色（RGB）
+        region: (x, y, w, h) 条在窗口内的区域，None 表示不检测
+        color: (r, g, b) 条颜色（RGB）
         tolerance: 颜色容差
 
     Returns:
-        0.0-1.0 血量比例；None 表示未配置/无法检测
+        0.0-1.0 剩余比例；None 表示未配置/无法检测
     """
-    if not hp_region or frame is None:
+    if not region or frame is None:
         return None
-    x, y, w, h = hp_region
+    x, y, w, h = region
     if w <= 0 or h <= 0:
         return None
     roi = frame[y:y + h, x:x + w]
     if roi.size == 0:
         return None
-    # frame 是 BGR，hp_color 传的是 RGB
-    target = np.array([hp_color[2], hp_color[1], hp_color[0]], dtype=np.int16)
+    # frame 是 BGR，color 传的是 RGB
+    target = np.array([color[2], color[1], color[0]], dtype=np.int16)
     diff = np.abs(roi.astype(np.int16) - target)
     mask = np.all(diff <= tolerance, axis=2)
     cols = np.where(mask.any(axis=0))[0]

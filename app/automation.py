@@ -6,7 +6,7 @@ import time
 import threading
 
 from .window_capture import WindowCapture
-from .detector import Detector, detect_hp_ratio
+from .detector import Detector, detect_bar_ratio
 from .controller import Controller
 from .config import Config
 
@@ -93,17 +93,24 @@ class Automation:
                         if d.cls_name in self._monster_classes()]
 
             # HP 检测
-            hp_ratio = detect_hp_ratio(
+            hp_ratio = detect_bar_ratio(
                 frame, self.config.hp_region,
                 tuple(self.config.hp_color) if self.config.hp_color else None,
                 self.config.hp_tolerance,
             )
 
+            # MP 检测
+            mp_ratio = detect_bar_ratio(
+                frame, self.config.mp_region,
+                tuple(self.config.mp_color) if self.config.mp_color else None,
+                self.config.mp_tolerance,
+            )
+
             # 决策与执行
-            self._decide(monsters, hp_ratio)
+            self._decide(monsters, hp_ratio, mp_ratio)
 
             # 预览回调
-            self.on_frame(frame, detections, hp_ratio)
+            self.on_frame(frame, detections, hp_ratio, mp_ratio)
 
             # 控制 FPS
             elapsed = time.time() - t0
@@ -113,7 +120,7 @@ class Automation:
     def _monster_classes(self):
         return [c.strip() for c in self.config.monster_classes.split(",") if c.strip()]
 
-    def _decide(self, monsters, hp_ratio):
+    def _decide(self, monsters, hp_ratio, mp_ratio):
         # 1) 没血优先加血
         if hp_ratio is not None and hp_ratio < self.config.hp_threshold:
             if self.controller.press_key(self.config.hp_key, cooldown=1.5):
@@ -123,7 +130,16 @@ class Automation:
                 )
                 return
 
-        # 2) 检测到怪物
+        # 2) 没蓝加蓝
+        if mp_ratio is not None and mp_ratio < self.config.mp_threshold:
+            if self.controller.press_key(self.config.mp_key, cooldown=1.5):
+                self.on_log(
+                    f"[加蓝] MP={mp_ratio:.0%} < {self.config.mp_threshold:.0%}，"
+                    f"按下 {self.config.mp_key}"
+                )
+                return
+
+        # 3) 检测到怪物
         if monsters:
             target = max(monsters, key=lambda d: d.w * d.h)
             cx, cy = target.center
