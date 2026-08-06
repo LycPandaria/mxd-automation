@@ -15,7 +15,7 @@ from PyQt5.QtWidgets import (
     QMessageBox, QSplitter, QAbstractItemView, QSpinBox,
 )
 from PyQt5.QtCore import Qt, QTimer, pyqtSignal, QRect
-from PyQt5.QtGui import QImage, QPixmap
+from PyQt5.QtGui import QImage, QPixmap, QColor, QPainterPath, QCursor
 
 from .config import load_config, save_config, config_path
 from .detector import create_detector
@@ -100,6 +100,148 @@ class PreviewLabel(QLabel):
         fw_sel = int(inter.width() * sx)
         fh_sel = int(inter.height() * sy)
         self.region_selected.emit(self._select_target, fx, fy, fw_sel, fh_sel)
+
+
+class ColorPickerOverlay(QWidget):
+    """全屏屏幕拾色器：点击任意位置获取该像素颜色。"""
+
+    color_picked = pyqtSignal(int, int, int)  # r, g, b
+    cancelled = pyqtSignal()
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setWindowFlags(
+            Qt.FramelessWindowHint | Qt.WindowStaysOnTopHint | Qt.Tool
+        )
+        self.setAttribute(Qt.WA_TranslucentBackground, True)
+        self.setCursor(Qt.CrossCursor)
+
+        # 获取整个虚拟桌面（多显示器支持）
+        screen = QApplication.primaryScreen().virtualGeometry()
+        self.setGeometry(screen)
+
+        self._mag_size = 150  # 放大镜尺寸
+
+    def keyPressEvent(self, event):
+        if event.key() == Qt.Key_Escape:
+            self.cancelled.emit()
+            self.close()
+
+    def mouseMoveEvent(self, event):
+        # 实时更新
+        self.update()
+
+    def mousePressEvent(self, event):
+        if event.button() == Qt.LeftButton:
+            global_pos = self.mapToGlobal(event.pos())
+            try:
+                r, g, b = self._get_pixel_color(global_pos.x(), global_pos.y())
+                self.color_picked.emit(r, g, b)
+            except Exception:
+                self.cancelled.emit()
+            self.close()
+
+    def paintEvent(self, event):
+        painter = QPainter(self)
+        painter.fillRect(self.rect(), QColor(0, 0, 0, 30))
+
+        # 获取全局鼠标位置
+        cursor_pos = QCursor.pos()
+        local_pos = self.mapFromGlobal(cursor_pos)
+
+        # 绘制放大镜
+        self._draw_magnifier(painter, local_pos)
+
+        # 绘制十字准星
+        painter.setPen(QPen(QColor(255, 255, 0), 1))
+        cx, cy = local_pos.x(), local_pos.y()
+        painter.drawLine(cx - 20, cy, cx - 5, cy)
+        painter.drawLine(cx + 5, cy, cx + 20, cy)
+        painter.drawLine(cx, cy - 20, cx, cy - 5)
+        painter.drawLine(cx, cy + 5, cx, cy + 20)
+
+        # 显示提示文本
+        painter.setPen(QPen(QColor(255, 255, 255)))
+        font = painter.font()
+        font.setPointSize(10)
+        painter.setFont(font)
+        painter.drawText(10, 20, "点击鼠标取色 | ESC 取消")
+
+        # 显示当前 RGB 值
+        try:
+            r, g, b = self._get_pixel_color(cursor_pos.x(), cursor_pos.y())
+            color_text = f"RGB: ({r}, {g}, {b}) | #{r:02X}{g:02X}{b:02X}"
+            painter.drawText(10, self.height() - 10, color_text)
+        except Exception:
+            pass
+
+    def _draw_magnifier(self, painter, local_pos):
+        """在鼠标旁边绘制放大镜效果。"""
+        global_pos = self.mapToGlobal(local_pos)
+
+        # 获取 15x15 像素的小区域
+        size = 15
+        try:
+            from PIL import Image
+            import io
+            img = ImageGrab.grab(bbox=(
+                global_pos.x() - size // 2,
+                global_pos.y() - size // 2,
+                global_pos.x() + size // 2,
+                global_pos.y() + size // 2,
+            ))
+        except Exception:
+            return
+
+        # 放大显示
+        from PyQt5.QtGui import QPixmap, QImage
+        import numpy as np
+
+        arr = np.array(img)
+        h, w = arr.shape[:2]
+        qimg = QImage(arr.tobytes(), w, h, w * 3, QImage.Format_RGB888)
+        pixmap = QPixmap.fromImage(qimg).scaled(
+            self._mag_size, self._mag_size,
+            Qt.KeepAspectRatio, Qt.FastTransformation
+        )
+
+        # 绘制位置（鼠标右侧）
+        mag_x = local_pos.x() + 20
+        mag_y = local_pos.y() + 20
+
+        # 边界检查
+        if mag_x + self._mag_size > self.width():
+            mag_x = local_pos.x() - self._mag_size - 20
+        if mag_y + self._mag_size > self.height():
+            mag_y = local_pos.y() - self._mag_size - 20
+
+        # 绘制放大镜背景
+        painter.setPen(QPen(QColor(255, 255, 255), 2))
+        painter.setBrush(QColor(0, 0, 0))
+        painter.drawEllipse(mag_x, mag_y, self._mag_size, self._mag_size)
+
+        # 绘制放大的图像
+        painter.setClipRegion(
+            QPainterPath().addEllipse(
+                mag_x, mag_y, self._mag_size, self._mag_size
+            )
+        )
+        painter.drawPixmap(mag_x, mag_y, pixmap)
+        painter.setClipping(False)
+
+        # 绘制中心标记
+        center_x = mag_x + self._mag_size // 2
+        center_y = mag_y + self._mag_size // 2
+        painter.setPen(QPen(QColor(255, 0, 0), 2))
+        painter.drawLine(center_x - 5, center_y, center_x + 5, center_y)
+        painter.drawLine(center_x, center_y - 5, center_x, center_y + 5)
+
+    @staticmethod
+    def _get_pixel_color(x, y):
+        """获取指定屏幕坐标的像素颜色。"""
+        import pyautogui
+        pixel = pyautogui.pixel(x, y)
+        return pixel.red, pixel.green, pixel.blue
 
 
 class MainWindow(QMainWindow):
@@ -266,80 +408,70 @@ class MainWindow(QMainWindow):
 
     def _build_hp_group(self):
         box = QGroupBox("血量设置")
-        g = QGridLayout(box)
-        g.addWidget(QLabel("加血按键:"), 0, 0)
+        h = QHBoxLayout(box)
+        h.addWidget(QLabel("按键:"))
         self.hp_key_edit = QLineEdit()
-        self.hp_key_edit.setPlaceholderText("如 f 或 4")
-        g.addWidget(self.hp_key_edit, 0, 1)
+        self.hp_key_edit.setFixedWidth(50)
+        self.hp_key_edit.setPlaceholderText("f")
+        h.addWidget(self.hp_key_edit)
 
-        g.addWidget(QLabel("加血阈值:"), 1, 0)
-        self.hp_thr_slider = QSlider(Qt.Horizontal)
-        self.hp_thr_slider.setRange(0, 100)
-        self.hp_thr_slider.setValue(50)
-        self.hp_thr_slider.valueChanged.connect(
-            lambda v: self.hp_thr_label.setText(f"{v}%")
-        )
-        self.hp_thr_label = QLabel("50%")
-        self.hp_thr_label.setMinimumWidth(40)
-        g.addWidget(self.hp_thr_slider, 1, 1)
-        g.addWidget(self.hp_thr_label, 1, 2)
+        h.addWidget(QLabel("阈值%:"))
+        self.hp_thr_spin = QSpinBox()
+        self.hp_thr_spin.setRange(0, 100)
+        self.hp_thr_spin.setValue(50)
+        self.hp_thr_spin.setFixedWidth(55)
+        h.addWidget(self.hp_thr_spin)
 
-        g.addWidget(QLabel("血条颜色RGB:"), 2, 0)
-        hp_color_row = QHBoxLayout()
-        self.hp_color_edit = QLineEdit("255,0,0")
-        self.hp_color_edit.setFixedWidth(90)
-        hp_color_row.addWidget(self.hp_color_edit)
+        h.addWidget(QLabel("颜色:"))
+        self.hp_color_btn = QPushButton("  屏幕取色  ")
+        self.hp_color_btn.setFixedWidth(85)
+        self.hp_color_btn.clicked.connect(lambda: self._start_color_picker("hp"))
+        h.addWidget(self.hp_color_btn)
         self.hp_swatch = QLabel()
         self.hp_swatch.setFixedSize(24, 24)
         self.hp_swatch.setStyleSheet("background-color: rgb(255,0,0); border:1px solid #333;")
-        hp_color_row.addWidget(self.hp_swatch)
-        self.hp_color_edit.editingFinished.connect(self._update_hp_swatch)
-        hp_color_row.addStretch()
-        g.addLayout(hp_color_row, 2, 1, 1, 2)
+        h.addWidget(self.hp_swatch)
 
-        g.addWidget(QLabel("血条区域:"), 3, 0)
-        self.hp_region_label = QLabel("未设置 (点击左下「框选血条区域」后在预览上拖选)")
-        self.hp_region_label.setWordWrap(True)
-        g.addWidget(self.hp_region_label, 3, 1, 1, 2)
+        h.addWidget(QLabel("区域:"))
+        self.hp_region_label = QLabel("未设置")
+        self.hp_region_label.setMinimumWidth(60)
+        h.addWidget(self.hp_region_label)
+
+        h.addStretch()
         return box
 
     def _build_mp_group(self):
         box = QGroupBox("蓝量设置")
-        g = QGridLayout(box)
-        g.addWidget(QLabel("加蓝按键:"), 0, 0)
+        h = QHBoxLayout(box)
+        h.addWidget(QLabel("按键:"))
         self.mp_key_edit = QLineEdit()
-        self.mp_key_edit.setPlaceholderText("如 g 或 5")
-        g.addWidget(self.mp_key_edit, 0, 1)
+        self.mp_key_edit.setFixedWidth(50)
+        self.mp_key_edit.setPlaceholderText("g")
+        h.addWidget(self.mp_key_edit)
 
-        g.addWidget(QLabel("加蓝阈值:"), 1, 0)
-        self.mp_thr_slider = QSlider(Qt.Horizontal)
-        self.mp_thr_slider.setRange(0, 100)
-        self.mp_thr_slider.setValue(30)
-        self.mp_thr_slider.valueChanged.connect(
-            lambda v: self.mp_thr_label.setText(f"{v}%")
-        )
-        self.mp_thr_label = QLabel("30%")
-        self.mp_thr_label.setMinimumWidth(40)
-        g.addWidget(self.mp_thr_slider, 1, 1)
-        g.addWidget(self.mp_thr_label, 1, 2)
+        h.addWidget(QLabel("阈值%:"))
+        self.mp_thr_spin = QSpinBox()
+        self.mp_thr_spin.setRange(0, 100)
+        self.mp_thr_spin.setValue(30)
+        self.mp_thr_spin.setFixedWidth(55)
+        h.addWidget(self.mp_thr_spin)
 
-        g.addWidget(QLabel("蓝条颜色RGB:"), 2, 0)
-        mp_color_row = QHBoxLayout()
-        self.mp_color_edit = QLineEdit("0,120,255")
-        self.mp_color_edit.setFixedWidth(90)
-        mp_color_row.addWidget(self.mp_color_edit)
+        h.addWidget(QLabel("颜色:"))
+        self.mp_color_btn = QPushButton("  屏幕取色  ")
+        self.mp_color_btn.setFixedWidth(85)
+        self.mp_color_btn.clicked.connect(lambda: self._start_color_picker("mp"))
+        h.addWidget(self.mp_color_btn)
         self.mp_swatch = QLabel()
         self.mp_swatch.setFixedSize(24, 24)
         self.mp_swatch.setStyleSheet("background-color: rgb(0,120,255); border:1px solid #333;")
-        mp_color_row.addWidget(self.mp_swatch)
-        self.mp_color_edit.editingFinished.connect(self._update_mp_swatch)
-        mp_color_row.addStretch()
-        g.addLayout(mp_color_row, 2, 1, 1, 2)
+        h.addWidget(self.mp_swatch)
 
-        g.addWidget(QLabel("蓝条区域:"), 3, 0)
-        self.mp_region_label = QLabel("未设置 (点击左下「框选蓝条区域」后在预览上拖选)")
-        self.mp_region_label.setWordWrap(True)
-        g.addWidget(self.mp_region_label, 3, 1, 1, 2)
+        h.addWidget(QLabel("区域:"))
+        self.mp_region_label = QLabel("未设置")
+        self.mp_region_label.setMinimumWidth(60)
+        h.addWidget(self.mp_region_label)
+
+        h.addStretch()
         return box
 
     def _build_combat_group(self):
@@ -390,25 +522,21 @@ class MainWindow(QMainWindow):
         self.classes_edit.setText(c.monster_classes)
         self.fps_spin.setValue(c.fps)
         self.hp_key_edit.setText(c.hp_key)
-        self.hp_thr_slider.setValue(int(c.hp_threshold * 100))
+        self.hp_thr_spin.setValue(int(c.hp_threshold * 100))
         if c.hp_color:
-            self.hp_color_edit.setText(",".join(str(x) for x in c.hp_color))
-            self._update_hp_swatch()
+            self._set_swatch(self.hp_swatch, c.hp_color)
         if c.hp_region:
             self.hp_region_label.setText(
-                f"血条区域: {c.hp_region[0]},{c.hp_region[1]} "
-                f"{c.hp_region[2]}x{c.hp_region[3]}"
+                f"{c.hp_region[0]},{c.hp_region[1]} {c.hp_region[2]}x{c.hp_region[3]}"
             )
         # MP
         self.mp_key_edit.setText(c.mp_key)
-        self.mp_thr_slider.setValue(int(c.mp_threshold * 100))
+        self.mp_thr_spin.setValue(int(c.mp_threshold * 100))
         if c.mp_color:
-            self.mp_color_edit.setText(",".join(str(x) for x in c.mp_color))
-            self._update_mp_swatch()
+            self._set_swatch(self.mp_swatch, c.mp_color)
         if c.mp_region:
             self.mp_region_label.setText(
-                f"蓝条区域: {c.mp_region[0]},{c.mp_region[1]} "
-                f"{c.mp_region[2]}x{c.mp_region[3]}"
+                f"{c.mp_region[0]},{c.mp_region[1]} {c.mp_region[2]}x{c.mp_region[3]}"
             )
         self.target_key_edit.setText(c.target_key)
         self.move_cb.setChecked(c.move_to_monster)
@@ -424,23 +552,12 @@ class MainWindow(QMainWindow):
         c.monster_classes = self.classes_edit.text().strip() or "monster"
         c.fps = self.fps_spin.value()
         c.hp_key = self.hp_key_edit.text().strip()
-        c.hp_threshold = self.hp_thr_slider.value() / 100
-        # hp_color
-        try:
-            parts = [int(x.strip()) for x in self.hp_color_edit.text().split(",")]
-            if len(parts) == 3:
-                c.hp_color = parts
-        except ValueError:
-            pass
+        c.hp_threshold = self.hp_thr_spin.value() / 100
+        c.hp_color = self.config.hp_color
         # mp
         c.mp_key = self.mp_key_edit.text().strip()
-        c.mp_threshold = self.mp_thr_slider.value() / 100
-        try:
-            parts = [int(x.strip()) for x in self.mp_color_edit.text().split(",")]
-            if len(parts) == 3:
-                c.mp_color = parts
-        except ValueError:
-            pass
+        c.mp_threshold = self.mp_thr_spin.value() / 100
+        c.mp_color = self.config.mp_color
         c.target_key = self.target_key_edit.text().strip()
         c.move_to_monster = self.move_cb.isChecked()
         # 技能
@@ -511,36 +628,41 @@ class MainWindow(QMainWindow):
         if path:
             self.model_edit.setText(path)
 
-    def _update_hp_swatch(self):
-        try:
-            parts = [int(x.strip()) for x in self.hp_color_edit.text().split(",")]
-            if len(parts) == 3:
-                r, g, b = parts
-                self.hp_swatch.setStyleSheet(
-                    f"background-color: rgb({r},{g},{b}); border:1px solid #333;"
-                )
-        except ValueError:
-            pass
+    def _start_color_picker(self, target):
+        """启动屏幕拾色器，点击后获取颜色。"""
+        self.hide()  # 隐藏主窗口，避免遮挡
+        self._color_target = target
+        self._color_picker = ColorPickerOverlay()
+        self._color_picker.color_picked.connect(self._on_color_picked)
+        self._color_picker.cancelled.connect(lambda: self.showNormal())
+        self._color_picker.show()
 
-    def _update_mp_swatch(self):
-        try:
-            parts = [int(x.strip()) for x in self.mp_color_edit.text().split(",")]
-            if len(parts) == 3:
-                r, g, b = parts
-                self.mp_swatch.setStyleSheet(
-                    f"background-color: rgb({r},{g},{b}); border:1px solid #333;"
-                )
-        except ValueError:
-            pass
+    def _on_color_picked(self, r, g, b):
+        color = [r, g, b]
+        if self._color_target == "mp":
+            self.config.mp_color = color
+            self._set_swatch(self.mp_swatch, color)
+        else:
+            self.config.hp_color = color
+            self._set_swatch(self.hp_swatch, color)
+        self._log(f"[取色] {self._color_target.upper()} 颜色已设置为 RGB({r},{g},{b})")
+        self.showNormal()
+        self.activateWindow()
+
+    @staticmethod
+    def _set_swatch(swatch, rgb):
+        swatch.setStyleSheet(
+            f"background-color: rgb({rgb[0]},{rgb[1]},{rgb[2]}); border:1px solid #333;"
+        )
 
     def _on_region_selected(self, target, x, y, w, h):
         if target == "mp":
             self.config.mp_region = [x, y, w, h]
-            self.mp_region_label.setText(f"蓝条区域: {x},{y} {w}x{h}")
+            self.mp_region_label.setText(f"{x},{y} {w}x{h}")
             self._log(f"[蓝量] 蓝条区域已设置: ({x},{y}) {w}x{h}")
         else:
             self.config.hp_region = [x, y, w, h]
-            self.hp_region_label.setText(f"血条区域: {x},{y} {w}x{h}")
+            self.hp_region_label.setText(f"{x},{y} {w}x{h}")
             self._log(f"[血量] 血条区域已设置: ({x},{y}) {w}x{h}")
 
     def _toggle_run(self):
