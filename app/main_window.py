@@ -28,7 +28,7 @@ class PreviewLabel(QLabel):
     region_selected 信号以原始帧坐标发出（已做缩放换算）。
     """
 
-    region_selected = pyqtSignal(int, int, int, int)  # x, y, w, h (帧坐标)
+    region_selected = pyqtSignal(str, int, int, int, int)  # target, x, y, w, h
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -37,13 +37,15 @@ class PreviewLabel(QLabel):
         self.setStyleSheet("background-color: #1a1a1a; border: 1px solid #333;")
         self.setText("尚未锁定窗口或未启动")
         self._selecting = False
+        self._select_target = "hp"     # 当前框选目标: "hp" 或 "mp"
         self._origin = None
         self._rubber = None
         self._frame_size = (0, 0)      # 当前帧的原始尺寸 (w, h)
         self._pixmap_rect = QRect()    # 当前显示 pixmap 在 label 内的实际矩形
 
-    def set_select_mode(self, on: bool):
+    def set_select_mode(self, on: bool, target: str = "hp"):
         self._selecting = on
+        self._select_target = target
         self.setCursor(Qt.CrossCursor if on else Qt.ArrowCursor)
 
     def update_frame(self, pixmap: QPixmap):
@@ -97,13 +99,13 @@ class PreviewLabel(QLabel):
         fy = int((inter.y() - self._pixmap_rect.y()) * sy)
         fw_sel = int(inter.width() * sx)
         fh_sel = int(inter.height() * sy)
-        self.region_selected.emit(fx, fy, fw_sel, fh_sel)
+        self.region_selected.emit(self._select_target, fx, fy, fw_sel, fh_sel)
 
 
 class MainWindow(QMainWindow):
     # 跨线程信号：自动化线程 → GUI 线程
     log_signal = pyqtSignal(str)
-    frame_signal = pyqtSignal(object, object, object)  # frame, detections, hp_ratio
+    frame_signal = pyqtSignal(object, object, object, object)  # frame, detections, hp, mp
     hotkey_signal = pyqtSignal()  # F12 触发
 
     def __init__(self):
@@ -178,7 +180,7 @@ class MainWindow(QMainWindow):
 
         # 预览
         self.preview = PreviewLabel()
-        self.preview.region_selected.connect(self._on_hp_region_selected)
+        self.preview.region_selected.connect(self._on_region_selected)
         v.addWidget(self.preview, 1)
 
         # FPS
@@ -197,9 +199,14 @@ class MainWindow(QMainWindow):
         ctl.addWidget(self.run_btn)
         self.hp_pick_btn = QPushButton("框选血条区域")
         self.hp_pick_btn.clicked.connect(
-            lambda: self.preview.set_select_mode(True)
+            lambda: self.preview.set_select_mode(True, "hp")
         )
         ctl.addWidget(self.hp_pick_btn)
+        self.mp_pick_btn = QPushButton("框选蓝条区域")
+        self.mp_pick_btn.clicked.connect(
+            lambda: self.preview.set_select_mode(True, "mp")
+        )
+        ctl.addWidget(self.mp_pick_btn)
         v.addLayout(ctl)
 
         # 日志
@@ -215,6 +222,7 @@ class MainWindow(QMainWindow):
         v = QVBoxLayout(panel)
         v.addWidget(self._build_detect_group())
         v.addWidget(self._build_hp_group())
+        v.addWidget(self._build_mp_group())
         v.addWidget(self._build_combat_group())
         v.addStretch()
         save_btn = QPushButton("保存配置")
@@ -295,6 +303,45 @@ class MainWindow(QMainWindow):
         g.addWidget(self.hp_region_label, 3, 1, 1, 2)
         return box
 
+    def _build_mp_group(self):
+        box = QGroupBox("蓝量设置")
+        g = QGridLayout(box)
+        g.addWidget(QLabel("加蓝按键:"), 0, 0)
+        self.mp_key_edit = QLineEdit()
+        self.mp_key_edit.setPlaceholderText("如 g 或 5")
+        g.addWidget(self.mp_key_edit, 0, 1)
+
+        g.addWidget(QLabel("加蓝阈值:"), 1, 0)
+        self.mp_thr_slider = QSlider(Qt.Horizontal)
+        self.mp_thr_slider.setRange(0, 100)
+        self.mp_thr_slider.setValue(30)
+        self.mp_thr_slider.valueChanged.connect(
+            lambda v: self.mp_thr_label.setText(f"{v}%")
+        )
+        self.mp_thr_label = QLabel("30%")
+        self.mp_thr_label.setMinimumWidth(40)
+        g.addWidget(self.mp_thr_slider, 1, 1)
+        g.addWidget(self.mp_thr_label, 1, 2)
+
+        g.addWidget(QLabel("蓝条颜色RGB:"), 2, 0)
+        mp_color_row = QHBoxLayout()
+        self.mp_color_edit = QLineEdit("0,120,255")
+        self.mp_color_edit.setFixedWidth(90)
+        mp_color_row.addWidget(self.mp_color_edit)
+        self.mp_swatch = QLabel()
+        self.mp_swatch.setFixedSize(24, 24)
+        self.mp_swatch.setStyleSheet("background-color: rgb(0,120,255); border:1px solid #333;")
+        mp_color_row.addWidget(self.mp_swatch)
+        self.mp_color_edit.editingFinished.connect(self._update_mp_swatch)
+        mp_color_row.addStretch()
+        g.addLayout(mp_color_row, 2, 1, 1, 2)
+
+        g.addWidget(QLabel("蓝条区域:"), 3, 0)
+        self.mp_region_label = QLabel("未设置 (点击左下「框选蓝条区域」后在预览上拖选)")
+        self.mp_region_label.setWordWrap(True)
+        g.addWidget(self.mp_region_label, 3, 1, 1, 2)
+        return box
+
     def _build_combat_group(self):
         box = QGroupBox("战斗设置")
         v = QVBoxLayout(box)
@@ -351,6 +398,17 @@ class MainWindow(QMainWindow):
             self.hp_region_label.setText(
                 f"血条区域: {c.hp_region[0]},{c.hp_region[1]} "
                 f"{c.hp_region[2]}x{c.hp_region[3]}"
+            )
+        # MP
+        self.mp_key_edit.setText(c.mp_key)
+        self.mp_thr_slider.setValue(int(c.mp_threshold * 100))
+        if c.mp_color:
+            self.mp_color_edit.setText(",".join(str(x) for x in c.mp_color))
+            self._update_mp_swatch()
+        if c.mp_region:
+            self.mp_region_label.setText(
+                f"蓝条区域: {c.mp_region[0]},{c.mp_region[1]} "
+                f"{c.mp_region[2]}x{c.mp_region[3]}"
             )
         self.target_key_edit.setText(c.target_key)
         self.move_cb.setChecked(c.move_to_monster)
