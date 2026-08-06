@@ -35,7 +35,9 @@ class Automation:
         return self.capture.list_windows()
 
     def lock_window(self, title: str) -> str:
-        return self.capture.lock(title=title)
+        locked = self.capture.lock(title=title)
+        self.controller.set_target_window(self.capture._hwnd)
+        return locked
 
     def unlock_window(self):
         self.capture.unlock()
