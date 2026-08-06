@@ -43,9 +43,10 @@ class PreviewLabel(QLabel):
         self._frame_size = (0, 0)      # 当前帧的原始尺寸 (w, h)
         self._pixmap_rect = QRect()    # 当前显示 pixmap 在 label 内的实际矩形
 
-    def set_select_mode(self, on: bool, target: str = "hp"):
+    def set_select_mode(self, on: bool, target: str = ""):
         self._selecting = on
-        self._select_target = target
+        if target:
+            self._select_target = target
         self.setCursor(Qt.CrossCursor if on else Qt.ArrowCursor)
 
     def update_frame(self, pixmap: QPixmap):
@@ -674,7 +675,6 @@ class MainWindow(QMainWindow):
         if target == "mp":
             self.config.mp_region = [x, y, w, h]
             self.mp_region_label.setText(f"{x},{y} {w}x{h}")
-            # 自动识别颜色
             color = self._detect_region_color(x, y, w, h)
             if color:
                 self.config.mp_color = color
@@ -685,7 +685,6 @@ class MainWindow(QMainWindow):
         else:
             self.config.hp_region = [x, y, w, h]
             self.hp_region_label.setText(f"{x},{y} {w}x{h}")
-            # 自动识别颜色
             color = self._detect_region_color(x, y, w, h)
             if color:
                 self.config.hp_color = color
@@ -694,32 +693,12 @@ class MainWindow(QMainWindow):
             else:
                 self._log(f"[血量] 区域已设置: ({x},{y}) {w}x{h} | 颜色识别失败")
 
-    @staticmethod
-    def _detect_region_color(x, y, w, h):
-        """截取指定区域并识别主颜色（取中间行像素的平均 RGB）。"""
+    def _detect_region_color(self, x, y, w, h):
+        """从当前窗口截图中识别指定区域的主颜色。"""
         try:
-            from PIL import ImageGrab
-            import numpy as np
-            # 截取区域
-            img = ImageGrab.grab(bbox=(x, y, x + w, y + h))
-            arr = np.array(img)  # RGB
-            
-            # 取中间行的所有像素
-            mid_row = arr[arr.shape[0] // 2, :, :]  # shape: (w, 3)
-            
-            # 计算平均颜色（排除接近黑色的背景像素）
-            # 血条/蓝条中间行应该大部分是彩色像素，黑色是背景
-            pixels = mid_row.reshape(-1, 3)
-            # 只考虑亮度大于 30 的像素（排除黑色背景）
-            mask = np.mean(pixels, axis=1) > 30
-            if mask.sum() > 0:
-                valid_pixels = pixels[mask]
-            else:
-                valid_pixels = pixels
-            
-            # 计算平均颜色
-            avg_color = np.mean(valid_pixels, axis=0).astype(int)
-            return [int(avg_color[0]), int(avg_color[1]), int(avg_color[2])]
+            frame = self.automation.capture.grab()
+            from .detector import detect_region_color
+            return detect_region_color(frame, [x, y, w, h])
         except Exception:
             return None
 
