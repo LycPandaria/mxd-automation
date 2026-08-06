@@ -432,6 +432,15 @@ class MainWindow(QMainWindow):
                 c.hp_color = parts
         except ValueError:
             pass
+        # mp
+        c.mp_key = self.mp_key_edit.text().strip()
+        c.mp_threshold = self.mp_thr_slider.value() / 100
+        try:
+            parts = [int(x.strip()) for x in self.mp_color_edit.text().split(",")]
+            if len(parts) == 3:
+                c.mp_color = parts
+        except ValueError:
+            pass
         c.target_key = self.target_key_edit.text().strip()
         c.move_to_monster = self.move_cb.isChecked()
         # 技能
@@ -513,10 +522,26 @@ class MainWindow(QMainWindow):
         except ValueError:
             pass
 
-    def _on_hp_region_selected(self, x, y, w, h):
-        self.config.hp_region = [x, y, w, h]
-        self.hp_region_label.setText(f"血条区域: {x},{y} {w}x{h}")
-        self._log(f"[血量] 血条区域已设置: ({x},{y}) {w}x{h}")
+    def _update_mp_swatch(self):
+        try:
+            parts = [int(x.strip()) for x in self.mp_color_edit.text().split(",")]
+            if len(parts) == 3:
+                r, g, b = parts
+                self.mp_swatch.setStyleSheet(
+                    f"background-color: rgb({r},{g},{b}); border:1px solid #333;"
+                )
+        except ValueError:
+            pass
+
+    def _on_region_selected(self, target, x, y, w, h):
+        if target == "mp":
+            self.config.mp_region = [x, y, w, h]
+            self.mp_region_label.setText(f"蓝条区域: {x},{y} {w}x{h}")
+            self._log(f"[蓝量] 蓝条区域已设置: ({x},{y}) {w}x{h}")
+        else:
+            self.config.hp_region = [x, y, w, h]
+            self.hp_region_label.setText(f"血条区域: {x},{y} {w}x{h}")
+            self._log(f"[血量] 血条区域已设置: ({x},{y}) {w}x{h}")
 
     def _toggle_run(self):
         if self.automation.running:
@@ -572,7 +597,7 @@ class MainWindow(QMainWindow):
         sb = self.log_box.verticalScrollBar()
         sb.setValue(sb.maximum())
 
-    def _on_frame(self, frame, detections, hp_ratio):
+    def _on_frame(self, frame, detections, hp_ratio, mp_ratio):
         if frame is None:
             return
         h, w = frame.shape[:2]
@@ -592,10 +617,17 @@ class MainWindow(QMainWindow):
         if self.config.hp_region:
             rx, ry, rw, rh = self.config.hp_region
             cv2.rectangle(disp, (rx, ry), (rx + rw, ry + rh), (0, 0, 255), 1)
-        # HP 文本
+        # 画蓝条区域
+        if self.config.mp_region:
+            rx, ry, rw, rh = self.config.mp_region
+            cv2.rectangle(disp, (rx, ry), (rx + rw, ry + rh), (255, 128, 0), 1)
+        # HP / MP 文本
         hp_text = f"HP: {hp_ratio:.0%}" if hp_ratio is not None else "HP: -"
         cv2.putText(disp, hp_text, (10, 25),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2)
+        mp_text = f"MP: {mp_ratio:.0%}" if mp_ratio is not None else "MP: -"
+        cv2.putText(disp, mp_text, (10, 50),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 128, 0), 2)
 
         rgb = cv2.cvtColor(disp, cv2.COLOR_BGR2RGB)
         qimg = QImage(rgb.data, w, h, w * 3, QImage.Format_RGB888)
