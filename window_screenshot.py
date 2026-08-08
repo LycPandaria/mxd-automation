@@ -54,6 +54,7 @@ class WindowDetector:
         self._windows = []
         win32gui.EnumWindows(self._enum_callback, None)
 
+
     def _enum_callback(self, hwnd, _):
         """EnumWindows 回调"""
         if not win32gui.IsWindowVisible(hwnd):

@@ -6,3 +6,4 @@ mss>=9.0.0
 pywin32>=306
 keyboard>=0.13.5
 mouse>=0.7.1
+psutil>=5.9.0

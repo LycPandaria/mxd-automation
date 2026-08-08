@@ -5,21 +5,31 @@
   "monster_classes": "monster",
   "fps": 13,
   "hp_key": "f",
-  "hp_threshold": 0.5,
-  "hp_region": null,
+  "hp_threshold": 0.99,
+  "hp_region": [
+    510,
+    777,
+    108,
+    17
+  ],
   "hp_color": [
-    255,
-    0,
-    0
+    231,
+    34,
+    34
   ],
   "hp_tolerance": 20,
   "mp_key": "g",
   "mp_threshold": 0.3,
-  "mp_region": null,
+  "mp_region": [
+    620,
+    777,
+    106,
+    18
+  ],
   "mp_color": [
-    0,
-    120,
-    255
+    3,
+    130,
+    232
   ],
   "mp_tolerance": 20,
   "target_key": "tab",
