@@ -7,7 +7,9 @@
 """
 import time
 
+import ImageGrab
 import cv2
+import numpy as np
 from PyQt5.QtWidgets import (
     QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QPushButton, QLabel,
     QLineEdit, QComboBox, QSlider, QGroupBox, QGridLayout, QTableWidget,
@@ -15,7 +17,7 @@ from PyQt5.QtWidgets import (
     QMessageBox, QSplitter, QAbstractItemView, QSpinBox,
 )
 from PyQt5.QtCore import Qt, QTimer, pyqtSignal, QRect
-from PyQt5.QtGui import QImage, QPixmap, QColor, QPainterPath, QCursor
+from PyQt5.QtGui import QImage, QPixmap, QColor, QPainterPath, QCursor, QPen, QPainter
 
 from .config import load_config, save_config, config_path
 from .detector import create_detector
