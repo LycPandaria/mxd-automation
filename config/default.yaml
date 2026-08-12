@@ -10,6 +10,10 @@ detection:
   model_path: ""           # 留空则使用 MockDetector；指向 .pt 文件时启用 YOLO
   confidence: 0.5
   monster_classes: "monster"   # 逗号分隔的怪物类别名
+  floor_classes: "floor"       # 地板类别名
+  rope_classes: "rope"         # 绳索类别名
+  player_classes: "player"     # 其他玩家类别名（自身不靠 YOLO）
+  self_name: ""               # 自身角色名（用于脚底名字匹配定位）
   fps: 13
 
 # ---- 血量 ----

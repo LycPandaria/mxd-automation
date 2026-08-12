@@ -7,7 +7,7 @@
 逻辑（加血 → 加蓝 → 选目标/技能）。后续可替换为 ``fsm.py`` 中的有限状态机。
 """
 from dataclasses import dataclass, field
-from typing import List, Optional, Callable, Any
+from typing import List, Optional, Tuple, Callable, Any
 
 from ..perception.yolo_detector import Detection
 from ..perception.screen_capture import ScreenCapture
@@ -17,11 +17,18 @@ from ..utils.config_loader import Config
 
 @dataclass
 class Context:
-    """感知层 → 决策层的数据载体（每帧一份）。"""
+    """感知层 → 决策层的数据载体（每帧一份）。
+
+    self_position 由 HP 条区域推算（窗口内坐标），不依赖 YOLO 检测。
+    """
     monsters: List[Detection] = field(default_factory=list)
+    floors: List[Detection] = field(default_factory=list)
+    ropes: List[Detection] = field(default_factory=list)
+    players: List[Detection] = field(default_factory=list)
+    self_position: Optional[Tuple[int, int]] = None  # 自身脚底坐标 (x, y)
     hp_ratio: Optional[float] = None
     mp_ratio: Optional[float] = None
-    detections: List[Detection] = field(default_factory=list)  # 全部检测（含非怪物）
+    detections: List[Detection] = field(default_factory=list)  # 全部检测结果
 
 
 class DecisionEngine:
@@ -57,6 +64,15 @@ class DecisionEngine:
 
     def _monster_classes(self) -> List[str]:
         return [c.strip() for c in self.config.monster_classes.split(",") if c.strip()]
+
+    def _floor_classes(self) -> List[str]:
+        return [c.strip() for c in self.config.floor_classes.split(",") if c.strip()]
+
+    def _rope_classes(self) -> List[str]:
+        return [c.strip() for c in self.config.rope_classes.split(",") if c.strip()]
+
+    def _player_classes(self) -> List[str]:
+        return [c.strip() for c in self.config.player_classes.split(",") if c.strip()]
 
     def decide(self, ctx: Context):
         """根据上下文执行决策。返回 None（动作通过 executor 直接触发）。"""

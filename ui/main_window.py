@@ -193,6 +193,11 @@ class MainWindow(QMainWindow):
         self.fps_spin.setRange(1, 30)
         self.fps_spin.setValue(8)
         g.addWidget(self.fps_spin, 3, 1, 1, 2)
+
+        g.addWidget(QLabel("自身名字:"), 4, 0)
+        self.name_edit = QLineEdit()
+        self.name_edit.setPlaceholderText("输入角色名, 如 我是立立")
+        g.addWidget(self.name_edit, 4, 1, 1, 2)
         return box
 
     def _build_hp_group(self):
@@ -302,6 +307,7 @@ class MainWindow(QMainWindow):
         self.conf_slider.setValue(int(c.confidence * 100))
         self.classes_edit.setText(c.monster_classes)
         self.fps_spin.setValue(c.fps)
+        self.name_edit.setText(c.self_name)
         self.hp_key_edit.setText(c.hp_key)
         self.hp_thr_spin.setValue(int(c.hp_threshold * 100))
         if c.hp_color:
@@ -332,6 +338,7 @@ class MainWindow(QMainWindow):
         c.confidence = self.conf_slider.value() / 100
         c.monster_classes = self.classes_edit.text().strip() or "monster"
         c.fps = self.fps_spin.value()
+        c.self_name = self.name_edit.text().strip()
         c.hp_key = self.hp_key_edit.text().strip()
         c.hp_threshold = self.hp_thr_spin.value() / 100
         # hp_color / mp_color 由框选区域时自动写入，此处不覆盖
@@ -480,6 +487,7 @@ class MainWindow(QMainWindow):
             self.automation.set_detector(self.detector)
 
         self.automation.config = self.config
+        self.automation._render_name_template()  # 重新渲染名字模板
         try:
             self.automation.start()
         except Exception as e:
@@ -506,11 +514,22 @@ class MainWindow(QMainWindow):
         self.preview.set_frame_size(w, h)
 
         disp = frame.copy()
-        # 画检测框
+        # 按类别使用不同颜色绘制检测框
+        monster_classes = [c.strip() for c in self.config.monster_classes.split(",")]
+        floor_classes = [c.strip() for c in self.config.floor_classes.split(",")]
+        rope_classes = [c.strip() for c in self.config.rope_classes.split(",")]
+        player_classes = [c.strip() for c in self.config.player_classes.split(",")]
         for d in detections:
-            color = (0, 255, 0) if d.cls_name in [
-                c.strip() for c in self.config.monster_classes.split(",")
-            ] else (0, 165, 255)
+            if d.cls_name in player_classes:
+                color = (255, 0, 255)        # 品红: 其他玩家
+            elif d.cls_name in monster_classes:
+                color = (0, 255, 0)          # 绿色: 怪物
+            elif d.cls_name in rope_classes:
+                color = (0, 165, 255)        # 橙色: 绳索
+            elif d.cls_name in floor_classes:
+                color = (128, 128, 128)      # 灰色: 地板
+            else:
+                color = (0, 165, 255)        # 默认橙色
             cv2.rectangle(disp, (d.x, d.y), (d.x + d.w, d.y + d.h), color, 2)
             cv2.putText(disp, f"{d.cls_name} {d.confidence:.2f}",
                         (d.x, max(0, d.y - 5)),
@@ -523,6 +542,13 @@ class MainWindow(QMainWindow):
         if self.config.mp_region:
             rx, ry, rw, rh = self.config.mp_region
             cv2.rectangle(disp, (rx, ry), (rx + rw, ry + rh), (255, 128, 0), 1)
+        # 自身位置：HP条偏移优先，名字模板匹配兜底
+        self_pos = self.automation._locate_self(frame)
+        if self_pos:
+            sx, sy = self_pos
+            cv2.circle(disp, (sx, sy), 6, (255, 255, 0), -1)
+            cv2.putText(disp, "self", (sx + 8, sy + 4),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 0), 1)
         # HP / MP 文本
         hp_text = f"HP: {hp_ratio:.0%}" if hp_ratio is not None else "HP: -"
         cv2.putText(disp, hp_text, (10, 25),

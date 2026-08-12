@@ -44,6 +44,10 @@ class Config:
     model_path: str = ""
     confidence: float = 0.5
     monster_classes: str = "monster"
+    floor_classes: str = "floor"
+    rope_classes: str = "rope"
+    player_classes: str = "player"
+    self_name: str = ""
     fps: int = 13
 
     # ---- 血量 ----
@@ -88,6 +92,10 @@ def _flat_to_nested(cfg: Config) -> dict:
             "model_path": cfg.model_path,
             "confidence": cfg.confidence,
             "monster_classes": cfg.monster_classes,
+            "floor_classes": cfg.floor_classes,
+            "rope_classes": cfg.rope_classes,
+            "player_classes": cfg.player_classes,
+            "self_name": cfg.self_name,
             "fps": cfg.fps,
         },
         "hp": {
@@ -127,6 +135,10 @@ def _nested_to_flat(data: dict, cfg: Config) -> Config:
     cfg.model_path = det.get("model_path", cfg.model_path)
     cfg.confidence = float(det.get("confidence", cfg.confidence))
     cfg.monster_classes = det.get("monster_classes", cfg.monster_classes)
+    cfg.floor_classes = det.get("floor_classes", cfg.floor_classes)
+    cfg.rope_classes = det.get("rope_classes", cfg.rope_classes)
+    cfg.player_classes = det.get("player_classes", cfg.player_classes)
+    cfg.self_name = det.get("self_name", cfg.self_name)
     cfg.fps = int(det.get("fps", cfg.fps))
 
     hp = data.get("hp", {})
