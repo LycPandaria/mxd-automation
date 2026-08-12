@@ -16,7 +16,7 @@ import shutil
 
 
 def train(data_yaml: str = "train/data/data.yaml",
-          model_name: str = "yolov8n.pt",
+          model_name: str = "train/model/yolov8n.pt",
           epochs: int = 100,
           imgsz: int = 640,
           batch: int = 16,
