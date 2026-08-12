@@ -130,15 +130,21 @@ class Automation:
             players = [d for d in detections if d.cls_name in self._player_classes()]
 
             # HP 检测
+            hp_region = self.config.scale_region(
+                self.config.hp_region, frame.shape[1], frame.shape[0]
+            )
             hp_ratio = detect_bar_ratio(
-                frame, self.config.hp_region,
+                frame, hp_region,
                 tuple(self.config.hp_color) if self.config.hp_color else None,
                 self.config.hp_tolerance,
             )
 
             # MP 检测
+            mp_region = self.config.scale_region(
+                self.config.mp_region, frame.shape[1], frame.shape[0]
+            )
             mp_ratio = detect_bar_ratio(
-                frame, self.config.mp_region,
+                frame, mp_region,
                 tuple(self.config.mp_color) if self.config.mp_color else None,
                 self.config.mp_tolerance,
             )
@@ -236,8 +242,13 @@ class Automation:
         """
         # 方案1: HP条偏移
         if self.config.hp_region:
-            hx, hy, hw, hh = self.config.hp_region
-            return (hx + hw // 2, hy + hh + 85)
+            hp_region = self.config.scale_region(
+                self.config.hp_region, frame.shape[1], frame.shape[0]
+            )
+            if hp_region:
+                hx, hy, hw, hh = hp_region
+                offset = self.config.scale_offset(self.config.self_offset, frame.shape[0])
+                return (hx + hw // 2, hy + hh + offset)
 
         # 方案2: 名字模板匹配
         if self._name_template is not None:

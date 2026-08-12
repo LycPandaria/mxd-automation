@@ -422,7 +422,11 @@ class MainWindow(QMainWindow):
         )
 
     def _on_region_selected(self, target, x, y, w, h):
-        """框选区域后自动识别颜色并写入配置。"""
+        """框选区域后自动识别颜色并写入配置，同时记录参考分辨率。"""
+        frame = self.automation.capture.grab()
+        fh, fw = frame.shape[:2]
+        self.config.ref_width = fw
+        self.config.ref_height = fh
         if target == "mp":
             self.config.mp_region = [x, y, w, h]
             self.mp_region_label.setText(f"{x},{y} {w}x{h}")
@@ -535,12 +539,18 @@ class MainWindow(QMainWindow):
                         (d.x, max(0, d.y - 5)),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 1)
         # 画血条区域
-        if self.config.hp_region:
-            rx, ry, rw, rh = self.config.hp_region
+        hp_region = self.config.scale_region(
+            self.config.hp_region, frame.shape[1], frame.shape[0]
+        )
+        if hp_region:
+            rx, ry, rw, rh = hp_region
             cv2.rectangle(disp, (rx, ry), (rx + rw, ry + rh), (0, 0, 255), 1)
         # 画蓝条区域
-        if self.config.mp_region:
-            rx, ry, rw, rh = self.config.mp_region
+        mp_region = self.config.scale_region(
+            self.config.mp_region, frame.shape[1], frame.shape[0]
+        )
+        if mp_region:
+            rx, ry, rw, rh = mp_region
             cv2.rectangle(disp, (rx, ry), (rx + rw, ry + rh), (255, 128, 0), 1)
         # 自身位置：HP条偏移优先，名字模板匹配兜底
         self_pos = self.automation._locate_self(frame)

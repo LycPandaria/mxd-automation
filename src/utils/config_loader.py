@@ -39,6 +39,8 @@ class Config:
 
     # ---- 窗口 ----
     window_title: str = ""
+    ref_width: int = 1366
+    ref_height: int = 768
 
     # ---- 检测 ----
     model_path: str = ""
@@ -48,6 +50,7 @@ class Config:
     rope_classes: str = "rope"
     player_classes: str = "player"
     self_name: str = ""
+    self_offset: int = 85
     fps: int = 13
 
     # ---- 血量 ----
@@ -81,13 +84,31 @@ class Config:
     humanize_key_delay_max: float = 0.06
     humanize_press_cooldown: float = 1.5
 
+    def scale_region(self, region: Optional[List[int]],
+                     current_w: int, current_h: int) -> Optional[List[int]]:
+        """将参考分辨率下的坐标缩放到当前窗口尺寸。"""
+        if not region or len(region) < 4:
+            return None
+        sx = current_w / max(1, self.ref_width)
+        sy = current_h / max(1, self.ref_height)
+        return [int(region[0] * sx), int(region[1] * sy),
+                int(region[2] * sx), int(region[3] * sy)]
+
+    def scale_offset(self, offset: int, current_h: int) -> int:
+        """将参考分辨率下的垂直偏移缩放到当前窗口高度。"""
+        return int(offset * current_h / max(1, self.ref_height))
+
 
 # ---------------- 扁平 ↔ 嵌套 转换 ----------------
 
 def _flat_to_nested(cfg: Config) -> dict:
     """扁平字段 → 嵌套字典（用于写 user.json）。"""
     return {
-        "window": {"title": cfg.window_title},
+        "window": {
+            "title": cfg.window_title,
+            "ref_width": cfg.ref_width,
+            "ref_height": cfg.ref_height,
+        },
         "detection": {
             "model_path": cfg.model_path,
             "confidence": cfg.confidence,
@@ -96,6 +117,7 @@ def _flat_to_nested(cfg: Config) -> dict:
             "rope_classes": cfg.rope_classes,
             "player_classes": cfg.player_classes,
             "self_name": cfg.self_name,
+            "self_offset": cfg.self_offset,
             "fps": cfg.fps,
         },
         "hp": {
@@ -130,6 +152,8 @@ def _nested_to_flat(data: dict, cfg: Config) -> Config:
     """嵌套字典 → 扁平字段（赋值到现有 Config 实例）。"""
     win = data.get("window", {})
     cfg.window_title = win.get("title", cfg.window_title)
+    cfg.ref_width = int(win.get("ref_width", cfg.ref_width))
+    cfg.ref_height = int(win.get("ref_height", cfg.ref_height))
 
     det = data.get("detection", {})
     cfg.model_path = det.get("model_path", cfg.model_path)
@@ -139,6 +163,7 @@ def _nested_to_flat(data: dict, cfg: Config) -> Config:
     cfg.rope_classes = det.get("rope_classes", cfg.rope_classes)
     cfg.player_classes = det.get("player_classes", cfg.player_classes)
     cfg.self_name = det.get("self_name", cfg.self_name)
+    cfg.self_offset = int(det.get("self_offset", cfg.self_offset))
     cfg.fps = int(det.get("fps", cfg.fps))
 
     hp = data.get("hp", {})

@@ -4,6 +4,8 @@
 # ---- 窗口 ----
 window:
   title: "冒险岛怀旧服"
+  ref_width: 1366         # 坐标标定时的窗口宽度（用于不同分辨率缩放）
+  ref_height: 768         # 坐标标定时的窗口高度
 
 # ---- 检测（YOLO）----
 detection:
@@ -14,6 +16,7 @@ detection:
   rope_classes: "rope"         # 绳索类别名
   player_classes: "player"     # 其他玩家类别名（自身不靠 YOLO）
   self_name: ""               # 自身角色名（用于脚底名字匹配定位）
+  self_offset: 85             # HP条底部到脚底的像素偏移（参考分辨率下）
   fps: 13
 
 # ---- 血量 ----
