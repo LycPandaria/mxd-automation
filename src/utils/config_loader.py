@@ -17,7 +17,11 @@ import os
 from dataclasses import dataclass, field, asdict
 from typing import List, Optional
 
-import yaml
+try:
+    import yaml
+    _YAML_AVAILABLE = True
+except ImportError:
+    _YAML_AVAILABLE = False
 
 
 # 路径常量
@@ -172,7 +176,7 @@ def load_config() -> Config:
     cfg = Config()
 
     # 1. default.yaml
-    if os.path.exists(_DEFAULT_YAML):
+    if _YAML_AVAILABLE and os.path.exists(_DEFAULT_YAML):
         try:
             with open(_DEFAULT_YAML, "r", encoding="utf-8") as f:
                 default_data = yaml.safe_load(f) or {}

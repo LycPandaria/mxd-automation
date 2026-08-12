@@ -7,3 +7,5 @@ pywin32>=306
 keyboard>=0.13.5
 mouse>=0.7.1
 psutil>=5.9.0
+PyYAML>=6.0
+ultralytics>=8.0.0
