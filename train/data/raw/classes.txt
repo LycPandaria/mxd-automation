@@ -1,4 +1,4 @@
+player
 monster
 floor
 rope
-player
