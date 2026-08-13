@@ -8,13 +8,31 @@
   DecisionEngine: 根据 Context + Config 决定下一步动作并执行
 
 ================================================================================
+整体架构
+================================================================================
+
+  ┌─────────────┐    ┌──────────────┐    ┌──────────────┐
+  │  感知层      │ →  │  MapExplorer  │ →  │  GlobalMap   │
+  │ YOLO/OCR/HP │    │  (建图)       │    │  (持久化)    │
+  └─────────────┘    └──────────────┘    └──────┬───────┘
+                                                │
+  ┌─────────────┐    ┌──────────────┐           │
+  │  ActionExec │ ←  │ DecisionEngine│ ← A*Pathfinder │
+  │  (方向键)   │    │  (决策)       │    (寻路)      │
+  └─────────────┘    └──────────────┘    └──────────────┘
+
+  两种运行模式:
+    探索模式: 边走边建图，同时打怪（建图和战斗可以同时进行）
+    战斗模式: 地图已加载，直接用 GlobalMap 规划路径
+
+================================================================================
 决策流程（优先级从高到低）
 ================================================================================
 
   1. HP 低于阈值 → 按加血键
   2. MP 低于阈值 → 按加蓝键
   3. 检测到怪物:
-     a. 若 move_to_monster=True → A* 寻路 + 方向键移动到怪物平台
+     a. 若 move_to_monster=True → A* 在全局地图上寻路 + 方向键移动
      b. 否则 → 按选目标键 + 轮转释放技能
   4. 没怪 → 按选目标键自动寻找目标
 
@@ -25,11 +43,10 @@
   冒险岛是 2D 横版游戏，移动靠方向键（← → ↑ ↓ + 跳跃），不能用鼠标点击。
 
   每帧:
-    1. 用 AStarPathfinder 根据 YOLO 检测到的 floor/rope 构建网格
-    2. 搜索从自身位置到怪物位置的最短路径
+    1. MapExplorer.update() 把当前帧的 floors/ropes 拼接到 GlobalMap
+    2. 用 AStarPathfinder 在 GlobalMap 上搜索从自身到怪物的路径
     3. 将路径转换为方向键指令并执行
-
-  如果 A* 找不到路径（跨平台不可达），回退到按 Tab 选同平台怪。
+    4. 寻路失败 → 回退到 Tab 选同平台怪
 
 ================================================================================
 技能轮转机制
@@ -37,10 +54,6 @@
 
   DecisionEngine 维护一个 _skill_index 计数器，每次释放技能时自增。
   轮转时跳过冷却中的技能，直到找到一个冷却已好的。
-
-  例如技能列表: [技能1(CD=1s), 技能2(CD=3s), 技能3(CD=8s)]
-  轮转顺序:    1→2→3→1→2→3→1→2→3→...
-  但 2 在冷却中时会跳过，直接到 3。
 
 ================================================================================
 Context 字段说明
@@ -61,6 +74,8 @@ from typing import List, Optional, Tuple, Callable
 from ..perception.yolo_detector import Detection
 from ..execution.action_executor import ActionExecutor
 from ..utils.config_loader import Config
+from .global_map import GlobalMap
+from .map_explorer import MapExplorer
 from .astar import AStarPathfinder, path_to_directions
 
 
@@ -113,36 +128,39 @@ class DecisionEngine:
          - 否则 → 按选目标键 + 轮转释放技能
       4. 没怪 → 按选目标键自动寻找目标
 
-    【寻路模式 vs 简单模式】
-      move_to_monster=True: 启用 A* 寻路，根据 YOLO 检测到的地板/绳索
-      动态规划路径，输出方向键指令。适合跨平台场景。
+    【探索 + 建图】
+      MapExplorer 每帧接收 YOLO 检测到的 floors/ropes，逐帧拼接成 GlobalMap。
+      探索和战斗可以同时进行：一边打怪一边建图。
 
-      move_to_monster=False: 简单模式，只按 Tab 选怪 + 释放技能。
-      适合同平台刷怪。
-
-    【技能轮转】
-    维护 _skill_index 计数器，每次释放技能后自增。
-    轮转时跳过冷却中的技能，直到找到一个可用的。
+    【寻路】
+      move_to_monster=True 时，AStarPathfinder 在 GlobalMap 上搜索路径。
+      路径缓存到 _current_path，多帧持续执行直到到达目标。
 
     Args:
-        config:   全局配置
-        executor: 动作执行器
-        on_log:   日志回调
+        config:     全局配置
+        executor:   动作执行器
+        map_explorer: 地图探索器（可选，不传则自动创建）
+        on_log:     日志回调
     """
 
     def __init__(self, config: Config, executor: ActionExecutor,
-                 capture=None,  # 保留参数兼容性，已不再使用
+                 capture=None,
+                 map_explorer: Optional[MapExplorer] = None,
                  on_log: Optional[Callable[[str], None]] = None):
         self.config = config
         self.executor = executor
         self._log = on_log or (lambda m: None)
-        self._skill_index = 0  # 技能轮转索引，每次释放后自增
+        self._skill_index = 0
 
-        # A* 寻路器: 每帧根据 YOLO 检测结果动态构建网格
-        self._pathfinder = AStarPathfinder()
+        # 地图探索器: 逐帧拼接 GlobalMap
+        self._explorer = map_explorer or MapExplorer(on_log=self._log)
 
-        # 当前寻路路径缓存: 每帧更新，用于多帧持续执行移动
-        self._current_path = []
+        # A* 寻路器: 在 GlobalMap 上搜索路径（每次 GlobalMap 更新后重建）
+        self._pathfinder: Optional[AStarPathfinder] = None
+
+        # 当前寻路路径缓存: 多帧持续执行移动
+        self._current_path: List[Tuple[int, int]] = []
+        self._path_target: Optional[Tuple[int, int]] = None  # 路径的目标全局坐标
 
     def update_config(self, config: Config):
         """更新配置引用（UI 修改配置后调用）。"""
@@ -152,7 +170,13 @@ class DecisionEngine:
         """重置状态：清空技能轮转索引、按键冷却记录和寻路缓存。"""
         self._skill_index = 0
         self._current_path = []
+        self._path_target = None
         self.executor.reset()
+
+    @property
+    def explorer(self) -> MapExplorer:
+        """获取地图探索器（供外部查询探索状态）。"""
+        return self._explorer
 
     # =========================================================================
     # 类别名解析
@@ -178,17 +202,21 @@ class DecisionEngine:
         """根据上下文执行决策。
 
         每帧调用一次，按优先级判断是否需要执行动作。
-        一旦某个条件命中并执行了动作，立即 return 不再继续。
+        无论是否寻路，都会先更新 MapExplorer（建图）。
 
         寻路模式 (move_to_monster=True):
-          1. 用 YOLO 检测到的 floors/ropes 构建网格
-          2. A* 搜索从自身到怪物的路径
+          1. MapExplorer.update() 把当前帧拼接到 GlobalMap
+          2. A* 在 GlobalMap 上搜索从自身到怪物的路径
           3. 路径存在 → 转换为方向键指令并执行
           4. 路径不存在 → 回退到 Tab 选怪 + 技能
 
         Args:
             ctx: 当前帧的感知数据
         """
+        # ---- 始终更新地图探索器（建图） ----
+        # 探索和战斗可以同时进行，每帧都拼接 floors/ropes
+        self._update_map(ctx)
+
         # ---- 优先级 1: 没血加血 ----
         if ctx.hp_ratio is not None and ctx.hp_ratio < self.config.hp_threshold:
             if self.executor.press_key(self.config.hp_key, cooldown=1.5):
@@ -209,19 +237,15 @@ class DecisionEngine:
 
         # ---- 优先级 3: 检测到怪物 ----
         if ctx.monsters:
-            # 选面积最大的怪物作为目标
             target = max(ctx.monsters, key=lambda d: d.w * d.h)
             cx, cy = target.center
             self._log(
                 f"[检测] {target.cls_name} conf={target.confidence:.2f} @ ({cx},{cy})"
             )
 
-            # 3a: 寻路模式 — A* 动态规划路径，方向键移动
+            # 3a: 寻路模式 — 在 GlobalMap 上 A* 寻路 + 方向键移动
             if self.config.move_to_monster and ctx.self_position:
-                path = self._plan_path(ctx, target)
-                if path:
-                    # 用路径生成方向键指令并执行
-                    self._execute_move(path, ctx.self_position)
+                if self._try_navigate(ctx, target):
                     return
                 # 寻路失败，回退到简单模式
 
@@ -235,41 +259,73 @@ class DecisionEngine:
             self.executor.press_key(self.config.target_key, cooldown=1.5)
 
     # =========================================================================
-    # 寻路与移动
+    # 地图更新
     # =========================================================================
 
-    def _plan_path(self, ctx: Context, target: Detection) -> List[Tuple[int, int]]:
-        """A* 寻路：根据 YOLO 检测结果构建网格，搜索从自身到怪物的路径。
+    def _update_map(self, ctx: Context):
+        """将当前帧的 YOLO 检测结果拼接到 GlobalMap。
 
-        Args:
-            ctx:    当前帧感知数据（含 floors, ropes, self_position）
-            target: 目标怪物检测结果
-
-        Returns:
-            路径点列表（像素坐标），空列表表示无路径
+        每帧调用，无论是否在战斗中。
         """
-        if not ctx.self_position:
-            return []
-
-        # 根据 YOLO 检测到的地板和绳索构建网格
-        # 注意: 这里用的是 ctx.floors 和 ctx.ropes（已过滤类别）
-        self._pathfinder.build_grid(
+        self._explorer.update(
             ctx.floors, ctx.ropes,
-            frame_width=1366,   # TODO: 从 capture 获取实际帧尺寸
+            ctx.self_position,
+            frame_width=1366,  # TODO: 从 capture 获取实际帧尺寸
             frame_height=768,
         )
 
-        path = self._pathfinder.find_path(
-            ctx.self_position, target.center
+    # =========================================================================
+    # 寻路与导航
+    # =========================================================================
+
+    def _try_navigate(self, ctx: Context, target: Detection) -> bool:
+        """尝试在 GlobalMap 上寻路并执行移动。
+
+        返回 True 表示成功执行了移动指令，False 表示寻路失败。
+
+        Args:
+            ctx:    当前帧感知数据
+            target: 目标怪物
+
+        Returns:
+            True 表示已执行移动（可以 return），False 表示需要回退
+        """
+        global_map = self._explorer.current_map
+        if global_map is None or global_map.explored_count == 0:
+            return False
+
+        # 转换坐标: 窗口坐标 → 全局坐标
+        self_global = self._explorer.window_to_global(
+            ctx.self_position[0], ctx.self_position[1]
         )
+        target_global = self._explorer.window_to_global(
+            target.center[0], target.center[1]
+        )
+
+        # 检查目标是否与当前路径目标相同（避免每帧重新寻路）
+        if self._path_target == target_global and self._current_path:
+            # 路径还在，继续执行移动
+            self._execute_move(self._current_path, self_global)
+            return True
+
+        # 重建 A* 寻路器（GlobalMap 可能已更新）
+        if self._pathfinder is None or self._pathfinder._map is not global_map:
+            self._pathfinder = AStarPathfinder(global_map)
+
+        # A* 搜索
+        path = self._pathfinder.find_path(self_global, target_global)
 
         if path:
             self._log(f"[寻路] 找到路径，共 {len(path)} 个路径点")
             self._current_path = path
+            self._path_target = target_global
+            self._execute_move(path, self_global)
+            return True
         else:
             self._log(f"[寻路] 无法到达目标，回退到 Tab 选怪")
-
-        return path
+            self._current_path = []
+            self._path_target = None
+            return False
 
     def _execute_move(self, path: List[Tuple[int, int]],
                       self_pos: Tuple[int, int]):
@@ -278,21 +334,19 @@ class DecisionEngine:
         取路径的下一个点，判断相对当前位置的方向，按对应的方向键。
 
         Args:
-            path:     A* 返回的路径点列表
-            self_pos: 当前自身坐标
+            path:     A* 返回的路径点列表（全局像素坐标）
+            self_pos: 当前自身全局坐标
         """
         commands = path_to_directions(path, self_pos)
         for cmd in commands:
             if cmd == "jump":
-                # 跳跃需要同时按方向键 + 跳跃键
-                # 先判断水平方向
                 if len(path) > 1:
                     next_pt = path[1]
                     if next_pt[0] > self_pos[0]:
                         self.executor.press_key("right", cooldown=0.1)
                     elif next_pt[0] < self_pos[0]:
                         self.executor.press_key("left", cooldown=0.1)
-                self.executor.press_key("alt", cooldown=1.0)  # 跳跃键
+                self.executor.press_key("alt", cooldown=1.0)
             elif cmd == "down":
                 self.executor.press_key("down", cooldown=0.3)
             elif cmd in ("left", "right"):
