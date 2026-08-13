@@ -58,7 +58,7 @@ JSON 配置字段说明
   mp_threshold:     MP 加蓝阈值
   mp_key:           加蓝键
   target_key:       选目标键
-  move_to_monster:  是否点击移动到怪物位置
+  move_to_monster:  是否启用 A* 寻路 + 方向键移动到怪物（False=仅Tab选怪+技能）
   skills:           技能列表 [{name, key, cooldown}, ...]
 """
 import json

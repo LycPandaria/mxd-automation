@@ -14,9 +14,22 @@
   1. HP 低于阈值 → 按加血键
   2. MP 低于阈值 → 按加蓝键
   3. 检测到怪物:
-     a. 若 move_to_monster=True → 点击怪位置（屏幕坐标）
+     a. 若 move_to_monster=True → A* 寻路 + 方向键移动到怪物平台
      b. 否则 → 按选目标键 + 轮转释放技能
   4. 没怪 → 按选目标键自动寻找目标
+
+================================================================================
+寻路机制（move_to_monster=True 时）
+================================================================================
+
+  冒险岛是 2D 横版游戏，移动靠方向键（← → ↑ ↓ + 跳跃），不能用鼠标点击。
+
+  每帧:
+    1. 用 AStarPathfinder 根据 YOLO 检测到的 floor/rope 构建网格
+    2. 搜索从自身位置到怪物位置的最短路径
+    3. 将路径转换为方向键指令并执行
+
+  如果 A* 找不到路径（跨平台不可达），回退到按 Tab 选同平台怪。
 
 ================================================================================
 技能轮转机制
@@ -43,12 +56,12 @@ Context 字段说明
   detections:     全部 YOLO 检测结果（含所有类别）
 """
 from dataclasses import dataclass, field
-from typing import List, Optional, Tuple, Callable, Any
+from typing import List, Optional, Tuple, Callable
 
 from ..perception.yolo_detector import Detection
-from ..perception.screen_capture import ScreenCapture
 from ..execution.action_executor import ActionExecutor
 from ..utils.config_loader import Config
+from .astar import AStarPathfinder, path_to_directions
 
 
 @dataclass
@@ -96,13 +109,16 @@ class DecisionEngine:
       1. HP 低 → 加血键
       2. MP 低 → 加蓝键
       3. 检测到怪物：
-         - 若 move_to_monster=True → 点击怪位置
+         - 若 move_to_monster=True → A* 寻路 + 方向键移动到怪物平台
          - 否则 → 按选目标键 + 轮转释放技能
       4. 没怪 → 按选目标键自动寻找目标
 
-    【为什么需要 capture 引用】
-    当 move_to_monster=True 时，需要把怪物的窗口内坐标转成屏幕坐标，
-    才能通过 PostMessage 发送鼠标点击。没有 capture 引用就做不到这个转换。
+    【寻路模式 vs 简单模式】
+      move_to_monster=True: 启用 A* 寻路，根据 YOLO 检测到的地板/绳索
+      动态规划路径，输出方向键指令。适合跨平台场景。
+
+      move_to_monster=False: 简单模式，只按 Tab 选怪 + 释放技能。
+      适合同平台刷怪。
 
     【技能轮转】
     维护 _skill_index 计数器，每次释放技能后自增。
@@ -111,30 +127,31 @@ class DecisionEngine:
     Args:
         config:   全局配置
         executor: 动作执行器
-        capture:  截图器（用于坐标转换），None 表示不支持点击移动
         on_log:   日志回调
     """
 
     def __init__(self, config: Config, executor: ActionExecutor,
-                 capture: Optional[ScreenCapture] = None,
+                 capture=None,  # 保留参数兼容性，已不再使用
                  on_log: Optional[Callable[[str], None]] = None):
         self.config = config
         self.executor = executor
-        self.capture = capture
         self._log = on_log or (lambda m: None)
         self._skill_index = 0  # 技能轮转索引，每次释放后自增
+
+        # A* 寻路器: 每帧根据 YOLO 检测结果动态构建网格
+        self._pathfinder = AStarPathfinder()
+
+        # 当前寻路路径缓存: 每帧更新，用于多帧持续执行移动
+        self._current_path = []
 
     def update_config(self, config: Config):
         """更新配置引用（UI 修改配置后调用）。"""
         self.config = config
 
-    def update_capture(self, capture: ScreenCapture):
-        """更新截图器引用（窗口切换后调用）。"""
-        self.capture = capture
-
     def reset(self):
-        """重置状态：清空技能轮转索引和按键冷却记录。"""
+        """重置状态：清空技能轮转索引、按键冷却记录和寻路缓存。"""
         self._skill_index = 0
+        self._current_path = []
         self.executor.reset()
 
     # =========================================================================
@@ -163,22 +180,23 @@ class DecisionEngine:
         每帧调用一次，按优先级判断是否需要执行动作。
         一旦某个条件命中并执行了动作，立即 return 不再继续。
 
-        注意：目前只处理了 monsters 字段，floors/ropes/players/self_position
-        预留供后续扩展（寻路、避障、跟随等）。
+        寻路模式 (move_to_monster=True):
+          1. 用 YOLO 检测到的 floors/ropes 构建网格
+          2. A* 搜索从自身到怪物的路径
+          3. 路径存在 → 转换为方向键指令并执行
+          4. 路径不存在 → 回退到 Tab 选怪 + 技能
 
         Args:
             ctx: 当前帧的感知数据
         """
         # ---- 优先级 1: 没血加血 ----
-        # hp_ratio < hp_threshold 时触发
-        # cooldown=1.5: 加血后 1.5 秒内不重复触发
         if ctx.hp_ratio is not None and ctx.hp_ratio < self.config.hp_threshold:
             if self.executor.press_key(self.config.hp_key, cooldown=1.5):
                 self._log(
                     f"[加血] HP={ctx.hp_ratio:.0%} < {self.config.hp_threshold:.0%}，"
                     f"按下 {self.config.hp_key}"
                 )
-                return  # 执行了加血就返回，不再往下走
+                return
 
         # ---- 优先级 2: 没蓝加蓝 ----
         if ctx.mp_ratio is not None and ctx.mp_ratio < self.config.mp_threshold:
@@ -191,36 +209,108 @@ class DecisionEngine:
 
         # ---- 优先级 3: 检测到怪物 ----
         if ctx.monsters:
-            # 选面积最大的怪物作为目标（通常是离得最近或威胁最大的）
+            # 选面积最大的怪物作为目标
             target = max(ctx.monsters, key=lambda d: d.w * d.h)
             cx, cy = target.center
             self._log(
                 f"[检测] {target.cls_name} conf={target.confidence:.2f} @ ({cx},{cy})"
             )
 
-            # 3a: 可选 — 点击移动到怪物位置
-            # move_to_monster=True 时，把窗口内坐标转成屏幕坐标再点击
-            if self.config.move_to_monster and self.capture is not None:
-                # get_rect() 返回 (left, top, width, height)
-                # 窗口内坐标 (cx, cy) + 窗口左上角屏幕坐标 (left, top) = 屏幕坐标
-                rect = self.capture.get_rect()
-                self.executor.click(rect[0] + cx, rect[1] + cy)
-                return
+            # 3a: 寻路模式 — A* 动态规划路径，方向键移动
+            if self.config.move_to_monster and ctx.self_position:
+                path = self._plan_path(ctx, target)
+                if path:
+                    # 用路径生成方向键指令并执行
+                    self._execute_move(path, ctx.self_position)
+                    return
+                # 寻路失败，回退到简单模式
 
-            # 3b: 按选目标键选中怪物
+            # 3b: 简单模式 — 按选目标键选中怪物
             self.executor.press_key(self.config.target_key, cooldown=0.8)
 
             # 3c: 轮转释放技能
-            skills = self.config.skills
-            # 遍历技能列表，最多尝试一轮（len(skills) 次）
-            for _ in range(len(skills)):
-                # 取当前轮转位置的技能
-                skill = skills[self._skill_index % len(skills)]
-                self._skill_index += 1  # 索引自增，下一帧用下一个技能
-                # can_press 检查 + press_key 发送（带冷却）
-                if self.executor.press_key(skill["key"], skill["cooldown"]):
-                    self._log(f"[技能] 释放 {skill['name']} ({skill['key']})")
-                    break  # 成功释放一个技能就退出
+            self._cast_skill()
         else:
             # ---- 优先级 4: 没怪，按选目标键自动寻找目标 ----
             self.executor.press_key(self.config.target_key, cooldown=1.5)
+
+    # =========================================================================
+    # 寻路与移动
+    # =========================================================================
+
+    def _plan_path(self, ctx: Context, target: Detection) -> List[Tuple[int, int]]:
+        """A* 寻路：根据 YOLO 检测结果构建网格，搜索从自身到怪物的路径。
+
+        Args:
+            ctx:    当前帧感知数据（含 floors, ropes, self_position）
+            target: 目标怪物检测结果
+
+        Returns:
+            路径点列表（像素坐标），空列表表示无路径
+        """
+        if not ctx.self_position:
+            return []
+
+        # 根据 YOLO 检测到的地板和绳索构建网格
+        # 注意: 这里用的是 ctx.floors 和 ctx.ropes（已过滤类别）
+        self._pathfinder.build_grid(
+            ctx.floors, ctx.ropes,
+            frame_width=1366,   # TODO: 从 capture 获取实际帧尺寸
+            frame_height=768,
+        )
+
+        path = self._pathfinder.find_path(
+            ctx.self_position, target.center
+        )
+
+        if path:
+            self._log(f"[寻路] 找到路径，共 {len(path)} 个路径点")
+            self._current_path = path
+        else:
+            self._log(f"[寻路] 无法到达目标，回退到 Tab 选怪")
+
+        return path
+
+    def _execute_move(self, path: List[Tuple[int, int]],
+                      self_pos: Tuple[int, int]):
+        """根据路径生成方向键指令并执行。
+
+        取路径的下一个点，判断相对当前位置的方向，按对应的方向键。
+
+        Args:
+            path:     A* 返回的路径点列表
+            self_pos: 当前自身坐标
+        """
+        commands = path_to_directions(path, self_pos)
+        for cmd in commands:
+            if cmd == "jump":
+                # 跳跃需要同时按方向键 + 跳跃键
+                # 先判断水平方向
+                if len(path) > 1:
+                    next_pt = path[1]
+                    if next_pt[0] > self_pos[0]:
+                        self.executor.press_key("right", cooldown=0.1)
+                    elif next_pt[0] < self_pos[0]:
+                        self.executor.press_key("left", cooldown=0.1)
+                self.executor.press_key("alt", cooldown=1.0)  # 跳跃键
+            elif cmd == "down":
+                self.executor.press_key("down", cooldown=0.3)
+            elif cmd in ("left", "right"):
+                self.executor.press_key(cmd, cooldown=0.1)
+
+    # =========================================================================
+    # 技能释放
+    # =========================================================================
+
+    def _cast_skill(self):
+        """轮转释放技能。
+
+        遍历技能列表，跳过冷却中的技能，释放第一个可用的。
+        """
+        skills = self.config.skills
+        for _ in range(len(skills)):
+            skill = skills[self._skill_index % len(skills)]
+            self._skill_index += 1
+            if self.executor.press_key(skill["key"], skill["cooldown"]):
+                self._log(f"[技能] 释放 {skill['name']} ({skill['key']})")
+                break
