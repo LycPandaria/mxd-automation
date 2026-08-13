@@ -1,11 +1,61 @@
 """主程序入口与自动打怪主循环。
 
-``Automation`` 类整合感知层（ScreenCapture + Detector）、决策层
-（DecisionEngine）和执行层（ActionExecutor），在独立线程运行主循环：
+================================================================================
+架构概览（三层架构）
+================================================================================
 
-  截图 → YOLO 检测 → HP/MP 检测 → 决策（执行动作） → 预览回调
+  感知层 (perception/)         决策层 (decision/)        执行层 (execution/)
+  ┌──────────────────┐       ┌──────────────────┐     ┌──────────────────┐
+  │ ScreenCapture    │──帧──▶│ Context          │     │ ActionExecutor   │
+  │  (截图)          │       │  (数据载体)       │     │  (动作聚合)      │
+  │                  │       │                  │     │                  │
+  │ YoloDetector     │──框──▶│ DecisionEngine   │──▶│ KeyboardController│
+  │  (YOLO检测)      │       │  (决策逻辑)       │     │  (按键注入)      │
+  │                  │       │                  │     │                  │
+  │ detect_bar_ratio │──比─▶│ 加血/蓝/选怪/技能│     │ MouseController  │
+  │  (HP/MP检测)     │       │                  │     │  (鼠标注入)      │
+  │                  │       │                  │     │                  │
+  │ OCRNameLocator   │──坐─▶│ self_position    │     │                  │
+  │  (名字定位)       │       │  (自身坐标)      │     │                  │
+  └──────────────────┘       └──────────────────┘     └──────────────────┘
 
-通过 start/stop 控制，检测和预览结果通过回调（信号）传回 UI 线程。
+================================================================================
+数据流（每帧）
+================================================================================
+
+  1. ScreenCapture.grab()          → frame (numpy BGR 数组)
+  2. YoloDetector.detect(frame)    → [Detection, ...]  (怪物/地板/绳索/玩家)
+  3. detect_bar_ratio(hp_region)   → hp_ratio (0.0~1.0)
+  4. detect_bar_ratio(mp_region)   → mp_ratio (0.0~1.0)
+  5. OCRNameLocator.locate(frame)  → self_position (cx, cy) 或 None
+  6. Context(monsters, floors, ..., hp_ratio, mp_ratio, self_position)
+  7. DecisionEngine.decide(ctx)    → 加血/加蓝/选目标/释放技能
+  8. on_frame(frame, ...)          → 预览回调（UI 渲染检测框）
+
+================================================================================
+自身定位策略（三级优先级）
+================================================================================
+
+  优先级 1: HP 条偏移推算
+    原理: 角色头顶 HP 条 → 向下偏移 85px → 脚底坐标
+    条件: 有组队、HP 条区域已配置
+    优点: 最快、最准
+
+  优先级 2: RapidOCR 文字识别
+    原理: OCR 识别画面中的角色名字（如"我是立立"）→ 名字中心 = 脚底
+    条件: 已配置 self_name，每 30 帧执行一次
+    优点: 不依赖 HP 条，换时装不受影响
+
+  优先级 3: None
+    条件: 以上方案都不可用
+    后果: 决策层无法使用自身位置，寻路/移动功能不可用
+
+================================================================================
+运行方式
+================================================================================
+
+  GUI 模式:  python main.py
+  CLI 模式:  python -m src.main
 """
 import time
 import threading
@@ -25,45 +75,90 @@ from .utils.config_loader import Config
 class Automation:
     """自动打怪主循环控制器。
 
+    【职责】
+    整合三层架构，在独立线程中循环执行"截图 → 检测 → 决策 → 执行"。
+
+    【线程模型】
+    - 主线程: PyQt5 GUI 事件循环
+    - 工作线程: Automation._loop() 运行控制循环
+    - 通过回调 (on_log, on_frame) 把结果推回主线程
+
+    【生命周期】
+    1. 构造 Automation(config, detector, on_log, on_frame)
+    2. lock_window(title)    锁定游戏窗口
+    3. start()               启动工作线程
+    4. stop()                停止工作线程
+    5. unlock_window()       释放窗口
+
     Args:
-        config: 全局配置
-        detector: YOLO 检测器（None 时使用 MockDetector）
-        on_log:  回调 (str) -> None，日志
-        on_frame: 回调 (frame_bgr, detections, hp_ratio, mp_ratio) -> None，预览更新
+        config:   全局配置对象（窗口/检测/按键/技能等）
+        detector: YOLO 检测器实例，None 时自动创建 MockDetector
+        on_log:   日志回调，参数 (message: str)
+        on_frame: 预览回调，参数 (frame, detections, hp_ratio, mp_ratio)
     """
 
     def __init__(self, config: Config, detector: Optional[Detector] = None,
                  on_log: Optional[Callable[[str], None]] = None,
                  on_frame: Optional[Callable[..., None]] = None):
+        # ---- 感知层 ----
         self.config = config
-        self.capture = ScreenCapture()
+        self.capture = ScreenCapture()  # 窗口截图（PrintWindow API）
+
+        # 检测器：如果传了就用，否则根据配置自动创建（模型不存在时回退 Mock）
         self.detector = detector if detector is not None else create_detector(
             config.model_path, config.confidence, on_log or (lambda m: None)
         )
-        self.executor = ActionExecutor()
+
+        # ---- 执行层 ----
+        self.executor = ActionExecutor()  # 聚合键盘 + 鼠标控制器
+
+        # ---- 决策层 ----
+        # DecisionEngine 需要 capture 引用，用于把窗口内坐标转屏幕坐标（点击怪物时）
         self.engine = DecisionEngine(
             config, self.executor, self.capture,
             on_log=on_log or (lambda m: None)
         )
+
+        # ---- 回调 ----
         self.on_log = on_log or (lambda m: None)
         self.on_frame = on_frame or (lambda f, d, h, m: None)
 
-        self._running = False
-        self._thread = None
+        # ---- 线程控制 ----
+        self._running = False  # 控制循环是否继续
+        self._thread = None    # 工作线程对象
+
+        # ---- OCR 名字定位器（延迟初始化，首次使用时才加载模型）----
+        # ocr_interval=30: 每 30 帧执行一次 OCR（约 2.3 秒 @13fps）
         self._ocr = OCRNameLocator(on_log=self.on_log, ocr_interval=30)
 
-    # ---- 窗口管理 ----
+    # =========================================================================
+    # 窗口管理
+    # =========================================================================
 
     def list_windows(self):
+        """枚举所有可见窗口，返回 [(hwnd, title), ...]。
+
+        用于 UI 下拉框选择要锁定的窗口。
+        """
         return self.capture.list_windows()
 
     def lock_window(self, title: str) -> str:
+        """按标题锁定游戏窗口。
+
+        锁定后：
+        1. ScreenCapture 可以截取该窗口画面
+        2. ActionExecutor 的 PostMessage 会注入到该窗口
+
+        Returns:
+            锁定后的窗口标题（用于确认）
+        """
         locked = self.capture.lock(title=title)
-        # 把窗口句柄传给执行层（PostMessage 注入）
+        # 把窗口句柄传给执行层，这样按键/鼠标消息会发到游戏中
         self.executor.set_target_window(self.capture.hwnd)
         return locked
 
     def unlock_window(self):
+        """释放窗口锁定。"""
         self.capture.unlock()
 
     @property
@@ -71,42 +166,79 @@ class Automation:
         return self.capture.locked
 
     def get_window_rect(self):
+        """获取窗口在屏幕中的矩形 (left, top, width, height)。"""
         return self.capture.get_rect() if self.capture.locked else None
 
-    # ---- 检测器 ----
+    # =========================================================================
+    # 检测器管理
+    # =========================================================================
 
     def set_detector(self, detector: Detector):
+        """运行时替换检测器（切换模型时用）。"""
         self.detector = detector
 
-    # ---- 主循环 ----
+    # =========================================================================
+    # 主循环控制
+    # =========================================================================
 
     @property
     def running(self):
+        """是否正在运行中。"""
         return self._running
 
     def start(self):
+        """启动自动打怪主循环。
+
+        在独立线程中运行 _loop()，不阻塞 UI 线程。
+
+        Raises:
+            RuntimeError: 未锁定窗口时调用
+        """
         if self._running:
             return
         if not self.capture.locked:
             raise RuntimeError("请先锁定游戏窗口")
-        # 配置可能被 UI 更新过，同步给决策引擎
+
+        # UI 可能修改了配置，同步到决策引擎
         self.engine.update_config(self.config)
-        self.engine.reset()
+        self.engine.reset()  # 清空技能轮转索引、冷却记录
+
         self._running = True
+        # daemon=True: 主线程退出时自动结束，不会卡住进程
         self._thread = threading.Thread(target=self._loop, daemon=True)
         self._thread.start()
         self.on_log("[启动] 自动打怪已开始")
 
     def stop(self):
+        """停止自动打怪。
+
+        设置 _running = False，_loop() 会在下一次迭代时退出。
+        """
         if not self._running:
             return
         self._running = False
         self.on_log("[停止] 自动打怪已停止")
 
     def _loop(self):
+        """主循环（在独立线程中运行）。
+
+        每帧执行:
+          1. 截图（grab）
+          2. YOLO 检测（detect）→ 按类别过滤
+          3. HP/MP 检测（颜色数像素）→ 比例
+          4. 自身定位（HP条偏移 / OCR 名字识别）→ 坐标
+          5. 组装 Context → DecisionEngine.decide()
+          6. 预览回调 → UI 渲染
+
+        FPS 控制: 通过 time.sleep() 补齐到 1/fps 秒
+        """
+        # 每帧的目标间隔时间（秒）
         interval = 1.0 / max(1, self.config.fps)
+
         while self._running:
-            t0 = time.time()
+            t0 = time.time()  # 帧开始时间
+
+            # ---- 1. 截图 ----
             try:
                 frame = self.capture.grab()
             except Exception as e:
@@ -114,29 +246,36 @@ class Automation:
                 time.sleep(interval)
                 continue
 
-            # YOLO 检测
+            # ---- 2. YOLO 检测 ----
+            # detect() 返回 [Detection, ...]，每个 Detection 包含:
+            #   cls_name, confidence, x, y, w, h, center
             try:
                 detections = self.detector.detect(frame)
             except Exception as e:
                 self.on_log(f"[错误] 检测失败: {e}")
                 detections = []
+
+            # 按类别名过滤（配置中可能用逗号分隔多个类别名）
             monster_classes = self._monster_classes()
             monsters = [d for d in detections if d.cls_name in monster_classes]
             floors = [d for d in detections if d.cls_name in self._floor_classes()]
             ropes = [d for d in detections if d.cls_name in self._rope_classes()]
             players = [d for d in detections if d.cls_name in self._player_classes()]
 
-            # HP 检测
+            # ---- 3. HP 检测 ----
+            # scale_region(): 把参考分辨率下的坐标缩放到当前帧的实际像素
+            # 这样同一个配置文件兼容不同窗口大小
             hp_region = self.config.scale_region(
                 self.config.hp_region, frame.shape[1], frame.shape[0]
             )
+            # detect_bar_ratio(): 多方法融合检测（边缘→亮度→颜色）
             hp_ratio = detect_bar_ratio(
                 frame, hp_region,
                 tuple(self.config.hp_color) if self.config.hp_color else None,
                 self.config.hp_tolerance,
             )
 
-            # MP 检测
+            # ---- 4. MP 检测 ----
             mp_region = self.config.scale_region(
                 self.config.mp_region, frame.shape[1], frame.shape[0]
             )
@@ -146,29 +285,38 @@ class Automation:
                 self.config.mp_tolerance,
             )
 
-            # 自身位置：HP条偏移优先，名字模板匹配兜底
+            # ---- 5. 自身定位 ----
             self_pos = self._locate_self(frame)
 
-            # 决策与执行
+            # ---- 6. 决策与执行 ----
+            # Context 是感知层 → 决策层的数据载体
             ctx = Context(
                 monsters=monsters,
                 floors=floors,
                 ropes=ropes,
                 players=players,
-                self_position=self_pos,
-                hp_ratio=hp_ratio,
-                mp_ratio=mp_ratio,
-                detections=detections,
+                self_position=self_pos,  # 自身脚底坐标 (cx, cy) 或 None
+                hp_ratio=hp_ratio,        # 0.0~1.0
+                mp_ratio=mp_ratio,        # 0.0~1.0
+                detections=detections,    # 全部检测结果（供调试/日志用）
             )
-            self.engine.decide(ctx)
+            self.engine.decide(ctx)  # 决策引擎根据上下文执行动作
 
-            # 预览回调
+            # ---- 7. 预览回调 ----
+            # 把 frame 和检测结果推给 UI 线程渲染
             self.on_frame(frame, detections, hp_ratio, mp_ratio)
 
-            # 控制 FPS
+            # ---- 8. FPS 控制 ----
             elapsed = time.time() - t0
             if elapsed < interval:
+                # 帧太快，sleep 补齐
                 time.sleep(interval - elapsed)
+
+    # =========================================================================
+    # 类别名解析（从配置的逗号分隔字符串 → 列表）
+    # 例如: "monster" → ["monster"]
+    #       "monster,boss" → ["monster", "boss"]
+    # =========================================================================
 
     def _monster_classes(self):
         return [c.strip() for c in self.config.monster_classes.split(",") if c.strip()]
@@ -182,36 +330,56 @@ class Automation:
     def _player_classes(self):
         return [c.strip() for c in self.config.player_classes.split(",") if c.strip()]
 
-    # ---- 自身定位 ----
+    # =========================================================================
+    # 自身定位
+    # =========================================================================
 
     def set_self_name(self, name: str):
-        """运行时更新自身名字。"""
+        """运行时更新自身名字（UI 输入框改动时调用）。"""
         self.config.self_name = name
 
     def _locate_self(self, frame: np.ndarray) -> Optional[Tuple[int, int]]:
-        """定位自身脚底坐标。
+        """定位自身脚底在画面中的坐标。
 
-        策略：
-          1. 有 HP 条 → HP 条底部偏移推算（最准）
-          2. OCR 识别脚底名字文字
-          3. 都没有 → None
+        返回值是该帧中角色脚底像素的 (x, y) 坐标（窗口内坐标）。
+
+        策略（按优先级）:
+          1. HP 条偏移推算 - 需要 hp_region 已配置
+             原理: 角色头顶 HP 条中心 → 向下偏移 self_offset 像素 → 脚底
+             优点: 最快（O(1)），最准
+
+          2. RapidOCR 文字识别 - 需要 self_name 已配置
+             原理: 在画面中搜索角色名字文字 → 文字区域中心 = 脚底
+             优点: 不依赖 HP 条，换时装不受影响
+             注意: 每 30 帧才执行一次（OCR 速度较慢）
+
+        Returns:
+            (cx, cy) 脚底坐标，None 表示无法定位
         """
-        # 方案1: HP条偏移
+        # ---- 方案1: HP 条偏移推算 ----
+        # hp_region 为 None 表示用户未框选 HP 条区域
         if self.config.hp_region:
+            # 把参考分辨率下的坐标缩放到当前帧
             hp_region = self.config.scale_region(
                 self.config.hp_region, frame.shape[1], frame.shape[0]
             )
             if hp_region:
                 hx, hy, hw, hh = hp_region
+                # 偏移量也按窗口高度缩放
                 offset = self.config.scale_offset(self.config.self_offset, frame.shape[0])
+                # HP 条中心 + 向下偏移 = 脚底坐标
                 return (hx + hw // 2, hy + hh + offset)
 
-        # 方案2: OCR 识别脚底名字
+        # ---- 方案2: RapidOCR 文字识别 ----
+        # OCRNameLocator 内部有帧间隔控制，不是每帧都执行
         return self._ocr.locate(frame, self.config.self_name)
 
 
 def main():
-    """CLI 入口（无 GUI）：加载配置并启动主循环，按 Ctrl+C 退出。"""
+    """CLI 入口（无 GUI）：加载配置并启动主循环，按 Ctrl+C 退出。
+
+    用法: python -m src.main
+    """
     from .utils.logger import get_logger
     log = get_logger()
 

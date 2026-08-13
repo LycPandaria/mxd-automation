@@ -1,258 +1,296 @@
-"""配置加载器。
+"""配置加载与配置实体。
 
-加载策略（双层覆盖）：
-  1. 先读 ``config/default.yaml`` 作为默认值（程序自带，请勿手动改）。
-  2. 再读 ``config/user.json`` 覆盖同名字段（运行时用户改动写入此文件）。
+================================================================================
+配置系统设计
+================================================================================
 
-对外保持扁平字段名（``cfg.hp_key`` / ``cfg.hp_threshold`` 等），与旧版
-``app/config.py`` 兼容，UI 层迁移成本最小。YAML/JSON 内部使用嵌套结构
-(``hp.key`` / ``hp.threshold``)，加载/保存时做扁平 ↔ 嵌套的双向转换。
+  配置分为两层:
+    - 默认配置: 内置在代码中，提供合理的出厂默认值
+    - 用户配置: 保存在 config/user.json，覆盖默认值
 
-需要 PyYAML：``pip install pyyaml``。
+  双层覆盖机制:
+    1. 先加载默认配置（_defaults()）
+    2. 再读取 user.json，用用户配置覆盖同名字段
+    3. 最终 Config 对象包含合并后的值
+
+  这样用户只需要配置自己关心的字段，其余使用默认值即可。
+
+================================================================================
+坐标自适应
+================================================================================
+
+  问题: 配置文件中的 HP 区域 / 自身偏移 等坐标是参考 1366×768 分辨率
+       记录的，但实际运行时窗口可能不同（如 1920×1080）。
+
+  解决: scale_region() 和 scale_offset() 根据参考分辨率与当前帧的比例，
+       自动缩放坐标值。
+
+  公式:
+    scale_x = 当前帧宽 / 参考帧宽
+    scale_y = 当前帧高 / 参考帧高
+    scaled_x = x * scale_x
+    scaled_y = y * scale_y
+
+================================================================================
+JSON 配置字段说明
+================================================================================
+
+  window_title:     游戏窗口标题（用于 FindWindow 锁定）
+  reference_width:  参考分辨率宽度（坐标记录时的分辨率）
+  reference_height: 参考分辨率高度
+  fps:              目标帧率
+  confidence:       YOLO 检测置信度阈值 (0.0~1.0)
+  model_path:       YOLO 模型文件路径
+  monster_classes:  怪物类别名（逗号分隔）
+  floor_classes:    地板类别名
+  rope_classes:     绳索类别名
+  player_classes:   玩家类别名
+  self_name:        自身角色名字（用于 OCR 定位）
+  self_offset:      自身 HP 条底部到脚底的偏移像素数
+  hp_region:        HP 条参考区域 [x, y, w, h]
+  hp_color:         HP 条颜色 [R, G, B]
+  hp_tolerance:     HP 条颜色容差
+  hp_threshold:     HP 加血阈值 (0.0~1.0)
+  hp_key:           加血键
+  mp_region:        MP 条参考区域
+  mp_color:         MP 条颜色
+  mp_tolerance:     MP 条颜色容差
+  mp_threshold:     MP 加蓝阈值
+  mp_key:           加蓝键
+  target_key:       选目标键
+  move_to_monster:  是否点击移动到怪物位置
+  skills:           技能列表 [{name, key, cooldown}, ...]
 """
-from __future__ import annotations
-
 import json
 import os
-from dataclasses import dataclass, field, asdict
-from typing import List, Optional
-
-try:
-    import yaml
-    _YAML_AVAILABLE = True
-except ImportError:
-    _YAML_AVAILABLE = False
+from typing import List, Optional, Dict, Any, Tuple
 
 
-# 路径常量
-_BASE_DIR = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-_DEFAULT_YAML = os.path.join(_BASE_DIR, "config", "default.yaml")
-_USER_JSON = os.path.join(_BASE_DIR, "config", "user.json")
+# ---- 路径常量 ----
+PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+CONFIG_DIR = os.path.join(PROJECT_ROOT, "config")
+DEFAULT_CONFIG_PATH = os.path.join(CONFIG_DIR, "user.json")
 
 
-@dataclass
-class Config:
-    """运行时配置（字段与旧版 app/config.py 兼容）。
+def _defaults() -> Dict[str, Any]:
+    """返回默认配置字典。
 
-    字段保持扁平命名，加载时从嵌套 YAML/JSON 转换而来。
+    这里定义了所有配置项的默认值。用户 JSON 中未配置的字段
+    会使用这些默认值。
+
+    修改这些默认值会影响所有用户（除非用户在 user.json 中覆盖）。
+
+    Returns:
+        包含所有默认配置的字典
     """
-
-    # ---- 窗口 ----
-    window_title: str = ""
-    ref_width: int = 1366
-    ref_height: int = 768
-
-    # ---- 检测 ----
-    model_path: str = ""
-    confidence: float = 0.5
-    monster_classes: str = "monster"
-    floor_classes: str = "floor"
-    rope_classes: str = "rope"
-    player_classes: str = "player"
-    self_name: str = ""
-    self_offset: int = 85
-    fps: int = 13
-
-    # ---- 血量 ----
-    hp_key: str = "f"
-    hp_threshold: float = 0.99
-    hp_region: Optional[List[int]] = None
-    hp_color: List[int] = field(default_factory=lambda: [231, 34, 34])
-    hp_tolerance: int = 20
-
-    # ---- 蓝量 ----
-    mp_key: str = "g"
-    mp_threshold: float = 0.3
-    mp_region: Optional[List[int]] = None
-    mp_color: List[int] = field(default_factory=lambda: [3, 130, 232])
-    mp_tolerance: int = 20
-
-    # ---- 战斗 ----
-    target_key: str = "tab"
-    skills: List[dict] = field(default_factory=lambda: [
-        {"name": "技能1", "key": "1", "cooldown": 1.0},
-        {"name": "技能2", "key": "2", "cooldown": 3.0},
-        {"name": "技能3", "key": "3", "cooldown": 8.0},
-    ])
-    move_to_monster: bool = False
-
-    # ---- 热键 ----
-    start_stop_hotkey: str = "f12"
-
-    # ---- 人类模拟参数（新架构预留，UI 暂不暴露）----
-    humanize_key_delay_min: float = 0.02
-    humanize_key_delay_max: float = 0.06
-    humanize_press_cooldown: float = 1.5
-
-    def scale_region(self, region: Optional[List[int]],
-                     current_w: int, current_h: int) -> Optional[List[int]]:
-        """将参考分辨率下的坐标缩放到当前窗口尺寸。"""
-        if not region or len(region) < 4:
-            return None
-        sx = current_w / max(1, self.ref_width)
-        sy = current_h / max(1, self.ref_height)
-        return [int(region[0] * sx), int(region[1] * sy),
-                int(region[2] * sx), int(region[3] * sy)]
-
-    def scale_offset(self, offset: int, current_h: int) -> int:
-        """将参考分辨率下的垂直偏移缩放到当前窗口高度。"""
-        return int(offset * current_h / max(1, self.ref_height))
-
-
-# ---------------- 扁平 ↔ 嵌套 转换 ----------------
-
-def _flat_to_nested(cfg: Config) -> dict:
-    """扁平字段 → 嵌套字典（用于写 user.json）。"""
     return {
-        "window": {
-            "title": cfg.window_title,
-            "ref_width": cfg.ref_width,
-            "ref_height": cfg.ref_height,
-        },
-        "detection": {
-            "model_path": cfg.model_path,
-            "confidence": cfg.confidence,
-            "monster_classes": cfg.monster_classes,
-            "floor_classes": cfg.floor_classes,
-            "rope_classes": cfg.rope_classes,
-            "player_classes": cfg.player_classes,
-            "self_name": cfg.self_name,
-            "self_offset": cfg.self_offset,
-            "fps": cfg.fps,
-        },
-        "hp": {
-            "key": cfg.hp_key,
-            "threshold": cfg.hp_threshold,
-            "color": list(cfg.hp_color) if cfg.hp_color else [],
-            "tolerance": cfg.hp_tolerance,
-            "region": list(cfg.hp_region) if cfg.hp_region else [],
-        },
-        "mp": {
-            "key": cfg.mp_key,
-            "threshold": cfg.mp_threshold,
-            "color": list(cfg.mp_color) if cfg.mp_color else [],
-            "tolerance": cfg.mp_tolerance,
-            "region": list(cfg.mp_region) if cfg.mp_region else [],
-        },
-        "combat": {
-            "target_key": cfg.target_key,
-            "move_to_monster": cfg.move_to_monster,
-            "skills": [dict(s) for s in cfg.skills],
-        },
-        "hotkey": {"start_stop": cfg.start_stop_hotkey},
-        "humanize": {
-            "key_delay_min": cfg.humanize_key_delay_min,
-            "key_delay_max": cfg.humanize_key_delay_max,
-            "press_cooldown": cfg.humanize_press_cooldown,
-        },
+        # ---- 窗口 ----
+        "window_title": "",
+        # ---- 分辨率自适应 ----
+        # 参考分辨率：坐标录制时的分辨率，所有坐标配置都基于此分辨率
+        "reference_width": 1366,
+        "reference_height": 768,
+        # ---- 性能 ----
+        "fps": 13,
+        # ---- 模型 ----
+        "confidence": 0.5,
+        "model_path": "assets/models/best.pt",
+        # ---- 类别 ----
+        "monster_classes": "monster",
+        "floor_classes": "floor",
+        "rope_classes": "rope",
+        "player_classes": "player",
+        # ---- 自身定位 ----
+        "self_name": "",  # 角色脚底名字，用于 OCR 定位
+        "self_offset": 85,  # HP 条底部 → 脚底的偏移像素
+        # ---- HP 检测 ----
+        "hp_region": None,  # [x, y, w, h] 参考分辨率下的 HP 条区域
+        "hp_color": [51, 204, 51],  # HP 条绿色 RGB
+        "hp_tolerance": 30,  # 颜色容差
+        "hp_threshold": 0.3,  # 低于 30% 时加血
+        "hp_key": "f",  # 加血快捷键
+        # ---- MP 检测 ----
+        "mp_region": None,
+        "mp_color": [51, 153, 255],  # MP 条蓝色 RGB
+        "mp_tolerance": 30,
+        "mp_threshold": 0.3,
+        "mp_key": "g",  # 加蓝快捷键
+        # ---- 战斗 ----
+        "target_key": "tab",  # 选目标键
+        "move_to_monster": False,  # 是否点击移动到怪物位置
+        "skills": [
+            {"name": "技能1", "key": "1", "cooldown": 1.0},
+            {"name": "技能2", "key": "2", "cooldown": 3.0},
+            {"name": "技能3", "key": "3", "cooldown": 8.0},
+        ],
     }
 
 
-def _nested_to_flat(data: dict, cfg: Config) -> Config:
-    """嵌套字典 → 扁平字段（赋值到现有 Config 实例）。"""
-    win = data.get("window", {})
-    cfg.window_title = win.get("title", cfg.window_title)
-    cfg.ref_width = int(win.get("ref_width", cfg.ref_width))
-    cfg.ref_height = int(win.get("ref_height", cfg.ref_height))
+class Config:
+    """配置实体类。
 
-    det = data.get("detection", {})
-    cfg.model_path = det.get("model_path", cfg.model_path)
-    cfg.confidence = float(det.get("confidence", cfg.confidence))
-    cfg.monster_classes = det.get("monster_classes", cfg.monster_classes)
-    cfg.floor_classes = det.get("floor_classes", cfg.floor_classes)
-    cfg.rope_classes = det.get("rope_classes", cfg.rope_classes)
-    cfg.player_classes = det.get("player_classes", cfg.player_classes)
-    cfg.self_name = det.get("self_name", cfg.self_name)
-    cfg.self_offset = int(det.get("self_offset", cfg.self_offset))
-    cfg.fps = int(det.get("fps", cfg.fps))
+    封装双层配置（默认 + 用户），提供属性访问和坐标缩放功能。
 
-    hp = data.get("hp", {})
-    cfg.hp_key = hp.get("key", cfg.hp_key)
-    cfg.hp_threshold = float(hp.get("threshold", cfg.hp_threshold))
-    hp_color = hp.get("color")
-    if hp_color:
-        cfg.hp_color = list(hp_color)
-    cfg.hp_tolerance = int(hp.get("tolerance", cfg.hp_tolerance))
-    hp_region = hp.get("region")
-    if hp_region:
-        cfg.hp_region = list(hp_region)
+    用法:
+        cfg = Config.load()  # 从 config/user.json 加载
+        cfg = Config(overrides={"hp_region": [100, 200, 50, 10]})  # 覆盖某项
 
-    mp = data.get("mp", {})
-    cfg.mp_key = mp.get("key", cfg.mp_key)
-    cfg.mp_threshold = float(mp.get("threshold", cfg.mp_threshold))
-    mp_color = mp.get("color")
-    if mp_color:
-        cfg.mp_color = list(mp_color)
-    cfg.mp_tolerance = int(mp.get("tolerance", cfg.mp_tolerance))
-    mp_region = mp.get("region")
-    if mp_region:
-        cfg.mp_region = list(mp_region)
+    Attributes:
+        所有 JSON 配置字段都作为属性直接访问，如 cfg.hp_threshold, cfg.fps 等。
+        属性名与 JSON 字段名一致（下划线命名）。
+    """
 
-    cb = data.get("combat", {})
-    cfg.target_key = cb.get("target_key", cfg.target_key)
-    cfg.move_to_monster = bool(cb.get("move_to_monster", cfg.move_to_monster))
-    skills = cb.get("skills")
-    if skills:
-        cfg.skills = list(skills)
+    def __init__(self, overrides: Optional[Dict[str, Any]] = None):
+        """构造配置对象。
 
-    hk = data.get("hotkey", {})
-    cfg.start_stop_hotkey = hk.get("start_stop", cfg.start_stop_hotkey)
+        Args:
+            overrides: 覆盖项字典，键值对会覆盖默认配置
+        """
+        # 1. 加载默认配置
+        data = _defaults()
 
-    hz = data.get("humanize", {})
-    cfg.humanize_key_delay_min = float(hz.get("key_delay_min", cfg.humanize_key_delay_min))
-    cfg.humanize_key_delay_max = float(hz.get("key_delay_max", cfg.humanize_key_delay_max))
-    cfg.humanize_press_cooldown = float(hz.get("press_cooldown", cfg.humanize_press_cooldown))
+        # 2. 用用户 JSON 覆盖
+        if os.path.isfile(DEFAULT_CONFIG_PATH):
+            try:
+                with open(DEFAULT_CONFIG_PATH, "r", encoding="utf-8") as f:
+                    user = json.load(f)
+                data.update(user)  # 用户配置覆盖默认配置
+            except Exception:
+                pass  # JSON 解析失败时忽略，使用默认值
 
-    return cfg
+        # 3. 用运行时覆盖项覆盖
+        if overrides:
+            data.update(overrides)
 
+        self._data = data
 
-# ---------------- 对外 API ----------------
+    # =========================================================================
+    # 工厂方法
+    # =========================================================================
 
-def load_config() -> Config:
-    """加载配置：先读 default.yaml，再用 user.json 覆盖。"""
-    cfg = Config()
+    @classmethod
+    def load(cls, path: Optional[str] = None) -> "Config":
+        """从指定路径加载配置。
 
-    # 1. default.yaml
-    if _YAML_AVAILABLE and os.path.exists(_DEFAULT_YAML):
+        Args:
+            path: JSON 配置文件路径，None 时使用默认路径 config/user.json
+
+        Returns:
+            Config 实例
+        """
+        if path is None:
+            path = DEFAULT_CONFIG_PATH
+        data = _defaults()
+        if os.path.isfile(path):
+            with open(path, "r", encoding="utf-8") as f:
+                data.update(json.load(f))
+        return cls(overrides=None)  # 上面的 data 处理逻辑在 __init__ 中
+
+    def save(self, path: Optional[str] = None):
+        """保存当前配置到 JSON 文件。
+
+        Args:
+            path: 保存路径，None 时使用默认路径
+        """
+        if path is None:
+            path = DEFAULT_CONFIG_PATH
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(self._data, f, ensure_ascii=False, indent=2)
+
+    def merge(self, updates: Dict[str, Any]):
+        """合并配置项（运行时修改）。
+
+        Args:
+            updates: 要更新的键值对
+        """
+        self._data.update(updates)
+
+    # =========================================================================
+    # 属性访问：让配置项像属性一样访问
+    # 例如: cfg.hp_threshold 等价于 cfg._data["hp_threshold"]
+    # =========================================================================
+
+    def __getattr__(self, name: str):
+        """属性访问降级到 _data 字典。
+
+        如果正常属性找不到（如 __dict__ 中没有），
+        就在 _data 字典中查找。这样可以让配置项像属性一样访问。
+
+        例如: cfg.hp_threshold → cfg._data["hp_threshold"]
+        """
+        if name.startswith("_"):
+            raise AttributeError(name)
         try:
-            with open(_DEFAULT_YAML, "r", encoding="utf-8") as f:
-                default_data = yaml.safe_load(f) or {}
-            cfg = _nested_to_flat(default_data, cfg)
-        except Exception:
-            pass
+            return self._data[name]
+        except KeyError:
+            raise AttributeError(f"Config 没有 '{name}' 字段")
 
-    # 2. user.json 覆盖
-    if os.path.exists(_USER_JSON):
-        try:
-            with open(_USER_JSON, "r", encoding="utf-8") as f:
-                user_data = json.load(f)
-            cfg = _nested_to_flat(user_data, cfg)
-        except Exception:
-            pass
+    def __setattr__(self, name: str, value):
+        """属性赋值：保存在 _data 中。
 
-    return cfg
+        非私有属性（不以下划线开头）直接写入 _data 字典。
+        私有属性（如 _data）正常走标准属性赋值。
+        """
+        if name.startswith("_"):
+            super().__setattr__(name, value)
+        else:
+            self._data[name] = value
+
+    # =========================================================================
+    # 坐标自适应缩放
+    # =========================================================================
+
+    def scale_region(self, region: Optional[List[int]],
+                     frame_width: int, frame_height: int) -> Optional[Tuple[int, int, int, int]]:
+        """将参考分辨率下的区域坐标缩放到当前帧。
+
+        公式:
+          scaled_x = x * (frame_width / reference_width)
+          scaled_y = y * (frame_height / reference_height)
+
+        Args:
+            region:      参考分辨率下的区域 [x, y, w, h]，None 返回 None
+            frame_width:  当前帧宽度（像素）
+            frame_height: 当前帧高度（像素）
+
+        Returns:
+            缩放后的区域 (x, y, w, h)，region 为 None 时返回 None
+        """
+        if region is None:
+            return None
+        x, y, w, h = region
+        sx = frame_width / self.reference_width
+        sy = frame_height / self.reference_height
+        return (
+            int(x * sx),   # 缩放后的 x
+            int(y * sy),   # 缩放后的 y
+            int(w * sx),   # 缩放后的宽度
+            int(h * sy),   # 缩放后的高度
+        )
+
+    def scale_offset(self, offset: int, frame_height: int) -> int:
+        """将参考分辨率下的偏移量缩放到当前帧高度。
+
+        公式: scaled_offset = offset * (frame_height / reference_height)
+
+        Args:
+            offset:       参考分辨率下的偏移（像素）
+            frame_height: 当前帧高度（像素）
+
+        Returns:
+            缩放后的偏移量
+        """
+        return int(offset * frame_height / self.reference_height)
 
 
-def save_user_config(cfg: Config):
-    """保存用户配置到 user.json（不写 default.yaml）。"""
-    os.makedirs(os.path.dirname(_USER_JSON), exist_ok=True)
-    data = _flat_to_nested(cfg)
-    with open(_USER_JSON, "w", encoding="utf-8") as f:
-        json.dump(data, f, ensure_ascii=False, indent=2)
+def load_config(path: Optional[str] = None) -> Config:
+    """快捷函数：加载配置。
 
+    Args:
+        path: JSON 配置文件路径，None 使用默认路径
 
-# 向后兼容：旧代码用 save_config / config_path 名称
-save_config = save_user_config
-
-
-def default_yaml_path() -> str:
-    return _DEFAULT_YAML
-
-
-def user_json_path() -> str:
-    return _USER_JSON
-
-
-# 旧代码兼容：config_path() 返回 user.json 路径
-def config_path() -> str:
-    return _USER_JSON
+    Returns:
+        Config 实例
+    """
+    return Config.load(path)
