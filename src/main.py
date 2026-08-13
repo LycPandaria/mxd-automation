@@ -7,18 +7,16 @@
 
 通过 start/stop 控制，检测和预览结果通过回调（信号）传回 UI 线程。
 """
-import os
 import time
 import threading
 from typing import Callable, Optional, Any, Tuple
 
-import cv2
 import numpy as np
-from PIL import Image, ImageDraw, ImageFont
 
 from .perception.screen_capture import ScreenCapture
 from .perception.yolo_detector import Detector, create_detector
 from .perception.hp_mp_detector import detect_bar_ratio
+from .perception.ocr_name_locator import OCRNameLocator
 from .execution.action_executor import ActionExecutor
 from .decision.context import Context, DecisionEngine
 from .utils.config_loader import Config
@@ -52,8 +50,7 @@ class Automation:
 
         self._running = False
         self._thread = None
-        self._name_template = None  # 名字渲染图（用于自身定位）
-        self._render_name_template()
+        self._ocr = OCRNameLocator(on_log=self.on_log, ocr_interval=30)
 
     # ---- 窗口管理 ----
 
@@ -187,57 +184,16 @@ class Automation:
 
     # ---- 自身定位 ----
 
-    def _render_name_template(self):
-        """将 self_name 文本渲染为模板图片，用于 cv2.matchTemplate 匹配。"""
-        name = self.config.self_name.strip()
-        if not name:
-            self._name_template = None
-            return
-
-        # 尝试匹配游戏内字体，找不到则用默认字体
-        font_paths = [
-            os.path.join(os.environ.get("WINDIR", "C:\\Windows"), "Fonts", "simhei.ttf"),
-            os.path.join(os.environ.get("WINDIR", "C:\\Windows"), "Fonts", "msyh.ttc"),
-            os.path.join(os.environ.get("WINDIR", "C:\\Windows"), "Fonts", "msyhbd.ttc"),
-        ]
-        font = None
-        for fp in font_paths:
-            if os.path.exists(fp):
-                try:
-                    font = ImageFont.truetype(fp, 14)
-                    break
-                except Exception:
-                    continue
-        if font is None:
-            font = ImageFont.load_default()
-
-        # 测量文字尺寸
-        dummy = Image.new("RGB", (1, 1))
-        draw = ImageDraw.Draw(dummy)
-        bbox = draw.textbbox((0, 0), name, font=font)
-        tw, th = bbox[2] - bbox[0], bbox[3] - bbox[1]
-        padding = 4
-        w, h = tw + padding * 2, th + padding * 2
-
-        # 渲染：灰色背景 + 白色文字（模拟脚底名字区域）
-        img = Image.new("RGB", (w, h), color=(60, 60, 60))
-        draw = ImageDraw.Draw(img)
-        draw.text((padding - bbox[0], padding - bbox[1]), name, fill=(255, 255, 255), font=font)
-
-        self._name_template = cv2.cvtColor(np.array(img), cv2.COLOR_RGB2BGR)
-        self.on_log(f"[定位] 名字模板已渲染: {name} ({w}x{h})")
-
     def set_self_name(self, name: str):
-        """运行时更新自身名字并重新渲染模板。"""
+        """运行时更新自身名字。"""
         self.config.self_name = name
-        self._render_name_template()
 
     def _locate_self(self, frame: np.ndarray) -> Optional[Tuple[int, int]]:
         """定位自身脚底坐标。
 
         策略：
-          1. 有 HP 条区域 → HP 条底部偏移推算（最准）
-          2. 有名字模板 → cv2.matchTemplate 匹配脚底名字
+          1. 有 HP 条 → HP 条底部偏移推算（最准）
+          2. OCR 识别脚底名字文字
           3. 都没有 → None
         """
         # 方案1: HP条偏移
@@ -250,16 +206,8 @@ class Automation:
                 offset = self.config.scale_offset(self.config.self_offset, frame.shape[0])
                 return (hx + hw // 2, hy + hh + offset)
 
-        # 方案2: 名字模板匹配
-        if self._name_template is not None:
-            th, tw = self._name_template.shape[:2]
-            result = cv2.matchTemplate(frame, self._name_template, cv2.TM_CCOEFF_NORMED)
-            _, max_val, _, max_loc = cv2.minMaxLoc(result)
-            if max_val >= 0.7:
-                # 名字在脚底，匹配位置就是脚底位置
-                return (max_loc[0] + tw // 2, max_loc[1] + th // 2)
-
-        return None
+        # 方案2: OCR 识别脚底名字
+        return self._ocr.locate(frame, self.config.self_name)
 
 
 def main():
