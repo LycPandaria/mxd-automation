@@ -6,5 +6,4 @@ names:
   0: floor
   1: monster
   2: rope
-  3: player
-nc: 4
+nc: 3

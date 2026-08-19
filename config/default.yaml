@@ -14,7 +14,7 @@ detection:
   monster_classes: "monster"   # 逗号分隔的怪物类别名
   floor_classes: "floor"       # 地板类别名
   rope_classes: "rope"         # 绳索类别名
-  player_classes: "player"     # 其他玩家类别名（自身不靠 YOLO）
+  player_classes: ""            # 其他玩家类别名（已移除，不标注）
   self_name: ""               # 自身角色名（用于脚底名字匹配定位）
   self_offset: 85             # HP条底部到脚底的像素偏移（参考分辨率下）
   fps: 13
