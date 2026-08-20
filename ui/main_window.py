@@ -11,14 +11,22 @@
   - ``src.perception``：检测器与区域颜色识别
   - ``ui.preview_label.PreviewLabel``：预览与框选
 """
+import os
+import sys
 import time
+
+# 确保项目根目录在 sys.path 中，使得 `src` / `ui` 可作为顶层包导入
+_PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+if _PROJECT_ROOT not in sys.path:
+    sys.path.insert(0, _PROJECT_ROOT)
 
 import cv2
 from PyQt5.QtWidgets import (
-    QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QPushButton, QLabel,
-    QLineEdit, QComboBox, QSlider, QGroupBox, QGridLayout, QTableWidget,
-    QTableWidgetItem, QHeaderView, QPlainTextEdit, QCheckBox, QFileDialog,
-    QMessageBox, QSplitter, QAbstractItemView, QSpinBox,
+    QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
+    QPushButton, QLabel, QLineEdit, QComboBox, QSlider, QGroupBox,
+    QGridLayout, QTableWidget, QTableWidgetItem, QHeaderView,
+    QPlainTextEdit, QCheckBox, QFileDialog, QMessageBox, QSplitter,
+    QAbstractItemView, QSpinBox,
 )
 from PyQt5.QtCore import Qt, QTimer, pyqtSignal
 from PyQt5.QtGui import QImage, QPixmap
@@ -30,7 +38,7 @@ from src.perception.yolo_detector import create_detector
 from src.perception.hp_mp_detector import detect_region_color
 from src.main import Automation
 
-from .preview_label import PreviewLabel
+from ui.preview_label import PreviewLabel
 
 
 class MainWindow(QMainWindow):
@@ -491,7 +499,6 @@ class MainWindow(QMainWindow):
             self.automation.set_detector(self.detector)
 
         self.automation.config = self.config
-        self.automation._render_name_template()  # 重新渲染名字模板
         try:
             self.automation.start()
         except Exception as e:
@@ -604,3 +611,11 @@ class MainWindow(QMainWindow):
         except Exception:
             pass
         super().closeEvent(event)
+
+
+if __name__ == "__main__":
+    app = QApplication(sys.argv)
+    app.setApplicationName("MXD 游戏辅助")
+    window = MainWindow()
+    window.show()
+    sys.exit(app.exec_())

@@ -1,4 +1,54 @@
 {
+  "window_title": "冒险岛怀旧服",
+  "start_stop_hotkey": "F6",
+  "reference_width": 1366,
+  "reference_height": 768,
+  "fps": 13,
+  "confidence": 0.5,
+  "model_path": "E:/pythonProjects/mxd-automation/train/scripts/02_train_yolo/model/best.pt",
+  "monster_classes": "monster",
+  "floor_classes": "floor",
+  "rope_classes": "rope",
+  "player_classes": "player",
+  "self_name": "",
+  "self_offset": 85,
+  "hp_region": null,
+  "hp_color": [
+    51,
+    204,
+    51
+  ],
+  "hp_tolerance": 30,
+  "hp_threshold": 0.3,
+  "hp_key": "f",
+  "mp_region": null,
+  "mp_color": [
+    51,
+    153,
+    255
+  ],
+  "mp_tolerance": 30,
+  "mp_threshold": 0.3,
+  "mp_key": "g",
+  "target_key": "tab",
+  "move_to_monster": false,
+  "skills": [
+    {
+      "name": "技能1",
+      "key": "1",
+      "cooldown": 1.0
+    },
+    {
+      "name": "技能2",
+      "key": "2",
+      "cooldown": 3.0
+    },
+    {
+      "name": "技能3",
+      "key": "3",
+      "cooldown": 8.0
+    }
+  ],
   "window": {
     "title": "冒险岛怀旧服"
   },
@@ -11,24 +61,54 @@
   "hp": {
     "key": "f",
     "threshold": 0.99,
-    "color": [231, 34, 34],
+    "color": [
+      231,
+      34,
+      34
+    ],
     "tolerance": 20,
-    "region": [510, 777, 108, 17]
+    "region": [
+      510,
+      777,
+      108,
+      17
+    ]
   },
   "mp": {
     "key": "g",
     "threshold": 0.3,
-    "color": [3, 130, 232],
+    "color": [
+      3,
+      130,
+      232
+    ],
     "tolerance": 20,
-    "region": [620, 777, 106, 18]
+    "region": [
+      620,
+      777,
+      106,
+      18
+    ]
   },
   "combat": {
     "target_key": "tab",
     "move_to_monster": false,
     "skills": [
-      {"name": "技能1", "key": "1", "cooldown": 1.0},
-      {"name": "技能2", "key": "2", "cooldown": 3.0},
-      {"name": "技能3", "key": "3", "cooldown": 8.0}
+      {
+        "name": "技能1",
+        "key": "1",
+        "cooldown": 1.0
+      },
+      {
+        "name": "技能2",
+        "key": "2",
+        "cooldown": 3.0
+      },
+      {
+        "name": "技能3",
+        "key": "3",
+        "cooldown": 8.0
+      }
     ]
   },
   "hotkey": {
