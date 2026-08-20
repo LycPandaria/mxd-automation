@@ -7,4 +7,4 @@
 """
 from .keyboard_controller import KeyboardController  # noqa: F401
 from .mouse_controller import MouseController  # noqa: F401
-from .action_executor import ActionExecutor, Controller  # noqa: F401
+from .action_executor import ActionExecutor  # noqa: F401

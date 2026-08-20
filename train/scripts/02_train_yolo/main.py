@@ -28,7 +28,7 @@ CLASSES = {0: "floor", 1: "monster", 2: "rope"}
 NAME_TO_ID = {v: k for k, v in CLASSES.items()}
 
 # 训练轮数
-EPOCHS = 100
+EPOCHS = 150
 
 # 批次大小（显存不够可调小，如 4 或 8）
 BATCH = 16
@@ -194,17 +194,15 @@ def train():
     print(f"设备: {'CUDA GPU' if DEVICE != 'cpu' else 'CPU'}")
     print("=" * 60)
 
-    # 步骤1：从 raw/ 复制数据到 auto_work/，划分训练集/验证集
     print("\n[步骤1] 准备训练数据...")
     train_count, val_count = prepare_data(RAW_DIR, WORK_DIR)
     if train_count == 0:
         print("[错误] raw/ 中没有可用的训练数据，请先手动标注一些图片")
         return
     create_data_yaml(WORK_DIR)
-
-    # 步骤2：训练
-    print("\n[步骤2] 开始训练...")
     data_yaml = str(Path(WORK_DIR) / "data.yaml")
+
+    print("\n[步骤2] 开始训练...")
     model = YOLO(MODEL_PATH)
     model.train(
         data=data_yaml,
@@ -216,9 +214,11 @@ def train():
         name="train",
         exist_ok=True,
         verbose=True,
+        seed=SEED,
+        workers=4,
+        patience=20,
     )
 
-    # 步骤3：复制 best.pt 到脚本自己的 model/ 目录
     best_pt = Path(RUNS_DIR) / "train" / "weights" / "best.pt"
     if best_pt.exists():
         os.makedirs(MODEL_OUTPUT_DIR, exist_ok=True)

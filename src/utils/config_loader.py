@@ -71,6 +71,11 @@ PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(_
 CONFIG_DIR = os.path.join(PROJECT_ROOT, "config")
 DEFAULT_CONFIG_PATH = os.path.join(CONFIG_DIR, "user.json")
 
+# 别名，供外部导入
+config_path = DEFAULT_CONFIG_PATH
+user_json_path = DEFAULT_CONFIG_PATH
+default_yaml_path = os.path.join(PROJECT_ROOT, "assets", "default.yaml")
+
 
 def _defaults() -> Dict[str, Any]:
     """返回默认配置字典。
@@ -86,6 +91,8 @@ def _defaults() -> Dict[str, Any]:
     return {
         # ---- 窗口 ----
         "window_title": "",
+        # ---- 热键 ----
+        "start_stop_hotkey": "F6",
         # ---- 分辨率自适应 ----
         # 参考分辨率：坐标录制时的分辨率，所有坐标配置都基于此分辨率
         "reference_width": 1366,
@@ -294,3 +301,22 @@ def load_config(path: Optional[str] = None) -> Config:
         Config 实例
     """
     return Config.load(path)
+
+
+def save_config(config: Config, path: str):
+    """保存配置到指定路径。
+
+    Args:
+        config: Config 实例
+        path: 保存路径
+    """
+    config.save(path)
+
+
+def save_user_config(config: Config):
+    """保存配置到默认用户配置文件。
+
+    Args:
+        config: Config 实例
+    """
+    config.save(DEFAULT_CONFIG_PATH)
