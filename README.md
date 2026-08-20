@@ -83,17 +83,41 @@ python main.py
 python -m src.main
 ```
 
-## 训练（可选）
+## 训练
+
+### 数据标注
+
+1. 将截图放入 `train/data/raw/` 目录
+2. 使用标注工具（如 LabelImg）对图片进行手动标注，保存为 Pascal VOC XML 格式
+3. 标注的 XML 文件与图片同名，放在同一目录下
+
+### 自动标注
+
+基于已手动标注的图片，训练模型后自动标注剩余图片：
 
 ```bash
-# 1. 准备数据集（80/20 划分训练集/验证集）
-python train/scripts/01_prepare_dataset.py
-
-# 2. 训练 YOLO
-python train/scripts/02_train_yolo.py
+cd train/data/raw
+python train/scripts/03_auto_annotate.py
 ```
 
-训练完成后，`train/runs/exp/weights/best.pt` 会自动复制到 `assets/models/`。
+**流程：**
+1. 清空 `auto_work/` 临时工作目录
+2. 扫描 `raw/` 中所有有 XML 的图片作为训练集
+3. 复制到 `auto_work/`，转为 YOLO 训练格式
+4. 用预训练 YOLOv8n 微调
+5. 对未标注图片推理，生成 XML 保存到 `raw/`
+
+**配置参数**（`03_auto_annotate.py` 顶部）：
+
+| 参数 | 默认值 | 说明 |
+|---|---|---|
+| `MAX_PREDICT` | `10` | 先试 10 张看效果，满意后改 `None` 跑全部 |
+| `SKIP_TRAIN` | `False` | 已训练过想只推理时改 `True` |
+| `EPOCHS` | `100` | 训练轮数 |
+| `CONFIDENCE_THRESHOLD` | `0.3` | 置信度阈值，调低更多框，调高更精准 |
+| `DEVICE` | `0` | CUDA GPU 编号，`"cpu"` 用 CPU |
+
+`auto_work/` 是临时训练目录，每次运行自动清空重建，无需手动管理。
 
 ## 项目结构
 
@@ -113,8 +137,11 @@ mxd-automation/
 │   ├── execution/           # 执行层
 │   └── utils/               # 工具（配置加载、日志、几何计算）
 ├── train/
-│   ├── data/                # 训练数据
+│   ├── data/
+│   │   ├── raw/             # 原始图片 + XML 标注
+│   │   └── auto_work/       # 临时训练目录（自动清空重建）
 │   ├── scripts/             # 训练脚本
+│   │   └── 03_auto_annotate.py  # 自动标注脚本
 │   └── model/               # 预训练模型
 └── ocr_demo.py              # RapidOCR 演示工具
 ```
