@@ -8,7 +8,6 @@
 train/
 ├── data/
 │   ├── raw/                  # 原始数据（图片 + Pascal VOC XML），只读不写
-│   └── auto_work/            # 02_train_yolo 临时训练目录，每次自动清空
 ├── model/
 │   └── yolov8n.pt            # YOLOv8n 预训练权重（自动下载）
 ├── scripts/
@@ -16,6 +15,7 @@ train/
 │   │   ├── main.py
 │   │   └── auto_work/        # 自动标注临时训练目录，每次自动清空
 │   └── 02_train_yolo/        # 训练脚本
+│       ├── auto_work/            # 02_train_yolo 临时训练目录，每次自动清空
 │       ├── main.py
 │       ├── runs/              # 训练输出（自动生成）
 │       └── model/             # 训练产出的 best.pt

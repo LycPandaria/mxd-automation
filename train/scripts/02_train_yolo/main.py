@@ -52,7 +52,7 @@ MODEL_PATH = "train/model/yolov8n.pt"
 RAW_DIR = "train/data/raw"
 
 # 工作目录（每次训练自动清空重建）
-WORK_DIR = "train/data/auto_work"
+WORK_DIR = "train/scripts/02_train_yolo/auto_work"
 
 # 训练输出目录（runs/ 和 model/ 都存在脚本自己的目录下）
 SCRIPT_DIR = str(Path(__file__).resolve().parent)
