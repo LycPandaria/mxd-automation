@@ -356,9 +356,9 @@ def save_empty_xml(xml_path: str, stem: str, img_w: int, img_h: int):
 def main():
     """主流程：清空工作区 → 扫描训练集 → 复制数据 → 训练 → 推理。"""
     # 路径计算：脚本在 train/scripts/ 下，base_dir = train/
-    base_dir = Path(__file__).resolve().parent.parent
+    base_dir = Path(__file__).resolve().parent.parent.parent  # main.py → 01_auto_annotate → scripts → train/
     raw_dir = base_dir / "data" / "raw"          # 原始数据目录（图片 + XML）
-    work_dir = base_dir / "data" / "auto_work"   # 临时训练工作目录（每次自动清空）
+    work_dir = base_dir / "scripts" / "01_auto_annotate" / "auto_work"   # 临时训练工作目录（每次自动清空）
     model_path = base_dir / "model" / "yolov8n.pt"  # 预训练模型
 
     # 打印当前配置
