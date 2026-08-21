@@ -126,6 +126,7 @@ class Automation:
         # ---- 线程控制 ----
         self._running = False  # 控制循环是否继续
         self._thread = None    # 工作线程对象
+        self._frame_count = 0  # 帧计数器（用于限频日志）
 
         # ---- OCR 名字定位器（延迟初始化，首次使用时才加载模型）----
         # ocr_interval=30: 每 30 帧执行一次 OCR（约 2.3 秒 @13fps）
@@ -237,6 +238,7 @@ class Automation:
 
         while self._running:
             t0 = time.time()  # 帧开始时间
+            self._frame_count += 1
 
             # ---- 1. 截图 ----
             try:
@@ -260,6 +262,13 @@ class Automation:
             monsters = [d for d in detections if d.cls_name in monster_classes]
             floors = [d for d in detections if d.cls_name in self._floor_classes()]
             ropes = [d for d in detections if d.cls_name in self._rope_classes()]
+
+            # 每 30 帧输出一次怪物坐标（避免刷屏）
+            if monsters and self._frame_count % 30 == 0:
+                coords = ", ".join(
+                    f"({d.center[0]},{d.center[1]})" for d in monsters
+                )
+                self.on_log(f"[怪物] {len(monsters)}只, 坐标: {coords}")
 
             # ---- 3. HP 检测 ----
             # scale_region(): 把参考分辨率下的坐标缩放到当前帧的实际像素

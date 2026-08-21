@@ -172,7 +172,7 @@ class MainWindow(QMainWindow):
     def _build_detect_group(self):
         box = QGroupBox("检测设置 (YOLO)")
         g = QGridLayout(box)
-        g.addWidget(QLabel("模型路径:"), 0, 0)
+        g.addWidget(QLabel("模型/EXE路径:"), 0, 0)
         self.model_edit = QLineEdit()
         g.addWidget(self.model_edit, 0, 1)
         browse = QPushButton("浏览")
@@ -413,7 +413,7 @@ class MainWindow(QMainWindow):
 
     def _browse_model(self):
         path, _ = QFileDialog.getOpenFileName(
-            self, "选择 YOLO 模型", "", "模型文件 (*.pt *.onnx)"
+            self, "选择 YOLO 模型或 EXE", "", "模型/EXE (*.pt *.onnx *.exe);;所有文件 (*.*)"
         )
         if path:
             self.model_edit.setText(path)
