@@ -2,7 +2,7 @@ window_title: 冒险岛怀旧服
 start_stop_hotkey: F6
 reference_width: 1368
 reference_height: 800
-fps: 10
+fps: 20
 confidence: 0.5
 model_path: E:/pythonProjects/mxd-automation/train/scripts/02_train_yolo/model/best.pt
 monster_classes: monster
