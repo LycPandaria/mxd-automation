@@ -44,6 +44,7 @@ Context 字段说明
   floors:         地板列表
   ropes:          绳索列表
   self_position:  自身脚底坐标 (cx, cy) 或 None
+  self_center:    自身角色中心点坐标 (cx, cy) 或 None（OCR 定位时记录）
   hp_ratio:       血量比例 0.0~1.0
   mp_ratio:       蓝量比例 0.0~1.0
   detections:     全部 YOLO 检测结果（含所有类别）
@@ -55,23 +56,18 @@ from ..perception.yolo_detector import Detection
 from ..execution.action_executor import ActionExecutor
 from ..utils.config_loader import Config
 from .fsm import FSM, State
+from .distance import (
+    estimate_path_distance,
+    JUMP_HEIGHT,
+)
 
 
 # =============================================================================
 # 反应式决策的阈值常量
 # =============================================================================
 
-SAME_PLATFORM_Y_THRESHOLD = 80
-"""同平台判定：自身与怪物 Y 坐标差小于此值视为同平台（像素）"""
-
 ATTACK_RANGE_X = 250
 """攻击范围：自身与怪物 X 坐标差小于此值视为进入攻击范围（像素）"""
-
-ABOVE_THRESHOLD = 100
-"""怪物在"上方"的判定：怪物 Y 比自身 Y 小超过此值（像素）"""
-
-BELOW_THRESHOLD = 100
-"""怪物在"下方"的判定：怪物 Y 比自身 Y 大超过此值（像素）"""
 
 ROPE_SEARCH_RANGE_X = 200
 """搜索绳索的水平范围（像素）"""
@@ -82,17 +78,22 @@ STUCK_FRAMES = 60
 EXPLORE_DIRECTION_SWITCH_FRAMES = 180
 """探索方向切换帧数：探索状态下持续此帧数没遇到怪就换方向"""
 
+DISTANCE_LOG_FRAMES = 60
+"""距离推算日志输出间隔帧数（避免刷屏）"""
+
 
 @dataclass
 class Context:
     """感知层 → 决策层的数据载体（每帧一份）。
 
-    self_position 由 HP 条区域推算或 OCR 识别得到（窗口内坐标）。
+    self_position 由 OCR 识别得到（窗口内坐标，脚底）。
+    self_center 为角色中心点（名字中心 + 人物高度一半），用于距离推算。
     """
     monsters: List[Detection] = field(default_factory=list)
     floors: List[Detection] = field(default_factory=list)
     ropes: List[Detection] = field(default_factory=list)
     self_position: Optional[Tuple[int, int]] = None
+    self_center: Optional[Tuple[int, int]] = None
     hp_ratio: Optional[float] = None
     mp_ratio: Optional[float] = None
     detections: List[Detection] = field(default_factory=list)
@@ -132,6 +133,7 @@ class DecisionEngine:
         self._last_self_pos: Optional[Tuple[int, int]] = None
         self._stuck_counter = 0
         self._explore_frame_count = 0
+        self._distance_log_frame_count = 0
 
     def update_config(self, config: Config):
         self.config = config
@@ -143,6 +145,7 @@ class DecisionEngine:
         self._last_self_pos = None
         self._stuck_counter = 0
         self._explore_frame_count = 0
+        self._distance_log_frame_count = 0
         self._fsm.reset()
         self.executor.reset()
 
@@ -207,19 +210,37 @@ class DecisionEngine:
 
     def _handle_monsters(self, ctx: Context):
         """处理画面中的怪物。"""
-        target = self._pick_best_target(ctx.monsters)
+        target = self._pick_best_target(ctx)
         self._target_monster = target
 
         tx, ty = target.center
 
-        if ctx.self_position is None:
+        # 人物中心点（优先用角色中心，回退脚底）
+        player = ctx.self_center or ctx.self_position
+        if player is None:
             self._tab_attack(ctx)
             return
 
-        sx, sy = ctx.self_position
+        sx, sy = player
 
-        # 同平台 → 追击或攻击
-        if self._on_same_platform(ctx, target):
+        # ---- 距离推算 ----
+        est = estimate_path_distance(player, (tx, ty), ctx.floors, ctx.ropes)
+
+        # 距离日志（限频输出，避免刷屏）
+        self._distance_log_frame_count += 1
+        if self._distance_log_frame_count >= DISTANCE_LOG_FRAMES:
+            self._distance_log_frame_count = 0
+            self._log(
+                f"[距离] 人物({sx},{sy}) → 怪({tx},{ty}) "
+                f"路径={est.path_type} 距离={est.distance}px "
+                f"(水平={est.horizontal} 垂直={est.vertical}"
+                + (f" 绳长={est.rope_length}" if est.path_type == "rope" else "")
+                + (f" 跳数={est.jump_count}" if est.path_type == "jump" else "")
+                + ")"
+            )
+
+        # 同平台（纵坐标差 <= 30px）→ 追击或攻击
+        if est.path_type == "same_level":
             if self._in_attack_range(sx, tx):
                 self._fsm.transition(State.ATTACKING)
                 self._attack(ctx, target)
@@ -228,18 +249,17 @@ class DecisionEngine:
                 self._chase(ctx, target)
             return
 
-        # 怪在上方 → 找绳索爬
-        if self._is_above(sy, ty):
+        # 不同层 + 有绳索 → 爬绳
+        if est.path_type == "rope":
             self._fsm.transition(State.CLIMBING)
             if not self._try_climb(ctx, target):
                 self._tab_attack(ctx)
             return
 
-        # 怪在下方 → 找边缘跳下
-        if self._is_below(sy, ty):
-            self._fsm.transition(State.DROPPING)
-            if not self._try_drop(ctx, target):
-                self._tab_attack(ctx)
+        # 不同层 + 无绳索 → 平台跳跃追击
+        if est.path_type == "jump":
+            self._fsm.transition(State.CHASING)
+            self._jump_chase(ctx, target)
             return
 
         # 兜底：Tab 选怪 + 原地攻击
@@ -249,39 +269,31 @@ class DecisionEngine:
     # 目标选择
     # =========================================================================
 
-    def _pick_best_target(self, monsters: List[Detection]) -> Detection:
+    def _pick_best_target(self, ctx: Context) -> Detection:
         """选择最佳目标怪物。
 
-        优先选择同平台、距离最近的怪物。
+        按路径距离（同层/绳索/跳跃）选择距离最近的怪物；
+        无法定位自身时回退为画面中最大的怪物。
         """
-        return max(monsters, key=lambda d: d.w * d.h)
+        monsters = ctx.monsters
+        if not monsters:
+            return None
+        player = ctx.self_center or ctx.self_position
+        if player is None:
+            return max(monsters, key=lambda d: d.w * d.h)
+
+        best = None
+        best_dist = float("inf")
+        for m in monsters:
+            est = estimate_path_distance(player, m.center, ctx.floors, ctx.ropes)
+            if est.reachable and est.distance < best_dist:
+                best = m
+                best_dist = est.distance
+        return best if best is not None else max(monsters, key=lambda d: d.w * d.h)
 
     # =========================================================================
-    # 同平台判定
+    # 地板判定
     # =========================================================================
-
-    def _on_same_platform(self, ctx: Context, target: Detection) -> bool:
-        """判断自身和目标是否在同一平台上。
-
-        判定条件:
-          1. 自身 Y 与目标 Y 的差值小于阈值
-          2. 自身和目标脚下都有地板
-        """
-        if ctx.self_position is None:
-            return False
-        sy = ctx.self_position[1]
-        ty = target.center[1]
-
-        if abs(sy - ty) > SAME_PLATFORM_Y_THRESHOLD:
-            return False
-
-        # 检查脚下是否有地板
-        if not self._has_floor_under(ctx, ctx.self_position):
-            return False
-        if not self._has_floor_under(ctx, target.center):
-            return False
-
-        return True
 
     def _has_floor_under(self, ctx: Context, pos: Tuple[int, int]) -> bool:
         """检查指定位置下方是否有地板。
@@ -302,18 +314,6 @@ class DecisionEngine:
     def _in_attack_range(self, sx: int, tx: int) -> bool:
         """判断自身是否在攻击范围内。"""
         return abs(sx - tx) < ATTACK_RANGE_X
-
-    # =========================================================================
-    # 上下判定
-    # =========================================================================
-
-    def _is_above(self, sy: int, ty: int) -> bool:
-        """怪物在自身正上方。"""
-        return sy - ty > ABOVE_THRESHOLD
-
-    def _is_below(self, sy: int, ty: int) -> bool:
-        """怪物在自身正下方。"""
-        return ty - sy > BELOW_THRESHOLD
 
     # =========================================================================
     # 追击（同平台）
@@ -416,30 +416,78 @@ class DecisionEngine:
             return True
 
     # =========================================================================
-    # 下落
+    # 跨层跳跃追击（无绳索时）
     # =========================================================================
 
-    def _try_drop(self, ctx: Context, target: Detection) -> bool:
-        """尝试找平台边缘跳下去。
+    def _jump_chase(self, ctx: Context, target: Detection):
+        """无绳索时，通过跳跃不同平台追击怪物。
 
-        返回 True 表示执行了下落动作，False 表示没找到边缘。
+        平台高度按"最上面的 y 坐标"（floor.y，top_y）计算，不是平台中心 y:
+          - 怪物所在平台 top_y 与人物高度差 <= 跳跃高度(80px) → 起跳
+          - 脚下没地板（在平台边缘/空中）→ 下落
+          - 否则继续往怪物方向走
         """
         if ctx.self_position is None:
-            return False
-        sx = ctx.self_position[0]
+            return
+        sx, sy = ctx.self_position
+        tx, ty = target.center[0], target.center[1]
 
-        # 走向目标方向，同时按下 + 跳（从平台边缘落下）
-        tx = target.center[0]
-        if tx > sx:
+        # 怪物所在平台的 top_y（最上面的 y）
+        target_top = self._find_floor_top(ctx, tx, ty)
+
+        if self._stuck_counter >= STUCK_FRAMES:
+            self._log("[跳跃追击] 卡住了，起跳")
+            self.executor.press_key("alt", cooldown=1.0)
+            self._stuck_counter = 0
+            return
+
+        # 水平方向走向怪物
+        if tx > sx + 10:
             self.executor.press_key("right", cooldown=0.05)
-        else:
+        elif tx < sx - 10:
             self.executor.press_key("left", cooldown=0.05)
 
-        # 按下 + 跳 = 从平台落下
-        self.executor.press_key("down", cooldown=0.3)
-        self.executor.press_key("alt", cooldown=1.0)
-        self._log("[下落] 尝试从平台边缘落下")
-        return True
+        # 脚下有地板
+        on_floor = self._has_floor_under(ctx, ctx.self_position)
+
+        if on_floor and target_top is not None:
+            # 怪在上层：高度差在跳跃高度内就起跳
+            if ty < sy and (sy - target_top) <= JUMP_HEIGHT:
+                self._log(
+                    f"[跳跃追击] 目标平台 top_y={target_top}，"
+                    f"高度差 {sy - target_top}px <= {JUMP_HEIGHT}px，起跳"
+                )
+                self.executor.press_key("alt", cooldown=1.0)
+                return
+            # 高度差超出跳跃高度 → 走不过去，只能继续往怪物方向走
+            self._log(
+                f"[跳跃追击] 目标平台 top_y={target_top}，"
+                f"高度差 {sy - target_top}px > {JUMP_HEIGHT}px，无法直接跳上，继续走"
+            )
+            return
+
+        # 脚下没地板（在平台边缘/空中）→ 下落
+        if not on_floor:
+            self.executor.press_key("down", cooldown=0.3)
+            self.executor.press_key("alt", cooldown=1.0)
+            self._log("[跳跃追击] 脚下没地板，下落")
+            return
+
+    def _find_floor_top(self, ctx: Context, x: int, y: int) -> Optional[int]:
+        """找到覆盖 (x, y) 的平台，返回其"最上面的 y"（top_y）。
+
+        找不到返回 None。
+        """
+        best = None
+        best_key = float("inf")
+        for f in ctx.floors:
+            if f.x <= x <= f.x + f.w:
+                if f.y - 30 <= y <= f.y + f.h + 30:
+                    d = abs(f.y - y)
+                    if d < best_key:
+                        best_key = d
+                        best = f.y
+        return best
 
     # =========================================================================
     # 探索

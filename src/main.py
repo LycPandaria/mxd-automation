@@ -37,7 +37,8 @@
 ================================================================================
 
   RapidOCR 文字识别（唯一方案，每帧实时执行）
-    原理: OCR 识别画面中的角色名字（如"我是立立"）→ 名字中心 = 脚底
+    原理: OCR 识别画面中的角色名字（如"我是立立"）→ 名字中心 ≈ 脚底；
+          角色中心点 = 名字中心向下延伸"人物高度一半"（character_height//2，约 30px）
     条件: 已配置 self_name；每帧执行，与 YOLO 检测同节奏，无缓存兜底
     说明: 早期"HP 条偏移推算"用的是 UI 底部固定血条（hp_region），
           不随角色移动，算出的坐标恒定不变（定位 bug），已移除。
@@ -103,7 +104,8 @@ class Automation:
         )
 
         # ---- 执行层 ----
-        self.executor = ActionExecutor()  # 聚合键盘 + 鼠标控制器
+        # 聚合键盘 + 鼠标控制器；on_log 用于上报按键注入结果（是否已锁定窗口等）
+        self.executor = ActionExecutor(on_log=on_log or (lambda m: None))
 
         # ---- 决策层 ----
         # 反应式决策引擎：基于 YOLO 画面实时决策，不需要地图
@@ -123,8 +125,9 @@ class Automation:
 
         # ---- OCR 名字定位器（延迟初始化，首次使用时才加载模型）----
         # ocr_interval=1: 每帧执行 OCR，与 YOLO 检测同节奏，实时定位
+        # character_height=60: 人物高度约 60px，角色中心 = 名字中心 + 高度一半（向下）
         self._ocr = OCRNameLocator(
-            name_offset=40, ocr_interval=1,
+            character_height=60, ocr_interval=1,
             on_log=self.on_log,
         )
 
@@ -361,10 +364,11 @@ class Automation:
                 monsters=monsters,
                 floors=floors,
                 ropes=ropes,
-                self_position=self_pos,  # 自身脚底坐标 (cx, cy) 或 None
-                hp_ratio=hp_ratio,        # 0.0~1.0
-                mp_ratio=mp_ratio,        # 0.0~1.0
-                detections=detections,    # 全部检测结果（供调试/日志用）
+                self_position=self_pos,     # 自身脚底坐标 (cx, cy) 或 None
+                self_center=self._get_last_center(),  # 角色中心点（距离推算用）
+                hp_ratio=hp_ratio,          # 0.0~1.0
+                mp_ratio=mp_ratio,          # 0.0~1.0
+                detections=detections,      # 全部检测结果（供调试/日志用）
             )
             self.engine.decide(ctx)  # 决策引擎根据上下文执行动作
 

@@ -6,26 +6,26 @@
 原理（冒险岛实际布局）
 ================================================================================
 
-  角色名字显示在角色脚下。从名字区域往上推算角色位置：
+  角色名字显示在角色脚下。名字中心 ≈ 角色脚底，从名字中心向下
+  延伸"人物高度一半"得到角色中心点：
 
-       ╔═════╗    ← 角色中心点（名字中心 - offset*0.5）
-       ║ 角色 ║
-       ╚═════╝
-           │
-           │  name_offset 像素（向上）
-           │
-           ▼
-    ┌─────────────────┐
-    │   我是立立       │  ← 名字区域（OCR 识别，在脚下）
-    └────────┬────────┘
-             ▼
-            ═══  ← 脚底坐标（≈ 名字中心 y）
+    ╔═══════╗
+    ║ 角色   ║
+    ║        ║  ← 人物高度（character_height，约 60px）
+    ╚═══╤═══╝
+        │  ↑ 名字中心 = 脚底
+        │
+        │  ↓ + 人物高度一半（character_height // 2）
+        │
+    ╔═══╧═══════╗   ← 名字中心 y + 30 = 角色中心点 y
+    ║  我是立立   ║
+    ╚═══════════╝
 
 ================================================================================
 用法
 ================================================================================
 
-  locator = OCRNameLocator(name_offset=40, on_log=print)
+  locator = OCRNameLocator(character_height=60, on_log=print)
   # 返回 (center_x, center_y, foot_x, foot_y) 或 None
   result = locator.locate(frame, "我是立立")
   if result:
@@ -38,7 +38,7 @@
   - OCR 模型首次加载较慢（约 1-2 秒），后续帧很快
   - 建议配合缓存使用：OCR 帧找到后缓存坐标，非 OCR 帧直接返回缓存
   - 如果名字和其他文字重叠，可能匹配失败
-  - name_offset 需要根据角色实际高度调整（通常 30~60 像素）
+  - character_height 需要根据角色实际高度调整（通常 50~70 像素）
 """
 from typing import Callable, Optional, Tuple
 
@@ -48,23 +48,24 @@ import numpy as np
 class OCRNameLocator:
     """基于 RapidOCR 的角色名字定位器。
 
-    冒险岛角色名字显示在脚下，通过名字中心向上偏移推算角色位置。
+    冒险岛角色名字显示在脚下，名字中心 ≈ 脚底；
+    角色中心点 = 名字中心向下延伸"人物高度一半"。
 
     每帧调用 locate()，内部有帧间隔控制（默认每 30 帧执行一次 OCR）。
     同时返回角色中心点和脚底坐标。
 
     Args:
-        name_offset:    名字中心到角色脚底的向上偏移像素数，默认 40
-        ocr_interval:   OCR 执行间隔（帧数），默认 30 帧
-        exact_match:    是否精确匹配名字（True=完全相等，False=包含即可）
-        on_log:         日志回调
+        character_height: 人物高度像素数，默认 60；角色中心 = 名字中心 + 高度一半
+        ocr_interval:     OCR 执行间隔（帧数），默认 30 帧
+        exact_match:      是否精确匹配名字（True=完全相等，False=包含即可）
+        on_log:           日志回调
     """
 
-    def __init__(self, name_offset: int = 40,
+    def __init__(self, character_height: int = 60,
                  ocr_interval: int = 30,
                  exact_match: bool = False,
                  on_log: Optional[Callable[[str], None]] = None):
-        self._name_offset = name_offset
+        self._character_height = character_height
         self._interval = ocr_interval
         self._exact_match = exact_match
         self._on_log = on_log or (lambda m: None)
@@ -84,7 +85,7 @@ class OCRNameLocator:
 
         冒险岛角色名字在脚下，所以:
           - 脚底 ≈ 名字中心 y（名字就在脚底位置）
-          - 角色中心 = 名字中心 - name_offset * 0.5（向上）
+          - 角色中心 = 名字中心 + character_height // 2（向下延伸人物高度一半）
 
         Args:
             frame:         BGR 截图 (H, W, 3)
@@ -152,8 +153,8 @@ class OCRNameLocator:
 
         # 脚底 = 名字中心（名字就在脚边）
         foot = (name_cx, name_cy)
-        # 角色中心 = 名字中心向上偏移 offset * 0.5
-        center = (name_cx, name_cy - self._name_offset // 2)
+        # 角色中心 = 名字中心向下延伸"人物高度一半"
+        center = (name_cx, name_cy + self._character_height // 2)
 
         self._last_center = center
         self._last_foot = foot

@@ -340,6 +340,7 @@ class MainWindow(QMainWindow):
 
     def _read_ui_to_config(self):
         c = self.config
+        c.window_title = self.window_combo.currentText().strip()
         c.model_path = self.model_edit.text().strip()
         c.confidence = self.conf_slider.value() / 100
         c.monster_classes = self.classes_edit.text().strip() or "monster"

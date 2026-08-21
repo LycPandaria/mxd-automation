@@ -1,19 +1,18 @@
 """键盘输入控制。
 
 ================================================================================
-两种发送模式
+发送模式
 ================================================================================
 
-  1. PostMessage 注入（优先）
+  PostMessage 注入（唯一模式）
      原理: 调用 Windows API PostMessageW() 直接向目标窗口发送
            WM_KEYDOWN / WM_KEYUP 消息，不经过全局键盘队列。
      优点: 不占用真实键盘，切换应用不影响，可以后台运行
      条件: 必须已锁定窗口（set_target_window() 已调用）
 
-  2. keyboard 库全局发送（兜底）
-     原理: 调用 keyboard.send() 模拟全局键盘输入
-     缺点: 占用真实键盘，切换应用时会误触发
-     条件: 未锁定窗口时使用
+  【重要】按键只发送到锁定的游戏窗口，绝不全局发送。
+  未锁定窗口时 press_key() 会返回 False 并记录日志，
+  不会影响用户正在操作的其它程序。
 
 ================================================================================
 虚拟键码（VK Code）
@@ -106,24 +105,33 @@ class KeyboardController:
         kb.press_key("1", cooldown=1.0)  # 按 1 键，冷却 1 秒
     """
 
-    def __init__(self):
+    def __init__(self, on_log=None):
         self._last_press = {}  # key -> 上次触发时间戳（秒）
         self._hwnd = None      # 目标窗口句柄
+        self._on_log = on_log or (lambda msg: None)
 
     # =========================================================================
     # 窗口绑定
     # =========================================================================
 
+    @property
+    def locked(self) -> bool:
+        """是否已锁定目标窗口（可注入按键）。"""
+        return self._hwnd is not None
+
     def set_target_window(self, hwnd):
         """设置目标窗口句柄。
 
         设置后，所有按键通过 PostMessage 直接发送到该窗口。
-        未设置时回退到 keyboard 库全局发送。
+        未设置（None）时 press_key() 会拒绝发送并记录日志，
+        绝不使用全局按键影响其它程序。
 
         Args:
             hwnd: Windows 窗口句柄（整数）
         """
         self._hwnd = hwnd
+        if hwnd:
+            self._on_log(f"[按键] 目标窗口已锁定, hwnd=0x{hwnd:X}")
 
     # =========================================================================
     # 按键
@@ -154,26 +162,34 @@ class KeyboardController:
         return 0
 
     def _press_single_key(self, key: str) -> bool:
-        """发送单个按键（PostMessage 或 keyboard 库兜底）。"""
+        """发送单个按键（PostMessage 注入到锁定窗口）。
+
+        Returns:
+            True: 已成功投递到锁定窗口
+            False: 键无效 / 未锁定窗口 / PostMessage 投递失败
+        """
         vk_code = self._get_vk_code(key)
         if not vk_code:
+            self._on_log(f"[按键] 无法识别的按键: {key}")
             return False
 
-        if self._hwnd:
-            # ---- 方案1: PostMessage 注入 ----
-            scan = user32.MapVirtualKeyW(vk_code, 0)
-            lparam_down = _make_lparam(vk_code, scan, 0x00000000)
-            lparam_up = _make_lparam(vk_code, scan, 0xC0000000)
-            user32.PostMessageW(self._hwnd, WM_KEYDOWN, vk_code, lparam_down)
-            time.sleep(0.02)
-            user32.PostMessageW(self._hwnd, WM_KEYUP, vk_code, lparam_up)
-        else:
-            # ---- 方案2: keyboard 库全局发送（兜底）----
-            try:
-                import keyboard
-                keyboard.send(key)
-            except Exception:
-                return False
+        if not self._hwnd:
+            self._on_log(f"[按键] 未锁定窗口，拒绝发送按键: {key}")
+            return False
+
+        # ---- PostMessage 注入 ----
+        scan = user32.MapVirtualKeyW(vk_code, 0)
+        lparam_down = _make_lparam(vk_code, scan, 0x00000000)
+        lparam_up = _make_lparam(vk_code, scan, 0xC0000000)
+        ok_down = user32.PostMessageW(self._hwnd, WM_KEYDOWN, vk_code, lparam_down)
+        time.sleep(0.02)
+        ok_up = user32.PostMessageW(self._hwnd, WM_KEYUP, vk_code, lparam_up)
+        if not ok_down or not ok_up:
+            self._on_log(
+                f"[按键] 投递失败 (窗口可能已关闭): key={key}, "
+                f"down={bool(ok_down)}, up={bool(ok_up)}"
+            )
+            return False
         return True
 
     def press_key(self, key: str, cooldown: float = 0.0) -> bool:

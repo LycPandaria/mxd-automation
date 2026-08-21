@@ -43,8 +43,8 @@ class ActionExecutor:
         executor.reset()                  # 重置所有冷却
     """
 
-    def __init__(self):
-        self._kb = KeyboardController()  # 键盘控制器
+    def __init__(self, on_log=None):
+        self._kb = KeyboardController(on_log=on_log)  # 键盘控制器
         self._mouse = MouseController()  # 鼠标控制器
 
     # =========================================================================
@@ -55,12 +55,18 @@ class ActionExecutor:
         """设置目标窗口句柄，同时传给键盘和鼠标控制器。
 
         PostMessage 模式需要知道发往哪个窗口，所以必须绑定。
+        绑定后所有按键只发送到该窗口，绝不全局发送。
 
         Args:
             hwnd: Windows 窗口句柄
         """
         self._kb.set_target_window(hwnd)
         self._mouse.set_target_window(hwnd)
+
+    @property
+    def locked(self) -> bool:
+        """是否已锁定目标窗口（可注入按键/点击）。"""
+        return self._kb.locked
 
     # =========================================================================
     # 按键
