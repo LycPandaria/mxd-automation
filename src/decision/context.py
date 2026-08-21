@@ -30,11 +30,14 @@
   1. HP 低于阈值 → 加血键
   2. MP 低于阈值 → 加蓝键
   3. 检测到怪物:
-     a. 同平台 → 走过去 + 进入范围后攻击
-     b. 怪在上方 + 有绳索 → 爬绳
-     c. 怪在下方 → 找边缘跳下
+     a. 同平台 → 按住方向键走过去，进入 200px 攻击范围后停止移动原地攻击
+     b. 怪在上方 + 有绳索 → 走到绳索正下方，跳跃 + 按住上键爬绳
+     c. 怪在下方/跨平台 → 按住方向键移动 + 按需跳跃
      d. 都不满足 → Tab 选怪 + 原地攻击
-  4. 没怪 → 探索（往一个方向走，遇坑跳）
+  4. 没怪 → 探索（按住方向键往一个方向走，遇坑跳）
+
+【移动方式】所有移动（追击/攀爬/探索）都是"按住方向键不松手"，
+  进入攻击范围或攻击时才释放方向键，攻击期间完全不移动。
 
 ================================================================================
 Context 字段说明
@@ -59,6 +62,7 @@ from .fsm import FSM, State
 from .distance import (
     estimate_path_distance,
     JUMP_HEIGHT,
+    SAME_LEVEL_Y_TOLERANCE,
 )
 
 
@@ -66,11 +70,26 @@ from .distance import (
 # 反应式决策的阈值常量
 # =============================================================================
 
-ATTACK_RANGE_X = 250
-"""攻击范围：自身与怪物 X 坐标差小于此值视为进入攻击范围（像素）"""
+ATTACK_RANGE_X = 200
+"""攻击范围：自身与怪物 X 坐标差小于此值（约 200px 附近）才开始攻击（像素）"""
 
 ROPE_SEARCH_RANGE_X = 200
 """搜索绳索的水平范围（像素）"""
+
+CLIMB_ALIGN_TOLERANCE = 5
+"""攀爬对准容差：人物中心与绳索中心 X 差小于此值（±5px）
+视为在同一竖直轴线（绳索正下方），才允许抓绳攀爬（像素）"""
+
+CLIMB_EXIT_FRAMES = 45
+"""爬绳结束后横向走出绳索的帧数（约 2 秒 @20fps），期间不重新抓绳"""
+
+ATTACK_STALE_FRAMES = 90
+"""锁定同一目标持续攻击的最大帧数（约 4.5 秒 @20fps）。
+
+怪物死亡后 YOLO 仍可能把尸体/消失残影检测为 monster，
+位置匹配会一直锁定这个残影，导致角色原地打空气、不换下一只。
+超过该帧数目标仍未消失（画面仍检测到）→ 判定为残影/无敌，
+立即解除锁定重新选目标。"""
 
 STUCK_FRAMES = 60
 """卡住判定帧数：持续此帧数位置不变则视为卡住"""
@@ -135,6 +154,13 @@ class DecisionEngine:
         self._explore_frame_count = 0
         self._distance_log_frame_count = 0
 
+        # 移动键按住状态（持续移动/攀爬）
+        self._held_key: Optional[str] = None      # 当前按住的键（left/right/up/down）
+        self._climbing = False                    # 是否正在沿绳索攀爬
+        self._climb_exit_frames = 0               # 脱离绳索后横向走出的剩余帧数
+        self._climb_log_count = 0                 # 攀爬日志限频计数
+        self._attack_stale_counter = 0            # 锁定同一目标持续攻击的帧数（残影检测）
+
     def update_config(self, config: Config):
         self.config = config
 
@@ -146,8 +172,17 @@ class DecisionEngine:
         self._stuck_counter = 0
         self._explore_frame_count = 0
         self._distance_log_frame_count = 0
+        self._attack_stale_counter = 0
+        self.release_keys()
         self._fsm.reset()
         self.executor.reset()
+
+    def release_keys(self):
+        """释放所有按住的移动键（停止时调用，防止方向键卡住）。"""
+        self._release_move()
+        self._climbing = False
+        self._climb_exit_frames = 0
+        self._climb_log_count = 0
 
     @property
     def state_name(self) -> str:
@@ -179,6 +214,7 @@ class DecisionEngine:
             # 满状态（>=95%）不触发，防止刚加完又按
             if ctx.hp_ratio < 0.95:
                 self._fsm.transition(State.HEALING)
+                self._release_move()  # 加血时站住不动
                 if self.executor.press_key(self.config.hp_key, cooldown=1.5):
                     self._log(
                         f"[加血] HP={ctx.hp_ratio:.0%} < {self.config.hp_threshold:.0%}，"
@@ -190,6 +226,7 @@ class DecisionEngine:
         if ctx.mp_ratio is not None and ctx.mp_ratio < self.config.mp_threshold:
             if ctx.mp_ratio < 0.95:
                 self._fsm.transition(State.RECOVERING)
+                self._release_move()  # 加蓝时站住不动
                 if self.executor.press_key(self.config.mp_key, cooldown=1.5):
                     self._log(
                         f"[加蓝] MP={ctx.mp_ratio:.0%} < {self.config.mp_threshold:.0%}，"
@@ -202,6 +239,12 @@ class DecisionEngine:
             self._handle_monsters(ctx)
         else:
             self._fsm.transition(State.IDLE)
+            # 画面中已没有怪物：立即解除锁定并清理攀爬等残留状态，
+            # 防止"上帧还锁着怪/在爬绳"的状态影响后续探索与重新选怪
+            self._target_monster = None
+            self._attack_stale_counter = 0
+            self._climbing = False
+            self._climb_exit_frames = 0
             self._explore(ctx)
 
     # =========================================================================
@@ -209,8 +252,36 @@ class DecisionEngine:
     # =========================================================================
 
     def _handle_monsters(self, ctx: Context):
-        """处理画面中的怪物。"""
-        target = self._pick_best_target(ctx)
+        """处理画面中的怪物。
+
+        【锁定机制】找到怪物后优先持续攻击同一只，直到它消失：
+          1. 若已锁定目标且仍能在画面中匹配到（位置接近的同一只怪）
+             → 继续攻击它，不去换别的怪
+          2. 若锁定目标已消失（匹配不到）→ 立即清除锁定，重新选最近目标
+          3. 【残影防护】持续攻击同一目标超过 ATTACK_STALE_FRAMES 帧
+             仍未击杀（画面仍检测到）→ 判定为死尸残影/无敌，
+             解除锁定重新选目标，避免原地打空气半天不动
+        """
+        target = self._resolve_locked_target(ctx)
+
+        # ---- 攻击超时检测（残影防护）----
+        # 只有"一直锁定同一只 + 处于攻击状态"才累计；换目标/追击中不计
+        if self._target_monster is not None and self._is_same_monster(
+                self._target_monster, target):
+            if self._fsm.current == State.ATTACKING:
+                self._attack_stale_counter += 1
+            else:
+                self._attack_stale_counter = 0
+        else:
+            self._attack_stale_counter = 0
+
+        # 同一只怪攻击过久仍没死 → 很可能是尸体残影/无敌，强制换目标
+        if self._attack_stale_counter >= ATTACK_STALE_FRAMES:
+            self._log("[换目标] 持续攻击无效果(疑似残影/已死)，重新锁定最近目标")
+            self._target_monster = None
+            self._attack_stale_counter = 0
+            target = self._pick_best_target(ctx)
+
         self._target_monster = target
 
         tx, ty = target.center
@@ -266,8 +337,94 @@ class DecisionEngine:
         self._tab_attack(ctx)
 
     # =========================================================================
+    # 按住移动
+    # =========================================================================
+
+    def _hold_move(self, direction: str):
+        """按住方向键持续移动。
+
+        切换方向时先释放旧键再按住新键，避免两个方向键同时按下。
+        移动期间不松手，直到调用 _release_move() 停止。
+        """
+        if direction not in ("left", "right", "up", "down"):
+            return
+        if self._held_key == direction:
+            return
+        if self._held_key:
+            self.executor.key_up(self._held_key)
+        self.executor.key_down(direction)
+        self._held_key = direction
+
+    def _release_move(self):
+        """释放当前按住的移动键（停止移动/攀爬）。"""
+        if self._held_key:
+            self.executor.key_up(self._held_key)
+            self._held_key = None
+
+    # =========================================================================
     # 目标选择
     # =========================================================================
+
+    def _resolve_locked_target(self, ctx: Context) -> Detection:
+        """解析当前应攻击的目标怪物（含锁定逻辑）。
+
+        优先保持已锁定的目标（直到它消失），否则重新选择最近目标。
+
+        Returns:
+            当前应攻击的怪物；若画面中有怪，必定返回一个。
+        """
+        # 已锁定目标：尝试在当前画面中继续匹配（位置接近的同一只怪）
+        if self._target_monster is not None:
+            matched = self._match_monster(ctx.monsters, self._target_monster)
+            if matched is not None:
+                return matched  # 继续锁定同一只
+            # 锁定目标已从画面消失 → 立即重新选择，不等不拖
+            self._log("[锁定] 目标已消失，立即重新选择最近目标")
+
+        # 锁定目标已消失或尚未锁定 → 重新选择最近目标
+        return self._pick_best_target(ctx)
+
+    def _is_same_monster(self, a: Detection, b: Detection) -> bool:
+        """按中心点距离判断两个检测是否可能是同一只怪。
+
+        容差与锁定匹配一致（目标 bbox 宽度的 1.5 倍，保底 40px），
+        用于攻击超时统计。
+        """
+        if a is None or b is None:
+            return False
+        tolerance = max(int(a.w * 1.5), 40)
+        d = abs(a.center[0] - b.center[0]) + abs(a.center[1] - b.center[1])
+        return d <= tolerance
+
+    def _match_monster(self, monsters: List[Detection],
+                       locked: Detection) -> Optional[Detection]:
+        """在当前怪物列表中匹配已锁定的目标。
+
+        用中心点距离匹配：锁定时记录目标中心，之后每帧找
+        与之位置最接近的怪物。若两者距离小于锁定容差
+        （目标 bbox 宽度的 1.5 倍，保底 40px），视为同一只怪。
+
+        Args:
+            monsters: 当前帧检测到的怪物列表
+            locked:   已锁定的目标怪物
+
+        Returns:
+            匹配到的当前怪物；匹配不到返回 None（视为已消失）
+        """
+        if not monsters:
+            return None
+        lx, ly = locked.center
+        tolerance = max(int(locked.w * 1.5), 40)
+        best = None
+        best_dist = float("inf")
+        for m in monsters:
+            mx, my = m.center
+            d = abs(mx - lx) + abs(my - ly)
+            if d < best_dist:
+                best, best_dist = m, d
+        if best_dist <= tolerance:
+            return best
+        return None
 
     def _pick_best_target(self, ctx: Context) -> Detection:
         """选择最佳目标怪物。
@@ -320,49 +477,46 @@ class DecisionEngine:
     # =========================================================================
 
     def _chase(self, ctx: Context, target: Detection):
-        """走向怪物。"""
+        """按住方向键持续走向怪物。
+
+        到达攻击范围前不松手（按住方向键移动），进入攻击范围后
+        由上层切换为攻击状态并释放方向键。
+        """
         if ctx.self_position is None:
+            self._release_move()
             return
         sx = ctx.self_position[0]
         tx = target.center[0]
 
         if self._stuck_counter >= STUCK_FRAMES:
             self._log("[追击] 卡住了，尝试跳跃")
-            self.executor.press_key("alt", cooldown=1.0)
+            self._release_move()
+            self.executor.press_key(self.config.jump_key, cooldown=1.0)
             self._stuck_counter = 0
             return
 
         if tx > sx + 10:
-            self.executor.press_key("right", cooldown=0.05)
+            self._hold_move("right")
         elif tx < sx - 10:
-            self.executor.press_key("left", cooldown=0.05)
+            self._hold_move("left")
+        else:
+            self._release_move()
 
     # =========================================================================
     # 攻击
     # =========================================================================
 
     def _attack(self, ctx: Context, target: Detection):
-        """在攻击范围内，面向怪物并释放技能。
+        """在攻击范围内原地释放技能（攻击时不移动）。
 
-        先调整面向（确保攻击方向正确），再轮转放技能。
+        进入攻击范围后停止移动（释放方向键），原地轮转放技能。
         """
-        if ctx.self_position is None:
-            self._cast_skill()
-            return
-        sx = ctx.self_position[0]
-        tx = target.center[0]
-
-        # 调整面向
-        if tx > sx + 5:
-            self.executor.press_key("right", cooldown=0.05)
-        elif tx < sx - 5:
-            self.executor.press_key("left", cooldown=0.05)
-
-        # 轮转释放技能
+        self._release_move()  # 攻击时保持不动
         self._cast_skill()
 
     def _tab_attack(self, ctx: Context):
-        """Tab 选怪 + 原地攻击（兜底方案）。"""
+        """Tab 选怪 + 原地攻击（兜底方案，不移动）。"""
+        self._release_move()
         self.executor.press_key(self.config.target_key, cooldown=0.8)
         self._cast_skill()
 
@@ -371,13 +525,35 @@ class DecisionEngine:
     # =========================================================================
 
     def _try_climb(self, ctx: Context, target: Detection) -> bool:
-        """尝试找绳索爬上去追怪。
+        """攀爬追怪：走到绳索正下方 → 跳跃 + 按住上键爬绳。
+
+        流程:
+          1. 脱离绳索后的横向走出阶段（不重新抓绳）
+          2. 找最近绳索（水平 ROPE_SEARCH_RANGE_X 内）
+          3. 【对准判定】人物中心与绳索中心是否在同一竖直轴线
+             （X 差 <= 5px）→ 否，先水平移动到绳索正下方
+          4. 已对准 → 按跳跃 + 按住上键沿绳索向上爬
+          5. 爬到怪物所在高度（人物中心与怪物中心 Y 差 <= 30px）
+             或爬到绳顶 → 停止爬绳，横向走出绳索继续追击
 
         返回 True 表示找到了绳索并执行了动作，False 表示没找到。
         """
-        if ctx.self_position is None:
+        # 用人物中心点（不是脚底），回退脚底
+        player = ctx.self_center or ctx.self_position
+        if player is None:
+            self._release_move()
             return False
-        sx = ctx.self_position[0]
+        sx, sy = player
+        tx = target.center[0]
+
+        # 刚爬完绳，横向走出绳索（此阶段不重新抓绳）
+        if self._climb_exit_frames > 0:
+            self._climb_exit_frames -= 1
+            if tx > sx:
+                self._hold_move("right")
+            else:
+                self._hold_move("left")
+            return True
 
         # 找最近的绳索
         nearest_rope = None
@@ -390,30 +566,54 @@ class DecisionEngine:
                 min_dist = dist
 
         if nearest_rope is None:
+            self._climbing = False
+            self._release_move()
             return False
 
-        rx = nearest_rope.center[0]
-        ry = nearest_rope.center[1]
+        rx, ry = nearest_rope.center
 
-        # 如果已经接近绳索
-        if abs(rx - sx) < 30:
-            # 攀爬：一直按上键（直到接近目标高度）
-            target_top = target.y
-            if ctx.self_position[1] > target_top + 50:
-                self.executor.press_key("up", cooldown=0.05)
-                self._log("[攀爬] 沿绳索向上")
-            else:
-                self._log("[攀爬] 已到达目标高度")
-                self.executor.press_key("right" if target.center[0] > sx else "left",
-                                        cooldown=0.1)
+        # ---- 阶段 1: 对准判定（人物中心与绳索中心同一竖直轴线）----
+        if not self._climbing:
+            if abs(rx - sx) > CLIMB_ALIGN_TOLERANCE:
+                # 不在绳索正下方 → 水平移动对准
+                if rx > sx:
+                    self._hold_move("right")
+                else:
+                    self._hold_move("left")
+                return True
+            # 人物中心与绳索中心在同一竖直轴线（±5px）→ 跳跃 + 按住上键爬绳
+            self._release_move()
+            self._climbing = True
+            self._log("[攀爬] 对准绳索，跳跃并开始攀爬")
+            self.executor.press_key(self.config.jump_key, cooldown=1.0)
+            self._hold_move("up")
             return True
-        else:
-            # 走向绳索
-            if rx > sx:
-                self.executor.press_key("right", cooldown=0.05)
-            else:
-                self.executor.press_key("left", cooldown=0.05)
+
+        # ---- 阶段 2: 正在爬绳 ----
+        ty = target.center[1]
+
+        # 到达条件: 人物中心与怪物中心 Y 差 <= 30px（已爬到怪物所在层）
+        if abs(sy - ty) <= SAME_LEVEL_Y_TOLERANCE:
+            self._climbing = False
+            self._climb_exit_frames = CLIMB_EXIT_FRAMES
+            self._release_move()
+            self._log("[攀爬] 已到达怪物所在高度，脱离绳索")
             return True
+
+        # 爬到绳顶（人物中心已接近绳索顶部）仍没到怪物高度 → 停止，横向走出
+        if sy <= ry - (nearest_rope.h / 2) + 10:
+            self._climbing = False
+            self._climb_exit_frames = CLIMB_EXIT_FRAMES
+            self._release_move()
+            self._log("[攀爬] 已到绳顶仍追不上，脱离绳索")
+            return True
+
+        # 还没到 → 继续按住上键向上爬（日志限频，防刷屏）
+        self._hold_move("up")
+        self._climb_log_count += 1
+        if self._climb_log_count % 15 == 1:
+            self._log("[攀爬] 沿绳索向上")
+        return True
 
     # =========================================================================
     # 跨层跳跃追击（无绳索时）
@@ -428,6 +628,7 @@ class DecisionEngine:
           - 否则继续往怪物方向走
         """
         if ctx.self_position is None:
+            self._release_move()
             return
         sx, sy = ctx.self_position
         tx, ty = target.center[0], target.center[1]
@@ -437,15 +638,18 @@ class DecisionEngine:
 
         if self._stuck_counter >= STUCK_FRAMES:
             self._log("[跳跃追击] 卡住了，起跳")
-            self.executor.press_key("alt", cooldown=1.0)
+            self._release_move()
+            self.executor.press_key(self.config.jump_key, cooldown=1.0)
             self._stuck_counter = 0
             return
 
-        # 水平方向走向怪物
+        # 水平方向按住走向怪物（跳跃时保持按住，跳得更远）
         if tx > sx + 10:
-            self.executor.press_key("right", cooldown=0.05)
+            self._hold_move("right")
         elif tx < sx - 10:
-            self.executor.press_key("left", cooldown=0.05)
+            self._hold_move("left")
+        else:
+            self._release_move()
 
         # 脚下有地板
         on_floor = self._has_floor_under(ctx, ctx.self_position)
@@ -457,7 +661,7 @@ class DecisionEngine:
                     f"[跳跃追击] 目标平台 top_y={target_top}，"
                     f"高度差 {sy - target_top}px <= {JUMP_HEIGHT}px，起跳"
                 )
-                self.executor.press_key("alt", cooldown=1.0)
+                self.executor.press_key(self.config.jump_key, cooldown=1.0)
                 return
             # 高度差超出跳跃高度 → 走不过去，只能继续往怪物方向走
             self._log(
@@ -469,7 +673,7 @@ class DecisionEngine:
         # 脚下没地板（在平台边缘/空中）→ 下落
         if not on_floor:
             self.executor.press_key("down", cooldown=0.3)
-            self.executor.press_key("alt", cooldown=1.0)
+            self.executor.press_key(self.config.jump_key, cooldown=1.0)
             self._log("[跳跃追击] 脚下没地板，下落")
             return
 
@@ -507,7 +711,7 @@ class DecisionEngine:
         if self._stuck_counter >= STUCK_FRAMES:
             self._log("[探索] 卡住了，跳跃并反向")
             self._explore_direction = "left" if self._explore_direction == "right" else "right"
-            self.executor.press_key("alt", cooldown=1.0)
+            self.executor.press_key(self.config.jump_key, cooldown=1.0)
             self._stuck_counter = 0
             return
 
@@ -520,11 +724,11 @@ class DecisionEngine:
         # 检测脚下是否有地板
         if ctx.self_position and not self._has_floor_under(ctx, ctx.self_position):
             self._log("[探索] 脚下没地板，跳跃")
-            self.executor.press_key("alt", cooldown=1.0)
+            self.executor.press_key(self.config.jump_key, cooldown=1.0)
             return
 
-        # 往前走
-        self.executor.press_key(self._explore_direction, cooldown=0.05)
+        # 按住方向键持续往前走
+        self._hold_move(self._explore_direction)
 
     # =========================================================================
     # 技能释放

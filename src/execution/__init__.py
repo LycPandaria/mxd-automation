@@ -1,7 +1,7 @@
 """执行层：只负责"做"，模拟人类键鼠操作。
 
 模块：
-  - keyboard_controller: 键盘模拟（PostMessage 注入锁定窗口，带冷却）
+  - keyboard_controller: 键盘模拟（SendInput 全局真实按键，带冷却，需窗口在前台）
   - mouse_controller:    鼠标模拟（PostMessage 注入锁定窗口）
   - action_executor:     动作执行器，整合键鼠 + 冷却管理
 """

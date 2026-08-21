@@ -124,10 +124,11 @@ class Automation:
         self._frame_count = 0  # 帧计数器（用于限频日志）
 
         # ---- OCR 名字定位器（延迟初始化，首次使用时才加载模型）----
-        # ocr_interval=1: 每帧执行 OCR，与 YOLO 检测同节奏，实时定位
+        # ocr_interval=10: 每 10 帧执行一次 OCR，其余帧用缓存（大幅降低 OCR 耗时，
+        #                  避免每帧 OCR 拖慢主循环帧率）
         # character_height=60: 人物高度约 60px，角色中心 = 名字中心 + 高度一半（向下）
         self._ocr = OCRNameLocator(
-            character_height=60, ocr_interval=1,
+            character_height=60, ocr_interval=10,
             on_log=self.on_log,
         )
 
@@ -220,10 +221,12 @@ class Automation:
         """停止自动打怪。
 
         设置 _running = False，_loop() 会在下一次迭代时退出。
+        同时释放所有按住的移动键，防止停止后方向键卡住。
         """
         if not self._running:
             return
         self._running = False
+        self.engine.release_keys()  # 释放按住的方向键/上键
         self.on_log("[停止] 自动打怪已停止")
 
     def _loop(self):
@@ -243,144 +246,157 @@ class Automation:
         interval = 1.0 / max(1, self.config.fps)
 
         while self._running:
-            t0 = time.time()  # 帧开始时间
             self._frame_count += 1
 
-            # ---- 1. 截图 ----
+            # ---- 全局异常兜底 ----
+            # 任何一步抛异常（截图/检测/OCR/决策）都不允许静默崩溃线程，
+            # 必须记录 traceback 到日志，便于定位问题。
             try:
-                frame = self.capture.grab()
-                # 首次截图记录帧尺寸 + DPI 诊断
-                if self._frame_count == 1:
-                    h, w = frame.shape[:2]
-                    self.on_log(f"[帧尺寸] {w}x{h}")
-                    self.on_log(
-                        f"[配置] 参考分辨率: "
-                        f"{self.config.reference_width}x{self.config.reference_height}"
-                    )
-                    # DPI 诊断：对比 GetClientRect 与实际帧尺寸
-                    try:
-                        cw, ch = self.capture.get_client_rect()
-                        if cw != w or ch != h:
-                            self.on_log(
-                                f"[DPI警告] GetClientRect={cw}x{ch} "
-                                f"与实际帧 {w}x{h} 不一致，"
-                                f"可能存在 DPI 缩放偏移！"
-                            )
-                        else:
-                            self.on_log(
-                                f"[DPI] 客户区尺寸匹配 ({cw}x{ch})，坐标应无偏移"
-                            )
-                    except Exception:
-                        pass
-            except Exception as e:
-                self.on_log(f"[错误] 截图失败: {e}")
+                self._loop_frame(interval)
+            except Exception:
+                import traceback
+                self.on_log("[错误] 主循环异常(已捕获, 继续运行):")
+                for line in traceback.format_exc().splitlines():
+                    self.on_log(f"  {line}")
                 time.sleep(interval)
-                continue
 
-            # ---- 2. YOLO 检测 ----
-            # detect() 返回 [Detection, ...]，每个 Detection 包含:
-            #   cls_name, confidence, x, y, w, h, center
-            try:
-                detections = self.detector.detect(frame)
-            except Exception as e:
-                self.on_log(f"[错误] 检测失败: {e}")
-                detections = []
-
-            # 按类别名过滤（配置中可能用逗号分隔多个类别名）
-            monster_classes = self._monster_classes()
-            monsters = [d for d in detections if d.cls_name in monster_classes]
-            floors = [d for d in detections if d.cls_name in self._floor_classes()]
-            ropes = [d for d in detections if d.cls_name in self._rope_classes()]
-
-            # 每 30 帧输出一次怪物坐标（避免刷屏）
-            if monsters and self._frame_count % 30 == 0:
-                coords = ", ".join(
-                    f"({d.center[0]},{d.center[1]})" for d in monsters
+    def _loop_frame(self, interval: float):
+        """单帧执行：截图→检测→HP/MP→定位→决策→预览。"""
+        t0 = time.time()  # 帧开始时间
+        try:
+            frame = self.capture.grab()
+            # 首次截图记录帧尺寸 + DPI 诊断
+            if self._frame_count == 1:
+                h, w = frame.shape[:2]
+                self.on_log(f"[帧尺寸] {w}x{h}")
+                self.on_log(
+                    f"[配置] 参考分辨率: "
+                    f"{self.config.reference_width}x{self.config.reference_height}"
                 )
-                self.on_log(f"[怪物] {len(monsters)}只, 坐标: {coords}")
-
-            # ---- 3. HP 检测 ----
-            # scale_region(): 把参考分辨率下的坐标缩放到当前帧的实际像素
-            # 这样同一个配置文件兼容不同窗口大小
-            hp_region = self.config.scale_region(
-                self.config.hp_region, frame.shape[1], frame.shape[0]
-            )
-            # detect_bar_ratio(): 多方法融合检测（边缘→亮度→颜色）
-            hp_ratio = detect_bar_ratio(
-                frame, hp_region,
-                tuple(self.config.hp_color) if self.config.hp_color else None,
-                self.config.hp_tolerance,
-            )
-
-            # ---- 4. MP 检测 ----
-            mp_region = self.config.scale_region(
-                self.config.mp_region, frame.shape[1], frame.shape[0]
-            )
-            mp_ratio = detect_bar_ratio(
-                frame, mp_region,
-                tuple(self.config.mp_color) if self.config.mp_color else None,
-                self.config.mp_tolerance,
-            )
-
-            # ---- 5. 自身定位 ----
-            self_pos = self._locate_self(frame)
-
-            # ---- HP/MP 变化检测 ----
-            if hp_ratio is not None:
-                if self._last_hp_ratio is None or abs(hp_ratio - self._last_hp_ratio) >= 0.05:
-                    self._last_hp_ratio = hp_ratio
-                    self.on_log(f"[HP] {hp_ratio:.0%}")
-            if mp_ratio is not None:
-                if self._last_mp_ratio is None or abs(mp_ratio - self._last_mp_ratio) >= 0.05:
-                    self._last_mp_ratio = mp_ratio
-                    self.on_log(f"[MP] {mp_ratio:.0%}")
-
-            # 每 30 帧输出一次状态
-            if self._frame_count % 30 == 0:
-                # HP/MP 比例
-                hp_str = f"{hp_ratio:.0%}" if hp_ratio is not None else "N/A"
-                mp_str = f"{mp_ratio:.0%}" if mp_ratio is not None else "N/A"
-
-                # 自身坐标
-                center = self._get_last_center()
-                if self_pos:
-                    if center:
+                # DPI 诊断：对比 GetClientRect 与实际帧尺寸
+                try:
+                    cw, ch = self.capture.get_client_rect()
+                    if cw != w or ch != h:
                         self.on_log(
-                            f"[状态] HP={hp_str} MP={mp_str} "
-                            f"中心:({center[0]},{center[1]}) "
-                            f"脚底:({self_pos[0]},{self_pos[1]})"
+                            f"[DPI警告] GetClientRect={cw}x{ch} "
+                            f"与实际帧 {w}x{h} 不一致，"
+                            f"可能存在 DPI 缩放偏移！"
                         )
                     else:
                         self.on_log(
-                            f"[状态] HP={hp_str} MP={mp_str} "
-                            f"脚底:({self_pos[0]},{self_pos[1]})"
+                            f"[DPI] 客户区尺寸匹配 ({cw}x{ch})，坐标应无偏移"
                         )
-                else:
-                    self.on_log(f"[状态] HP={hp_str} MP={mp_str} 自身未定位")
+                except Exception:
+                    pass
+        except Exception as e:
+            self.on_log(f"[错误] 截图失败: {e}")
+            time.sleep(interval)
+            return
 
-            # ---- 6. 决策与执行 ----
-            # Context 是感知层 → 决策层的数据载体
-            ctx = Context(
-                monsters=monsters,
-                floors=floors,
-                ropes=ropes,
-                self_position=self_pos,     # 自身脚底坐标 (cx, cy) 或 None
-                self_center=self._get_last_center(),  # 角色中心点（距离推算用）
-                hp_ratio=hp_ratio,          # 0.0~1.0
-                mp_ratio=mp_ratio,          # 0.0~1.0
-                detections=detections,      # 全部检测结果（供调试/日志用）
+        # ---- 2. YOLO 检测 ----
+        # detect() 返回 [Detection, ...]，每个 Detection 包含:
+        #   cls_name, confidence, x, y, w, h, center
+        try:
+            detections = self.detector.detect(frame)
+        except Exception as e:
+            self.on_log(f"[错误] 检测失败: {e}")
+            detections = []
+
+        # 按类别名过滤（配置中可能用逗号分隔多个类别名）
+        monster_classes = self._monster_classes()
+        monsters = [d for d in detections if d.cls_name in monster_classes]
+        floors = [d for d in detections if d.cls_name in self._floor_classes()]
+        ropes = [d for d in detections if d.cls_name in self._rope_classes()]
+
+        # 每 30 帧输出一次怪物坐标（避免刷屏）
+        if monsters and self._frame_count % 30 == 0:
+            coords = ", ".join(
+                f"({d.center[0]},{d.center[1]})" for d in monsters
             )
-            self.engine.decide(ctx)  # 决策引擎根据上下文执行动作
+            self.on_log(f"[怪物] {len(monsters)}只, 坐标: {coords}")
 
-            # ---- 7. 预览回调 ----
-            # 把 frame 和检测结果推给 UI 线程渲染
-            self.on_frame(frame, detections, hp_ratio, mp_ratio)
+        # ---- 3. HP 检测 ----
+        # scale_region(): 把参考分辨率下的坐标缩放到当前帧的实际像素
+        # 这样同一个配置文件兼容不同窗口大小
+        hp_region = self.config.scale_region(
+            self.config.hp_region, frame.shape[1], frame.shape[0]
+        )
+        # detect_bar_ratio(): 多方法融合检测（边缘→亮度→颜色）
+        hp_ratio = detect_bar_ratio(
+            frame, hp_region,
+            tuple(self.config.hp_color) if self.config.hp_color else None,
+            self.config.hp_tolerance,
+        )
 
-            # ---- 8. FPS 控制 ----
-            elapsed = time.time() - t0
-            if elapsed < interval:
-                # 帧太快，sleep 补齐
-                time.sleep(interval - elapsed)
+        # ---- 4. MP 检测 ----
+        mp_region = self.config.scale_region(
+            self.config.mp_region, frame.shape[1], frame.shape[0]
+        )
+        mp_ratio = detect_bar_ratio(
+            frame, mp_region,
+            tuple(self.config.mp_color) if self.config.mp_color else None,
+            self.config.mp_tolerance,
+        )
+
+        # ---- 5. 自身定位 ----
+        self_pos = self._locate_self(frame)
+
+        # ---- HP/MP 变化检测 ----
+        if hp_ratio is not None:
+            if self._last_hp_ratio is None or abs(hp_ratio - self._last_hp_ratio) >= 0.05:
+                self._last_hp_ratio = hp_ratio
+                self.on_log(f"[HP] {hp_ratio:.0%}")
+        if mp_ratio is not None:
+            if self._last_mp_ratio is None or abs(mp_ratio - self._last_mp_ratio) >= 0.05:
+                self._last_mp_ratio = mp_ratio
+                self.on_log(f"[MP] {mp_ratio:.0%}")
+
+        # 每 30 帧输出一次状态
+        if self._frame_count % 30 == 0:
+            # HP/MP 比例
+            hp_str = f"{hp_ratio:.0%}" if hp_ratio is not None else "N/A"
+            mp_str = f"{mp_ratio:.0%}" if mp_ratio is not None else "N/A"
+
+            # 自身坐标
+            center = self._get_last_center()
+            if self_pos:
+                if center:
+                    self.on_log(
+                        f"[状态] HP={hp_str} MP={mp_str} "
+                        f"中心:({center[0]},{center[1]}) "
+                        f"脚底:({self_pos[0]},{self_pos[1]})"
+                    )
+                else:
+                    self.on_log(
+                        f"[状态] HP={hp_str} MP={mp_str} "
+                        f"脚底:({self_pos[0]},{self_pos[1]})"
+                    )
+            else:
+                self.on_log(f"[状态] HP={hp_str} MP={mp_str} 自身未定位")
+
+        # ---- 6. 决策与执行 ----
+        # Context 是感知层 → 决策层的数据载体
+        ctx = Context(
+            monsters=monsters,
+            floors=floors,
+            ropes=ropes,
+            self_position=self_pos,     # 自身脚底坐标 (cx, cy) 或 None
+            self_center=self._get_last_center(),  # 角色中心点（距离推算用）
+            hp_ratio=hp_ratio,          # 0.0~1.0
+            mp_ratio=mp_ratio,          # 0.0~1.0
+            detections=detections,      # 全部检测结果（供调试/日志用）
+        )
+        self.engine.decide(ctx)  # 决策引擎根据上下文执行动作
+
+        # ---- 7. 预览回调 ----
+        # 把 frame 和检测结果推给 UI 线程渲染
+        self.on_frame(frame, detections, hp_ratio, mp_ratio)
+
+        # ---- 8. FPS 控制 ----
+        elapsed = time.time() - t0
+        if elapsed < interval:
+            # 帧太快，sleep 补齐
+            time.sleep(interval - elapsed)
 
     # =========================================================================
     # 类别名解析（从配置的逗号分隔字符串 → 列表）

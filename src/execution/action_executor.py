@@ -12,7 +12,7 @@
     executor.click(500, 300)     → 点击
     executor.set_target_window() → 绑定窗口
 
-  不需要关心底层是 PostMessage 还是 keyboard 库。
+  不需要关心底层是 SendInput 还是 PostMessage。
 
 ================================================================================
 冷却机制
@@ -54,8 +54,7 @@ class ActionExecutor:
     def set_target_window(self, hwnd: int):
         """设置目标窗口句柄，同时传给键盘和鼠标控制器。
 
-        PostMessage 模式需要知道发往哪个窗口，所以必须绑定。
-        绑定后所有按键只发送到该窗口，绝不全局发送。
+        SendInput 模式需要绑定窗口，以便按键前激活该窗口到前台。
 
         Args:
             hwnd: Windows 窗口句柄
@@ -95,6 +94,30 @@ class ActionExecutor:
             True 表示冷却已过
         """
         return self._kb.can_press(key, cooldown)
+
+    def key_down(self, key: str) -> bool:
+        """按住指定键（持续按住直到 key_up / reset）。
+
+        用于持续移动/攀爬：按住期间角色一直移动。
+
+        Args:
+            key: 按键名，如 "right", "up"
+
+        Returns:
+            True 已按住
+        """
+        return self._kb.key_down(key)
+
+    def key_up(self, key: str) -> bool:
+        """释放指定键（停止移动/攀爬）。
+
+        Args:
+            key: 按键名
+
+        Returns:
+            True 已释放
+        """
+        return self._kb.key_up(key)
 
     # =========================================================================
     # 鼠标

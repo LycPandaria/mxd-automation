@@ -4,15 +4,17 @@
 发送模式
 ================================================================================
 
-  PostMessage 注入（唯一模式）
-     原理: 调用 Windows API PostMessageW() 直接向目标窗口发送
-           WM_KEYDOWN / WM_KEYUP 消息，不经过全局键盘队列。
-     优点: 不占用真实键盘，切换应用不影响，可以后台运行
-     条件: 必须已锁定窗口（set_target_window() 已调用）
+  SendInput 真实按键（当前模式）
+     原理: 调用 Windows API SendInput() 从驱动层模拟真实全局按键，
+           经过系统全局键盘输入队列，DirectX/DirectInput 游戏可以收到。
+     优点: 对冒险岛这类读取全局键盘状态的游戏有效
+           （PostMessage 注入对这类游戏无效，已弃用）
+     代价: 占用真实键盘输入，游戏窗口必须处于前台/激活状态，
+           运行期间不能切换去操作其它程序
 
-  【重要】按键只发送到锁定的游戏窗口，绝不全局发送。
-  未锁定窗口时 press_key() 会返回 False 并记录日志，
-  不会影响用户正在操作的其它程序。
+  【重要】按键是全局真实输入。
+  未锁定窗口时 press_key() 会返回 False 并记录日志。
+  锁定后每次按键前会自动尝试把游戏窗口激活到前台。
 
 ================================================================================
 虚拟键码（VK Code）
@@ -25,10 +27,9 @@
     - Tab:    0x09
     - Enter:  0x0D
 
-  PostMessage 需要的参数:
-    uMsg:    WM_KEYDOWN (0x0100) 或 WM_KEYUP (0x0101)
-    wParam:  虚拟键码 (VK Code)
-    lParam:  打包的扫描码 + 标志位
+  SendInput 需要的参数:
+    扫描码: 由 MapVirtualKeyW(vk, 0) 获得（KEYEVENTF_SCANCODE 模式）
+    标志:   KEYEVENTF_EXTENDEDKEY（扩展键）/ KEYEVENTF_KEYUP（抬起）
 
 ================================================================================
 按键冷却
@@ -47,9 +48,88 @@ from ctypes import wintypes
 # ---- Windows API 常量 ----
 user32 = ctypes.windll.user32
 
-WM_KEYDOWN = 0x0100  # 按键按下消息
+WM_KEYDOWN = 0x0100  # 按键按下消息（保留参考，SendInput 模式不再使用）
 WM_KEYUP = 0x0101    # 按键抬起消息
 WM_CHAR = 0x0102     # 字符消息（一般不需要）
+
+# ---- SendInput 常量 ----
+INPUT_KEYBOARD = 1               # INPUT 类型: 键盘输入
+
+KEYEVENTF_EXTENDEDKEY = 0x0001   # 扩展键标志（方向键/Insert/Delete 等）
+KEYEVENTF_KEYUP = 0x0002         # 键抬起标志
+KEYEVENTF_SCANCODE = 0x0008      # 使用硬件扫描码（更接近真实硬件按键）
+
+SW_RESTORE = 9                   # ShowWindow: 恢复窗口
+
+
+# ---- SendInput 结构体 ----
+class _KEYBDINPUT(ctypes.Structure):
+    """键盘输入结构。"""
+    _fields_ = [
+        ("wVk", wintypes.WORD),
+        ("wScan", wintypes.WORD),
+        ("dwFlags", wintypes.DWORD),
+        ("time", wintypes.DWORD),
+        ("dwExtraInfo", ctypes.c_size_t),  # ULONG_PTR
+    ]
+
+
+class _MOUSEINPUT(ctypes.Structure):
+    """鼠标输入结构（键盘模式不使用，占位对齐用）。"""
+    _fields_ = [
+        ("dx", wintypes.LONG),
+        ("dy", wintypes.LONG),
+        ("mouseData", wintypes.DWORD),
+        ("dwFlags", wintypes.DWORD),
+        ("time", wintypes.DWORD),
+        ("dwExtraInfo", ctypes.c_size_t),
+    ]
+
+
+class _HARDWAREINPUT(ctypes.Structure):
+    """硬件输入结构（不使用，占位对齐用）。"""
+    _fields_ = [
+        ("uMsg", wintypes.DWORD),
+        ("wParamL", wintypes.WORD),
+        ("wParamH", wintypes.WORD),
+    ]
+
+
+class _INPUTUNION(ctypes.Union):
+    """INPUT 的联合体。"""
+    _fields_ = [
+        ("ki", _KEYBDINPUT),
+        ("mi", _MOUSEINPUT),
+        ("hi", _HARDWAREINPUT),
+    ]
+
+
+class INPUT(ctypes.Structure):
+    """SendInput 的 INPUT 结构。"""
+    _anonymous_ = ("u",)
+    _fields_ = [
+        ("type", wintypes.DWORD),
+        ("u", _INPUTUNION),
+    ]
+
+
+SendInput = user32.SendInput
+SendInput.argtypes = (wintypes.UINT, ctypes.POINTER(INPUT), wintypes.UINT)
+SendInput.restype = wintypes.UINT
+
+# 需要 KEYEVENTF_EXTENDEDKEY 标志的键（有独立的扩展扫描码）
+_EXTENDED_KEYS = {
+    0x21,  # PageUp
+    0x22,  # PageDown
+    0x23,  # End
+    0x24,  # Home
+    0x25,  # Left
+    0x26,  # Up
+    0x27,  # Right
+    0x28,  # Down
+    0x2D,  # Insert
+    0x2E,  # Delete
+}
 
 # ---- 虚拟键码映射表 ----
 # 将可读的按键名映射到 Windows 虚拟键码
@@ -73,40 +153,23 @@ for _c in "abcdefghijklmnopqrstuvwxyz":
 del _i, _c  # 清理循环变量，避免污染命名空间
 
 
-def _make_lparam(vk_code, scan_code, flags):
-    """构造 PostMessage 的 lParam 参数。
-
-    lParam 是一个 32 位整数，格式如下:
-      bits 0-15:   重复计数
-      bits 16-23:  扫描码
-      bits 24-28:  扩展键标志等
-      bits 29:     上下文码 (0=按下, 1=抬起)
-      bits 30:     之前按键状态
-      bits 31:     转换状态 (0=按下, 1=抬起)
-
-    Args:
-        vk_code:   虚拟键码
-        scan_code: 硬件扫描码（通过 MapVirtualKeyW 获取）
-        flags:     标志位组合
-    """
-    return (scan_code << 16) | flags
-
-
 class KeyboardController:
     """键盘控制器。
 
-    通过 PostMessage 直接向锁定窗口发送 WM_KEYDOWN/WM_KEYUP，
+    通过 SendInput 发送全局真实按键（游戏窗口需在前台激活），
     支持按键冷却（同一键在冷却时间内不重复触发）。
 
     用法:
         kb = KeyboardController()
         kb.set_target_window(hwnd)  # 设置目标窗口
-        kb.press_key("f")           # 按 F 键
-        kb.press_key("1", cooldown=1.0)  # 按 1 键，冷却 1 秒
+        kb.press_key("f")           # 按 F 键（点按）
+        kb.key_down("right")        # 按住右方向键（持续移动）
+        kb.key_up("right")          # 释放右方向键（停止移动）
     """
 
     def __init__(self, on_log=None):
         self._last_press = {}  # key -> 上次触发时间戳（秒）
+        self._held_keys = set()  # 当前被按住未释放的键
         self._hwnd = None      # 目标窗口句柄
         self._on_log = on_log or (lambda msg: None)
 
@@ -122,16 +185,18 @@ class KeyboardController:
     def set_target_window(self, hwnd):
         """设置目标窗口句柄。
 
-        设置后，所有按键通过 PostMessage 直接发送到该窗口。
-        未设置（None）时 press_key() 会拒绝发送并记录日志，
-        绝不使用全局按键影响其它程序。
+        设置后，按键通过 SendInput 全局注入，游戏窗口必须在前台。
+        未设置（None）时 press_key() 会拒绝发送并记录日志。
 
         Args:
             hwnd: Windows 窗口句柄（整数）
         """
         self._hwnd = hwnd
         if hwnd:
-            self._on_log(f"[按键] 目标窗口已锁定, hwnd=0x{hwnd:X}")
+            self._on_log(
+                f"[按键] 目标窗口已锁定, hwnd=0x{hwnd:X}"
+                "（SendInput 模式: 运行期间请保持游戏窗口在前台）"
+            )
 
     # =========================================================================
     # 按键
@@ -162,11 +227,18 @@ class KeyboardController:
         return 0
 
     def _press_single_key(self, key: str) -> bool:
-        """发送单个按键（PostMessage 注入到锁定窗口）。
+        """发送单个按键（SendInput 全局真实按键）。
+
+        SendInput 流程:
+          1. 激活锁定窗口到前台（游戏才能收到全局输入）
+          2. 计算硬件扫描码（MapVirtualKeyW）
+          3. SendInput 发送 KEYDOWN（扫描码模式，扩展键加标志）
+          4. sleep 让游戏有时间处理
+          5. SendInput 发送 KEYUP
 
         Returns:
-            True: 已成功投递到锁定窗口
-            False: 键无效 / 未锁定窗口 / PostMessage 投递失败
+            True: 按键已注入系统输入队列
+            False: 键无效 / 未锁定窗口 / SendInput 失败
         """
         vk_code = self._get_vk_code(key)
         if not vk_code:
@@ -177,31 +249,137 @@ class KeyboardController:
             self._on_log(f"[按键] 未锁定窗口，拒绝发送按键: {key}")
             return False
 
-        # ---- PostMessage 注入 ----
+        # SendInput 是全局输入，先把游戏窗口激活到前台
+        self._activate_window()
+
+        # 扫描码模式：接近真实硬件按键，DirectInput 游戏（冒险岛）可识别
         scan = user32.MapVirtualKeyW(vk_code, 0)
-        lparam_down = _make_lparam(vk_code, scan, 0x00000000)
-        lparam_up = _make_lparam(vk_code, scan, 0xC0000000)
-        ok_down = user32.PostMessageW(self._hwnd, WM_KEYDOWN, vk_code, lparam_down)
-        time.sleep(0.02)
-        ok_up = user32.PostMessageW(self._hwnd, WM_KEYUP, vk_code, lparam_up)
-        if not ok_down or not ok_up:
+        flags_down = KEYEVENTF_SCANCODE
+        if vk_code in _EXTENDED_KEYS:
+            flags_down |= KEYEVENTF_EXTENDEDKEY
+        flags_up = flags_down | KEYEVENTF_KEYUP
+
+        input_down = INPUT(
+            type=INPUT_KEYBOARD,
+            ki=_KEYBDINPUT(wVk=0, wScan=scan, dwFlags=flags_down),
+        )
+        input_up = INPUT(
+            type=INPUT_KEYBOARD,
+            ki=_KEYBDINPUT(wVk=0, wScan=scan, dwFlags=flags_up),
+        )
+
+        sent_down = SendInput(1, ctypes.byref(input_down), ctypes.sizeof(INPUT))
+        time.sleep(0.03)  # 让游戏有时间处理按下事件
+        sent_up = SendInput(1, ctypes.byref(input_up), ctypes.sizeof(INPUT))
+        if not sent_down or not sent_up:
             self._on_log(
-                f"[按键] 投递失败 (窗口可能已关闭): key={key}, "
-                f"down={bool(ok_down)}, up={bool(ok_up)}"
+                f"[按键] SendInput 发送失败 (err={ctypes.get_last_error()}): "
+                f"key={key}, down={sent_down}, up={sent_up}"
             )
             return False
         return True
 
+    def key_down(self, key: str) -> bool:
+        """按住指定键（SendInput KEYDOWN，持续按住直到 key_up / reset）。
+
+        用于持续移动/攀爬：按住期间角色会一直移动，
+        直到调用 key_up() 释放或 reset() 统一释放。
+
+        Args:
+            key: 按键名，如 "right", "up"
+
+        Returns:
+            True: 已按住；False: 键无效 / 未锁定窗口 / 发送失败
+        """
+        vk_code = self._get_vk_code(key)
+        if not vk_code:
+            self._on_log(f"[按键] 无法识别的按键: {key}")
+            return False
+        if not self._hwnd:
+            self._on_log(f"[按键] 未锁定窗口，拒绝发送按键: {key}")
+            return False
+        if key in self._held_keys:
+            return True  # 已按住，避免重复发送 KEYDOWN
+
+        self._activate_window()
+        scan = user32.MapVirtualKeyW(vk_code, 0)
+        flags = KEYEVENTF_SCANCODE
+        if vk_code in _EXTENDED_KEYS:
+            flags |= KEYEVENTF_EXTENDEDKEY
+        inp = INPUT(
+            type=INPUT_KEYBOARD,
+            ki=_KEYBDINPUT(wVk=0, wScan=scan, dwFlags=flags),
+        )
+        sent = SendInput(1, ctypes.byref(inp), ctypes.sizeof(INPUT))
+        if not sent:
+            self._on_log(f"[按键] 按住失败 (err={ctypes.get_last_error()}): key={key}")
+            return False
+        self._held_keys.add(key)
+        return True
+
+    def key_up(self, key: str) -> bool:
+        """释放指定键（SendInput KEYUP）。
+
+        Args:
+            key: 按键名
+
+        Returns:
+            True: 已释放（或本就未按住）；False: 键无效 / 发送失败
+        """
+        if key not in self._held_keys:
+            return True  # 未按住，无需释放
+        vk_code = self._get_vk_code(key)
+        if not vk_code:
+            return False
+        scan = user32.MapVirtualKeyW(vk_code, 0)
+        flags = KEYEVENTF_SCANCODE | KEYEVENTF_KEYUP
+        if vk_code in _EXTENDED_KEYS:
+            flags |= KEYEVENTF_EXTENDEDKEY
+        inp = INPUT(
+            type=INPUT_KEYBOARD,
+            ki=_KEYBDINPUT(wVk=0, wScan=scan, dwFlags=flags),
+        )
+        sent = SendInput(1, ctypes.byref(inp), ctypes.sizeof(INPUT))
+        if not sent:
+            self._on_log(f"[按键] 释放失败 (err={ctypes.get_last_error()}): key={key}")
+            return False
+        self._held_keys.discard(key)
+        return True
+
+    def _activate_window(self) -> bool:
+        """将锁定窗口激活到前台。
+
+        SendInput 是全局输入，只有前台窗口才能收到按键。
+        通过 恢复窗口 + 释放前台锁 + SetForegroundWindow 激活。
+        若激活失败（被 Windows 前台锁限制），仅记录日志，不阻断按键。
+
+        Returns:
+            True 激活成功 / False 激活失败
+        """
+        if not self._hwnd:
+            return False
+        try:
+            user32.ShowWindow(self._hwnd, SW_RESTORE)
+            # 空按键释放 Windows 的"前台锁定"，提高 SetForegroundWindow 成功率
+            user32.keybd_event(0, 0, 0, 0)
+            ok = bool(user32.SetForegroundWindow(self._hwnd))
+            if not ok:
+                self._on_log("[按键] 激活窗口失败，请手动把游戏窗口点到前台")
+            return ok
+        except Exception as e:
+            self._on_log(f"[按键] 激活窗口异常: {e}")
+            return False
+
     def press_key(self, key: str, cooldown: float = 0.0) -> bool:
         """按下指定键，支持多字符序列（如 "hm" 依次按 h、m）。
 
-        【PostMessage 流程】
+        【SendInput 流程】
         1. 获取虚拟键码
-        2. 获取硬件扫描码（MapVirtualKeyW）
-        3. 构造 lParam（按下/抬起）
-        4. PostMessageW(hwnd, WM_KEYDOWN, vk, lParam_down)
-        5. sleep(0.02s) 让游戏有时间处理
-        6. PostMessageW(hwnd, WM_KEYUP, vk, lParam_up)
+        2. 激活窗口到前台（SetForegroundWindow）
+        3. 获取硬件扫描码（MapVirtualKeyW）
+        4. SendInput 发送 KEYDOWN（扫描码模式，扩展键加标志）
+        5. sleep(0.03s) 让游戏有时间处理
+        6. SendInput 发送 KEYUP
 
         【冷却机制】
         cooldown > 0 时，在冷却时间内再次调用返回 False。
@@ -248,5 +426,8 @@ class KeyboardController:
         return now - self._last_press.get(key, 0) >= cooldown
 
     def reset(self):
-        """清空所有按键冷却记录，用于停止/重启时重置状态。"""
+        """清空所有按键冷却，并释放所有被按住的键（停止时防止方向键卡住）。"""
+        for key in list(self._held_keys):
+            self.key_up(key)
+        self._held_keys.clear()
         self._last_press.clear()

@@ -127,8 +127,12 @@ class OCRNameLocator:
             roi = frame[y1:y2, x1:x2]
             offset_x, offset_y = x1, y1
 
-        # 执行 OCR
-        result, _ = engine(roi)
+        # 执行 OCR（引擎执行异常时降级返回 None，不让异常扩散到主循环）
+        try:
+            result, _ = engine(roi)
+        except Exception as e:
+            self._on_log(f"[定位] OCR 执行异常: {e}")
+            return None
         if result is None:
             return None
 
@@ -171,7 +175,11 @@ class OCRNameLocator:
         if engine is None:
             return []
 
-        result, _ = engine(frame)
+        try:
+            result, _ = engine(frame)
+        except Exception as e:
+            self._on_log(f"[定位] OCR 执行异常: {e}")
+            return []
         if result is None:
             return []
 

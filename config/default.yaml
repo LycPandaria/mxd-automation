@@ -37,6 +37,7 @@ mp:
 # ---- 战斗 ----
 combat:
   target_key: "tab"        # 选中目标按键
+  jump_key: "alt"          # 跳跃按键
   skills:
     - name: "技能1"
       key: "1"

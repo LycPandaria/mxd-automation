@@ -65,6 +65,7 @@ YAML 配置字段说明
   mp_threshold:     MP 加蓝阈值
   mp_key:           加蓝键
   target_key:       选目标键
+  jump_key:         跳跃键
   skills:           技能列表 [{name, key, cooldown}, ...]
 """
 import os
@@ -171,6 +172,7 @@ def _defaults() -> Dict[str, Any]:
         "mp_key": "g",  # 加蓝快捷键
         # ---- 战斗 ----
         "target_key": "tab",  # 选目标键
+        "jump_key": "alt",    # 跳跃键
         "skills": [
             {"name": "技能1", "key": "1", "cooldown": 1.0},
             {"name": "技能2", "key": "2", "cooldown": 3.0},

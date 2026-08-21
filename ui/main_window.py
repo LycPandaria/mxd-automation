@@ -275,7 +275,12 @@ class MainWindow(QMainWindow):
         g = QGridLayout()
         g.addWidget(QLabel("选中目标键:"), 0, 0)
         self.target_key_edit = QLineEdit("tab")
+        self.target_key_edit.setPlaceholderText("tab")
         g.addWidget(self.target_key_edit, 0, 1)
+        g.addWidget(QLabel("跳跃键:"), 1, 0)
+        self.jump_key_edit = QLineEdit("alt")
+        self.jump_key_edit.setPlaceholderText("alt / space")
+        g.addWidget(self.jump_key_edit, 1, 1)
         v.addLayout(g)
 
         # 技能表
@@ -333,6 +338,7 @@ class MainWindow(QMainWindow):
                 f"w={c.mp_region[2]:.1%} h={c.mp_region[3]:.1%}"
             )
         self.target_key_edit.setText(c.target_key)
+        self.jump_key_edit.setText(c.jump_key)
         # 技能表
         self.skill_table.setRowCount(0)
         for s in c.skills:
@@ -353,6 +359,7 @@ class MainWindow(QMainWindow):
         c.mp_key = self.mp_key_edit.text().strip()
         c.mp_threshold = self.mp_thr_spin.value() / 100
         c.target_key = self.target_key_edit.text().strip()
+        c.jump_key = self.jump_key_edit.text().strip() or "alt"
         # 技能
         skills = []
         for r in range(self.skill_table.rowCount()):
@@ -580,10 +587,10 @@ class MainWindow(QMainWindow):
         if mp_region:
             rx, ry, rw, rh = mp_region
             cv2.rectangle(disp, (rx, ry), (rx + rw, ry + rh), (255, 128, 0), 1)
-        # 自身位置：HP条偏移优先，名字模板匹配兜底
-        self_pos = self.automation._locate_self(frame)
-        if self_pos:
-            sx, sy = self_pos
+        # 自身位置：直接复用主循环已算好的缓存中心点（避免 UI 线程执行 OCR 卡死）
+        center = self.automation._get_last_center()
+        if center:
+            sx, sy = center
             cv2.circle(disp, (sx, sy), 6, (255, 255, 0), -1)
             cv2.putText(disp, "self", (sx + 8, sy + 4),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 0), 1)

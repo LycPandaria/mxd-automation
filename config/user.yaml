@@ -1,4 +1,4 @@
-window_title: 冒险岛怀旧服
+window_title: ''
 start_stop_hotkey: F6
 reference_width: 1368
 reference_height: 800
@@ -35,6 +35,7 @@ mp_tolerance: 20
 mp_threshold: 0.6
 mp_key: y
 target_key: tab
+jump_key: c
 skills:
 - name: 技能1
   key: x
