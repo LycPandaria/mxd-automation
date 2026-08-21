@@ -23,7 +23,7 @@
     88
   ],
   "hp_tolerance": 20,
-  "hp_threshold": 0.7,
+  "hp_threshold": 0.6,
   "hp_key": "f",
   "mp_region": [
     0.4458272327964861,
@@ -37,7 +37,7 @@
     231
   ],
   "mp_tolerance": 20,
-  "mp_threshold": 0.7,
+  "mp_threshold": 0.6,
   "mp_key": "g",
   "target_key": "tab",
   "skills": [

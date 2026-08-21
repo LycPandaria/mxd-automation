@@ -213,8 +213,8 @@ class MainWindow(QMainWindow):
         h = QHBoxLayout(box)
         h.addWidget(QLabel("按键:"))
         self.hp_key_edit = QLineEdit()
-        self.hp_key_edit.setFixedWidth(50)
-        self.hp_key_edit.setPlaceholderText("f")
+        self.hp_key_edit.setFixedWidth(80)
+        self.hp_key_edit.setPlaceholderText("f / hm")
         h.addWidget(self.hp_key_edit)
 
         h.addWidget(QLabel("阈值%:"))
@@ -243,8 +243,8 @@ class MainWindow(QMainWindow):
         h = QHBoxLayout(box)
         h.addWidget(QLabel("按键:"))
         self.mp_key_edit = QLineEdit()
-        self.mp_key_edit.setFixedWidth(50)
-        self.mp_key_edit.setPlaceholderText("g")
+        self.mp_key_edit.setFixedWidth(80)
+        self.mp_key_edit.setPlaceholderText("g / pu")
         h.addWidget(self.mp_key_edit)
 
         h.addWidget(QLabel("阈值%:"))

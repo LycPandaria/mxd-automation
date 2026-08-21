@@ -153,8 +153,31 @@ class KeyboardController:
                 return vk
         return 0
 
+    def _press_single_key(self, key: str) -> bool:
+        """发送单个按键（PostMessage 或 keyboard 库兜底）。"""
+        vk_code = self._get_vk_code(key)
+        if not vk_code:
+            return False
+
+        if self._hwnd:
+            # ---- 方案1: PostMessage 注入 ----
+            scan = user32.MapVirtualKeyW(vk_code, 0)
+            lparam_down = _make_lparam(vk_code, scan, 0x00000000)
+            lparam_up = _make_lparam(vk_code, scan, 0xC0000000)
+            user32.PostMessageW(self._hwnd, WM_KEYDOWN, vk_code, lparam_down)
+            time.sleep(0.02)
+            user32.PostMessageW(self._hwnd, WM_KEYUP, vk_code, lparam_up)
+        else:
+            # ---- 方案2: keyboard 库全局发送（兜底）----
+            try:
+                import keyboard
+                keyboard.send(key)
+            except Exception:
+                return False
+        return True
+
     def press_key(self, key: str, cooldown: float = 0.0) -> bool:
-        """按下指定键。
+        """按下指定键，支持多字符序列（如 "hm" 依次按 h、m）。
 
         【PostMessage 流程】
         1. 获取虚拟键码
@@ -165,10 +188,11 @@ class KeyboardController:
         6. PostMessageW(hwnd, WM_KEYUP, vk, lParam_up)
 
         【冷却机制】
-        cooldown > 0 时，在冷却时间内再次调用返回 False
+        cooldown > 0 时，在冷却时间内再次调用返回 False。
+        冷却作用于整个 key 序列（如 "hm" 整体冷却），而不是单个字母。
 
         Args:
-            key:      按键名
+            key:      按键名，如 "f", "tab", "hm"（多字符会依次发送每个键）
             cooldown: 冷却时间（秒），0 表示无冷却
 
         Returns:
@@ -184,36 +208,15 @@ class KeyboardController:
             return False
         self._last_press[key] = now
 
-        # 获取虚拟键码
-        vk_code = self._get_vk_code(key)
-        if not vk_code:
-            return False
+        # 多字符序列（如 "hm"）：先判断是否为映射表中的多字符功能键名
+        key_lower = key.lower().strip()
+        if len(key) > 1 and key_lower not in VK_MAP:
+            for k in key:
+                if not self._press_single_key(k):
+                    return False
+            return True
 
-        if self._hwnd:
-            # ---- 方案1: PostMessage 注入 ----
-            # 获取硬件扫描码
-            scan = user32.MapVirtualKeyW(vk_code, 0)
-
-            # 构造 lParam
-            # 按下: flags=0x00000000 (第30位=0表示之前未按下)
-            # 抬起: flags=0xC0000000 (第30位=1, 第31位=1)
-            lparam_down = _make_lparam(vk_code, scan, 0x00000000)
-            lparam_up = _make_lparam(vk_code, scan, 0xC0000000)
-
-            # 发送按下消息
-            user32.PostMessageW(self._hwnd, WM_KEYDOWN, vk_code, lparam_down)
-            # 短暂延迟让游戏处理
-            time.sleep(0.02)
-            # 发送抬起消息
-            user32.PostMessageW(self._hwnd, WM_KEYUP, vk_code, lparam_up)
-        else:
-            # ---- 方案2: keyboard 库全局发送（兜底）----
-            try:
-                import keyboard
-                keyboard.send(key)
-            except Exception:
-                return False
-        return True
+        return self._press_single_key(key)
 
     def can_press(self, key: str, cooldown: float = 0.0) -> bool:
         """查询某键当前是否可按下（冷却时间已过）。
