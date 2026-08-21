@@ -278,9 +278,6 @@ class MainWindow(QMainWindow):
         g.addWidget(self.target_key_edit, 0, 1)
         v.addLayout(g)
 
-        self.move_cb = QCheckBox("检测到怪时点击移动到怪位置 (否则原地放技能)")
-        v.addWidget(self.move_cb)
-
         # 技能表
         v.addWidget(QLabel("技能列表 (轮转释放):"))
         self.skill_table = QTableWidget(0, 3)
@@ -334,7 +331,6 @@ class MainWindow(QMainWindow):
                 f"{c.mp_region[0]},{c.mp_region[1]} {c.mp_region[2]}x{c.mp_region[3]}"
             )
         self.target_key_edit.setText(c.target_key)
-        self.move_cb.setChecked(c.move_to_monster)
         # 技能表
         self.skill_table.setRowCount(0)
         for s in c.skills:
@@ -354,7 +350,6 @@ class MainWindow(QMainWindow):
         c.mp_key = self.mp_key_edit.text().strip()
         c.mp_threshold = self.mp_thr_spin.value() / 100
         c.target_key = self.target_key_edit.text().strip()
-        c.move_to_monster = self.move_cb.isChecked()
         # 技能
         skills = []
         for r in range(self.skill_table.rowCount()):
@@ -529,11 +524,8 @@ class MainWindow(QMainWindow):
         monster_classes = [c.strip() for c in self.config.monster_classes.split(",")]
         floor_classes = [c.strip() for c in self.config.floor_classes.split(",")]
         rope_classes = [c.strip() for c in self.config.rope_classes.split(",")]
-        player_classes = [c.strip() for c in self.config.player_classes.split(",")]
         for d in detections:
-            if d.cls_name in player_classes:
-                color = (255, 0, 255)        # 品红: 其他玩家
-            elif d.cls_name in monster_classes:
+            if d.cls_name in monster_classes:
                 color = (0, 255, 0)          # 绿色: 怪物
             elif d.cls_name in rope_classes:
                 color = (0, 165, 255)        # 橙色: 绳索

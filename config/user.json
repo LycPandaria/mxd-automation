@@ -3,13 +3,12 @@
   "start_stop_hotkey": "F6",
   "reference_width": 1366,
   "reference_height": 768,
-  "fps": 13,
+  "fps": 5,
   "confidence": 0.5,
   "model_path": "E:/pythonProjects/mxd-automation/train/scripts/02_train_yolo/model/best.pt",
   "monster_classes": "monster",
   "floor_classes": "floor",
   "rope_classes": "rope",
-  "player_classes": "player",
   "self_name": "",
   "self_offset": 85,
   "hp_region": null,
@@ -31,22 +30,11 @@
   "mp_threshold": 0.3,
   "mp_key": "g",
   "target_key": "tab",
-  "move_to_monster": false,
   "skills": [
     {
       "name": "技能1",
-      "key": "1",
+      "key": "x",
       "cooldown": 1.0
-    },
-    {
-      "name": "技能2",
-      "key": "2",
-      "cooldown": 3.0
-    },
-    {
-      "name": "技能3",
-      "key": "3",
-      "cooldown": 8.0
     }
   ],
   "window": {
@@ -92,7 +80,6 @@
   },
   "combat": {
     "target_key": "tab",
-    "move_to_monster": false,
     "skills": [
       {
         "name": "技能1",

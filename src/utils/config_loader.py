@@ -43,8 +43,7 @@ JSON 配置字段说明
   model_path:       YOLO 模型文件路径
   monster_classes:  怪物类别名（逗号分隔）
   floor_classes:    地板类别名
-  rope_classes:     绳索类别名
-  player_classes:   玩家类别名
+  rope_classes:    绳索类别名
   self_name:        自身角色名字（用于 OCR 定位）
   self_offset:      自身 HP 条底部到脚底的偏移像素数
   hp_region:        HP 条参考区域 [x, y, w, h]
@@ -58,7 +57,6 @@ JSON 配置字段说明
   mp_threshold:     MP 加蓝阈值
   mp_key:           加蓝键
   target_key:       选目标键
-  move_to_monster:  是否启用 A* 寻路 + 方向键移动到怪物（False=仅Tab选怪+技能）
   skills:           技能列表 [{name, key, cooldown}, ...]
 """
 import json
@@ -106,7 +104,6 @@ def _defaults() -> Dict[str, Any]:
         "monster_classes": "monster",
         "floor_classes": "floor",
         "rope_classes": "rope",
-        "player_classes": "player",
         # ---- 自身定位 ----
         "self_name": "",  # 角色脚底名字，用于 OCR 定位
         "self_offset": 85,  # HP 条底部 → 脚底的偏移像素
@@ -124,7 +121,6 @@ def _defaults() -> Dict[str, Any]:
         "mp_key": "g",  # 加蓝快捷键
         # ---- 战斗 ----
         "target_key": "tab",  # 选目标键
-        "move_to_monster": False,  # 是否点击移动到怪物位置
         "skills": [
             {"name": "技能1", "key": "1", "cooldown": 1.0},
             {"name": "技能2", "key": "2", "cooldown": 3.0},

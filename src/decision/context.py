@@ -1,68 +1,48 @@
-"""决策上下文与决策引擎。
+"""决策上下文与反应式决策引擎。
 
 ================================================================================
-职责
+设计理念
 ================================================================================
 
-  Context:      感知层 → 决策层的数据载体（每帧一份）
-  DecisionEngine: 根据 Context + Config 决定下一步动作并执行
+  不再建地图、不做 A* 寻路。每一帧只看 YOLO 检测到的画面内容，
+  像人类玩家一样"看到什么就做什么反应"。
+
+  画面里有什么 → 就应该做什么:
+    - 看到怪 → 判断同平台还是跨平台，走过去或爬绳跳下去
+    - 看到地板 → 知道哪里能站
+    - 看到绳索 → 知道哪里能爬
+    - 没看到怪 → 往一个方向走探索
+    - HP/MP 低 → 加血加蓝
 
 ================================================================================
-整体架构
+架构
 ================================================================================
 
-  ┌─────────────┐    ┌──────────────┐    ┌──────────────┐
-  │  感知层      │ →  │  MapExplorer  │ →  │  GlobalMap   │
-  │ YOLO/OCR/HP │    │  (建图)       │    │  (持久化)    │
-  └─────────────┘    └──────────────┘    └──────┬───────┘
-                                                │
-  ┌─────────────┐    ┌──────────────┐           │
-  │  ActionExec │ ←  │ DecisionEngine│ ← A*Pathfinder │
-  │  (方向键)   │    │  (决策)       │    (寻路)      │
-  └─────────────┘    └──────────────┘    └──────────────┘
-
-  两种运行模式:
-    探索模式: 边走边建图，同时打怪（建图和战斗可以同时进行）
-    战斗模式: 地图已加载，直接用 GlobalMap 规划路径
+  ┌─────────────┐    ┌─────────────────────┐    ┌──────────────┐
+  │  感知层      │ →  │  DecisionEngine     │ →  │ ActionExec   │
+  │ YOLO/OCR/HP │    │  (反应式决策 + FSM)  │    │ (方向键/技能) │
+  └─────────────┘    └─────────────────────┘    └──────────────┘
 
 ================================================================================
 决策流程（优先级从高到低）
 ================================================================================
 
-  1. HP 低于阈值 → 按加血键
-  2. MP 低于阈值 → 按加蓝键
+  1. HP 低于阈值 → 加血键
+  2. MP 低于阈值 → 加蓝键
   3. 检测到怪物:
-     a. 若 move_to_monster=True → A* 在全局地图上寻路 + 方向键移动
-     b. 否则 → 按选目标键 + 轮转释放技能
-  4. 没怪 → 按选目标键自动寻找目标
-
-================================================================================
-寻路机制（move_to_monster=True 时）
-================================================================================
-
-  冒险岛是 2D 横版游戏，移动靠方向键（← → ↑ ↓ + 跳跃），不能用鼠标点击。
-
-  每帧:
-    1. MapExplorer.update() 把当前帧的 floors/ropes 拼接到 GlobalMap
-    2. 用 AStarPathfinder 在 GlobalMap 上搜索从自身到怪物的路径
-    3. 将路径转换为方向键指令并执行
-    4. 寻路失败 → 回退到 Tab 选同平台怪
-
-================================================================================
-技能轮转机制
-================================================================================
-
-  DecisionEngine 维护一个 _skill_index 计数器，每次释放技能时自增。
-  轮转时跳过冷却中的技能，直到找到一个冷却已好的。
+     a. 同平台 → 走过去 + 进入范围后攻击
+     b. 怪在上方 + 有绳索 → 爬绳
+     c. 怪在下方 → 找边缘跳下
+     d. 都不满足 → Tab 选怪 + 原地攻击
+  4. 没怪 → 探索（往一个方向走，遇坑跳）
 
 ================================================================================
 Context 字段说明
 ================================================================================
 
-  monsters:       YOLO 检测到的怪物列表（已过滤类别）
+  monsters:       YOLO 检测到的怪物列表
   floors:         地板列表
   ropes:          绳索列表
-  players:        其他玩家列表
   self_position:  自身脚底坐标 (cx, cy) 或 None
   hp_ratio:       血量比例 0.0~1.0
   mp_ratio:       蓝量比例 0.0~1.0
@@ -74,151 +54,126 @@ from typing import List, Optional, Tuple, Callable
 from ..perception.yolo_detector import Detection
 from ..execution.action_executor import ActionExecutor
 from ..utils.config_loader import Config
-from .global_map import GlobalMap
-from .map_explorer import MapExplorer
-from .astar import AStarPathfinder, path_to_directions
+from .fsm import FSM, State
+
+
+# =============================================================================
+# 反应式决策的阈值常量
+# =============================================================================
+
+SAME_PLATFORM_Y_THRESHOLD = 80
+"""同平台判定：自身与怪物 Y 坐标差小于此值视为同平台（像素）"""
+
+ATTACK_RANGE_X = 250
+"""攻击范围：自身与怪物 X 坐标差小于此值视为进入攻击范围（像素）"""
+
+ABOVE_THRESHOLD = 100
+"""怪物在"上方"的判定：怪物 Y 比自身 Y 小超过此值（像素）"""
+
+BELOW_THRESHOLD = 100
+"""怪物在"下方"的判定：怪物 Y 比自身 Y 大超过此值（像素）"""
+
+ROPE_SEARCH_RANGE_X = 200
+"""搜索绳索的水平范围（像素）"""
+
+STUCK_FRAMES = 60
+"""卡住判定帧数：持续此帧数位置不变则视为卡住"""
+
+EXPLORE_DIRECTION_SWITCH_FRAMES = 180
+"""探索方向切换帧数：探索状态下持续此帧数没遇到怪就换方向"""
 
 
 @dataclass
 class Context:
     """感知层 → 决策层的数据载体（每帧一份）。
 
-    这是一个纯数据类（dataclass），没有任何行为逻辑。
-    DecisionEngine 读取 Context 的字段来决定下一步动作。
-
-    self_position 由 HP 条区域推算或 OCR 识别得到（窗口内坐标），
-    不依赖 YOLO 检测自身的类别。
+    self_position 由 HP 条区域推算或 OCR 识别得到（窗口内坐标）。
     """
     monsters: List[Detection] = field(default_factory=list)
-    """YOLO 检测到的怪物"""
-
     floors: List[Detection] = field(default_factory=list)
-    """地板检测结果"""
-
     ropes: List[Detection] = field(default_factory=list)
-    """绳索检测结果"""
-
-    players: List[Detection] = field(default_factory=list)
-    """其他玩家检测结果"""
-
     self_position: Optional[Tuple[int, int]] = None
-    """自身脚底坐标 (x, y) 窗口内坐标，None 表示无法定位"""
-
     hp_ratio: Optional[float] = None
-    """血量比例 (0.0 ~ 1.0)，None 表示未检测到"""
-
     mp_ratio: Optional[float] = None
-    """蓝量比例 (0.0 ~ 1.0)，None 表示未检测到"""
-
     detections: List[Detection] = field(default_factory=list)
-    """全部 YOLO 检测结果（含所有类别，供调试/日志用）"""
 
 
 class DecisionEngine:
-    """决策引擎：根据 Context + Config 决定下一步动作并执行。
+    """反应式决策引擎：根据画面实时内容决定下一步动作。
 
-    【职责】
-    读 Context（感知数据），按 Config（配置），通过 ActionExecutor（执行层）触发动作。
+    【核心理念】
+    不做地图、不做全局规划。每一帧只看 YOLO 检测结果，
+    模拟人类玩家的反应模式。
 
-    【决策优先级】
-      1. HP 低 → 加血键
-      2. MP 低 → 加蓝键
-      3. 检测到怪物：
-         - 若 move_to_monster=True → A* 寻路 + 方向键移动到怪物平台
-         - 否则 → 按选目标键 + 轮转释放技能
-      4. 没怪 → 按选目标键自动寻找目标
-
-    【探索 + 建图】
-      MapExplorer 每帧接收 YOLO 检测到的 floors/ropes，逐帧拼接成 GlobalMap。
-      探索和战斗可以同时进行：一边打怪一边建图。
-
-    【寻路】
-      move_to_monster=True 时，AStarPathfinder 在 GlobalMap 上搜索路径。
-      路径缓存到 _current_path，多帧持续执行直到到达目标。
+    【状态机】
+    使用 FSM 管理 7 个状态：
+      IDLE → CHASING → ATTACKING  （同平台追击）
+      IDLE → CLIMBING              （爬绳追怪）
+      IDLE → DROPPING              （跳下追怪）
+      任意 → HEALING / RECOVERING  （生存优先）
 
     Args:
-        config:     全局配置
-        executor:   动作执行器
-        map_explorer: 地图探索器（可选，不传则自动创建）
-        on_log:     日志回调
+        config:   全局配置
+        executor: 动作执行器
+        on_log:   日志回调
     """
 
     def __init__(self, config: Config, executor: ActionExecutor,
-                 capture=None,
-                 map_explorer: Optional[MapExplorer] = None,
                  on_log: Optional[Callable[[str], None]] = None):
         self.config = config
         self.executor = executor
         self._log = on_log or (lambda m: None)
         self._skill_index = 0
 
-        # 地图探索器: 逐帧拼接 GlobalMap
-        self._explorer = map_explorer or MapExplorer(on_log=self._log)
+        self._fsm = FSM(on_log=self._log)
 
-        # A* 寻路器: 在 GlobalMap 上搜索路径（每次 GlobalMap 更新后重建）
-        self._pathfinder: Optional[AStarPathfinder] = None
-
-        # 当前寻路路径缓存: 多帧持续执行移动
-        self._current_path: List[Tuple[int, int]] = []
-        self._path_target: Optional[Tuple[int, int]] = None  # 路径的目标全局坐标
+        self._target_monster: Optional[Detection] = None
+        self._explore_direction = "right"
+        self._last_self_pos: Optional[Tuple[int, int]] = None
+        self._stuck_counter = 0
+        self._explore_frame_count = 0
 
     def update_config(self, config: Config):
-        """更新配置引用（UI 修改配置后调用）。"""
         self.config = config
 
     def reset(self):
-        """重置状态：清空技能轮转索引、按键冷却记录和寻路缓存。"""
         self._skill_index = 0
-        self._current_path = []
-        self._path_target = None
+        self._target_monster = None
+        self._explore_direction = "right"
+        self._last_self_pos = None
+        self._stuck_counter = 0
+        self._explore_frame_count = 0
+        self._fsm.reset()
         self.executor.reset()
 
     @property
-    def explorer(self) -> MapExplorer:
-        """获取地图探索器（供外部查询探索状态）。"""
-        return self._explorer
+    def state_name(self) -> str:
+        """当前状态名（供 UI 显示）。"""
+        return self._fsm.state_name
 
     # =========================================================================
-    # 类别名解析
-    # =========================================================================
-
-    def _monster_classes(self) -> List[str]:
-        return [c.strip() for c in self.config.monster_classes.split(",") if c.strip()]
-
-    def _floor_classes(self) -> List[str]:
-        return [c.strip() for c in self.config.floor_classes.split(",") if c.strip()]
-
-    def _rope_classes(self) -> List[str]:
-        return [c.strip() for c in self.config.rope_classes.split(",") if c.strip()]
-
-    def _player_classes(self) -> List[str]:
-        return [c.strip() for c in self.config.player_classes.split(",") if c.strip()]
-
-    # =========================================================================
-    # 决策主逻辑
+    # 决策主入口
     # =========================================================================
 
     def decide(self, ctx: Context):
-        """根据上下文执行决策。
-
-        每帧调用一次，按优先级判断是否需要执行动作。
-        无论是否寻路，都会先更新 MapExplorer（建图）。
-
-        寻路模式 (move_to_monster=True):
-          1. MapExplorer.update() 把当前帧拼接到 GlobalMap
-          2. A* 在 GlobalMap 上搜索从自身到怪物的路径
-          3. 路径存在 → 转换为方向键指令并执行
-          4. 路径不存在 → 回退到 Tab 选怪 + 技能
+        """每帧调用一次，根据画面内容执行动作。
 
         Args:
             ctx: 当前帧的感知数据
         """
-        # ---- 始终更新地图探索器（建图） ----
-        # 探索和战斗可以同时进行，每帧都拼接 floors/ropes
-        self._update_map(ctx)
+        self._fsm.tick()
+
+        # 检测卡住
+        if ctx.self_position:
+            if self._last_self_pos and self._last_self_pos == ctx.self_position:
+                self._stuck_counter += 1
+            else:
+                self._stuck_counter = 0
+            self._last_self_pos = ctx.self_position
 
         # ---- 优先级 1: 没血加血 ----
         if ctx.hp_ratio is not None and ctx.hp_ratio < self.config.hp_threshold:
+            self._fsm.transition(State.HEALING)
             if self.executor.press_key(self.config.hp_key, cooldown=1.5):
                 self._log(
                     f"[加血] HP={ctx.hp_ratio:.0%} < {self.config.hp_threshold:.0%}，"
@@ -228,6 +183,7 @@ class DecisionEngine:
 
         # ---- 优先级 2: 没蓝加蓝 ----
         if ctx.mp_ratio is not None and ctx.mp_ratio < self.config.mp_threshold:
+            self._fsm.transition(State.RECOVERING)
             if self.executor.press_key(self.config.mp_key, cooldown=1.5):
                 self._log(
                     f"[加蓝] MP={ctx.mp_ratio:.0%} < {self.config.mp_threshold:.0%}，"
@@ -237,131 +193,297 @@ class DecisionEngine:
 
         # ---- 优先级 3: 检测到怪物 ----
         if ctx.monsters:
-            target = max(ctx.monsters, key=lambda d: d.w * d.h)
-            cx, cy = target.center
-            self._log(
-                f"[检测] {target.cls_name} conf={target.confidence:.2f} @ ({cx},{cy})"
-            )
+            self._handle_monsters(ctx)
+        else:
+            self._fsm.transition(State.IDLE)
+            self._explore(ctx)
 
-            # 3a: 寻路模式 — 在 GlobalMap 上 A* 寻路 + 方向键移动
-            if self.config.move_to_monster and ctx.self_position:
-                if self._try_navigate(ctx, target):
-                    return
-                # 寻路失败，回退到简单模式
+    # =========================================================================
+    # 怪物处理
+    # =========================================================================
 
-            # 3b: 简单模式 — 按选目标键选中怪物
-            self.executor.press_key(self.config.target_key, cooldown=0.8)
+    def _handle_monsters(self, ctx: Context):
+        """处理画面中的怪物。"""
+        target = self._pick_best_target(ctx.monsters)
+        self._target_monster = target
 
-            # 3c: 轮转释放技能
+        tx, ty = target.center
+
+        if ctx.self_position is None:
+            self._tab_attack(ctx)
+            return
+
+        sx, sy = ctx.self_position
+
+        # 同平台 → 追击或攻击
+        if self._on_same_platform(ctx, target):
+            if self._in_attack_range(sx, tx):
+                self._fsm.transition(State.ATTACKING)
+                self._attack(ctx, target)
+            else:
+                self._fsm.transition(State.CHASING)
+                self._chase(ctx, target)
+            return
+
+        # 怪在上方 → 找绳索爬
+        if self._is_above(sy, ty):
+            self._fsm.transition(State.CLIMBING)
+            if not self._try_climb(ctx, target):
+                self._tab_attack(ctx)
+            return
+
+        # 怪在下方 → 找边缘跳下
+        if self._is_below(sy, ty):
+            self._fsm.transition(State.DROPPING)
+            if not self._try_drop(ctx, target):
+                self._tab_attack(ctx)
+            return
+
+        # 兜底：Tab 选怪 + 原地攻击
+        self._tab_attack(ctx)
+
+    # =========================================================================
+    # 目标选择
+    # =========================================================================
+
+    def _pick_best_target(self, monsters: List[Detection]) -> Detection:
+        """选择最佳目标怪物。
+
+        优先选择同平台、距离最近的怪物。
+        """
+        return max(monsters, key=lambda d: d.w * d.h)
+
+    # =========================================================================
+    # 同平台判定
+    # =========================================================================
+
+    def _on_same_platform(self, ctx: Context, target: Detection) -> bool:
+        """判断自身和目标是否在同一平台上。
+
+        判定条件:
+          1. 自身 Y 与目标 Y 的差值小于阈值
+          2. 自身和目标脚下都有地板
+        """
+        if ctx.self_position is None:
+            return False
+        sy = ctx.self_position[1]
+        ty = target.center[1]
+
+        if abs(sy - ty) > SAME_PLATFORM_Y_THRESHOLD:
+            return False
+
+        # 检查脚下是否有地板
+        if not self._has_floor_under(ctx, ctx.self_position):
+            return False
+        if not self._has_floor_under(ctx, target.center):
+            return False
+
+        return True
+
+    def _has_floor_under(self, ctx: Context, pos: Tuple[int, int]) -> bool:
+        """检查指定位置下方是否有地板。
+
+        判断: 地板检测框的 Y 范围是否覆盖了该位置的 Y 坐标附近。
+        """
+        px, py = pos
+        for f in ctx.floors:
+            if f.x <= px <= f.x + f.w:
+                if f.y - 10 <= py <= f.y + f.h + 10:
+                    return True
+        return True  # 没检测到地板时默认认为可以站（宽容处理）
+
+    # =========================================================================
+    # 攻击范围判定
+    # =========================================================================
+
+    def _in_attack_range(self, sx: int, tx: int) -> bool:
+        """判断自身是否在攻击范围内。"""
+        return abs(sx - tx) < ATTACK_RANGE_X
+
+    # =========================================================================
+    # 上下判定
+    # =========================================================================
+
+    def _is_above(self, sy: int, ty: int) -> bool:
+        """怪物在自身正上方。"""
+        return sy - ty > ABOVE_THRESHOLD
+
+    def _is_below(self, sy: int, ty: int) -> bool:
+        """怪物在自身正下方。"""
+        return ty - sy > BELOW_THRESHOLD
+
+    # =========================================================================
+    # 追击（同平台）
+    # =========================================================================
+
+    def _chase(self, ctx: Context, target: Detection):
+        """走向怪物。"""
+        if ctx.self_position is None:
+            return
+        sx = ctx.self_position[0]
+        tx = target.center[0]
+
+        if self._stuck_counter >= STUCK_FRAMES:
+            self._log("[追击] 卡住了，尝试跳跃")
+            self.executor.press_key("alt", cooldown=1.0)
+            self._stuck_counter = 0
+            return
+
+        if tx > sx + 10:
+            self.executor.press_key("right", cooldown=0.05)
+        elif tx < sx - 10:
+            self.executor.press_key("left", cooldown=0.05)
+
+    # =========================================================================
+    # 攻击
+    # =========================================================================
+
+    def _attack(self, ctx: Context, target: Detection):
+        """在攻击范围内，面向怪物并释放技能。
+
+        先调整面向（确保攻击方向正确），再轮转放技能。
+        """
+        if ctx.self_position is None:
             self._cast_skill()
-        else:
-            # ---- 优先级 4: 没怪，按选目标键自动寻找目标 ----
-            self.executor.press_key(self.config.target_key, cooldown=1.5)
+            return
+        sx = ctx.self_position[0]
+        tx = target.center[0]
+
+        # 调整面向
+        if tx > sx + 5:
+            self.executor.press_key("right", cooldown=0.05)
+        elif tx < sx - 5:
+            self.executor.press_key("left", cooldown=0.05)
+
+        # 轮转释放技能
+        self._cast_skill()
+
+    def _tab_attack(self, ctx: Context):
+        """Tab 选怪 + 原地攻击（兜底方案）。"""
+        self.executor.press_key(self.config.target_key, cooldown=0.8)
+        self._cast_skill()
 
     # =========================================================================
-    # 地图更新
+    # 攀爬
     # =========================================================================
 
-    def _update_map(self, ctx: Context):
-        """将当前帧的 YOLO 检测结果拼接到 GlobalMap。
+    def _try_climb(self, ctx: Context, target: Detection) -> bool:
+        """尝试找绳索爬上去追怪。
 
-        每帧调用，无论是否在战斗中。
+        返回 True 表示找到了绳索并执行了动作，False 表示没找到。
         """
-        self._explorer.update(
-            ctx.floors, ctx.ropes,
-            ctx.self_position,
-            frame_width=1366,  # TODO: 从 capture 获取实际帧尺寸
-            frame_height=768,
-        )
+        if ctx.self_position is None:
+            return False
+        sx = ctx.self_position[0]
 
-    # =========================================================================
-    # 寻路与导航
-    # =========================================================================
+        # 找最近的绳索
+        nearest_rope = None
+        min_dist = float("inf")
+        for r in ctx.ropes:
+            rx = r.center[0]
+            dist = abs(rx - sx)
+            if dist < ROPE_SEARCH_RANGE_X and dist < min_dist:
+                nearest_rope = r
+                min_dist = dist
 
-    def _try_navigate(self, ctx: Context, target: Detection) -> bool:
-        """尝试在 GlobalMap 上寻路并执行移动。
-
-        返回 True 表示成功执行了移动指令，False 表示寻路失败。
-
-        Args:
-            ctx:    当前帧感知数据
-            target: 目标怪物
-
-        Returns:
-            True 表示已执行移动（可以 return），False 表示需要回退
-        """
-        global_map = self._explorer.current_map
-        if global_map is None or global_map.explored_count == 0:
+        if nearest_rope is None:
             return False
 
-        # 转换坐标: 窗口坐标 → 全局坐标
-        self_global = self._explorer.window_to_global(
-            ctx.self_position[0], ctx.self_position[1]
-        )
-        target_global = self._explorer.window_to_global(
-            target.center[0], target.center[1]
-        )
+        rx = nearest_rope.center[0]
+        ry = nearest_rope.center[1]
 
-        # 检查目标是否与当前路径目标相同（避免每帧重新寻路）
-        if self._path_target == target_global and self._current_path:
-            # 路径还在，继续执行移动
-            self._execute_move(self._current_path, self_global)
-            return True
-
-        # 重建 A* 寻路器（GlobalMap 可能已更新）
-        if self._pathfinder is None or self._pathfinder._map is not global_map:
-            self._pathfinder = AStarPathfinder(global_map)
-
-        # A* 搜索
-        path = self._pathfinder.find_path(self_global, target_global)
-
-        if path:
-            self._log(f"[寻路] 找到路径，共 {len(path)} 个路径点")
-            self._current_path = path
-            self._path_target = target_global
-            self._execute_move(path, self_global)
+        # 如果已经接近绳索
+        if abs(rx - sx) < 30:
+            # 攀爬：一直按上键（直到接近目标高度）
+            target_top = target.y
+            if ctx.self_position[1] > target_top + 50:
+                self.executor.press_key("up", cooldown=0.05)
+                self._log("[攀爬] 沿绳索向上")
+            else:
+                self._log("[攀爬] 已到达目标高度")
+                self.executor.press_key("right" if target.center[0] > sx else "left",
+                                        cooldown=0.1)
             return True
         else:
-            self._log(f"[寻路] 无法到达目标，回退到 Tab 选怪")
-            self._current_path = []
-            self._path_target = None
-            return False
+            # 走向绳索
+            if rx > sx:
+                self.executor.press_key("right", cooldown=0.05)
+            else:
+                self.executor.press_key("left", cooldown=0.05)
+            return True
 
-    def _execute_move(self, path: List[Tuple[int, int]],
-                      self_pos: Tuple[int, int]):
-        """根据路径生成方向键指令并执行。
+    # =========================================================================
+    # 下落
+    # =========================================================================
 
-        取路径的下一个点，判断相对当前位置的方向，按对应的方向键。
+    def _try_drop(self, ctx: Context, target: Detection) -> bool:
+        """尝试找平台边缘跳下去。
 
-        Args:
-            path:     A* 返回的路径点列表（全局像素坐标）
-            self_pos: 当前自身全局坐标
+        返回 True 表示执行了下落动作，False 表示没找到边缘。
         """
-        commands = path_to_directions(path, self_pos)
-        for cmd in commands:
-            if cmd == "jump":
-                if len(path) > 1:
-                    next_pt = path[1]
-                    if next_pt[0] > self_pos[0]:
-                        self.executor.press_key("right", cooldown=0.1)
-                    elif next_pt[0] < self_pos[0]:
-                        self.executor.press_key("left", cooldown=0.1)
-                self.executor.press_key("alt", cooldown=1.0)
-            elif cmd == "down":
-                self.executor.press_key("down", cooldown=0.3)
-            elif cmd in ("left", "right"):
-                self.executor.press_key(cmd, cooldown=0.1)
+        if ctx.self_position is None:
+            return False
+        sx = ctx.self_position[0]
+
+        # 走向目标方向，同时按下 + 跳（从平台边缘落下）
+        tx = target.center[0]
+        if tx > sx:
+            self.executor.press_key("right", cooldown=0.05)
+        else:
+            self.executor.press_key("left", cooldown=0.05)
+
+        # 按下 + 跳 = 从平台落下
+        self.executor.press_key("down", cooldown=0.3)
+        self.executor.press_key("alt", cooldown=1.0)
+        self._log("[下落] 尝试从平台边缘落下")
+        return True
+
+    # =========================================================================
+    # 探索
+    # =========================================================================
+
+    def _explore(self, ctx: Context):
+        """画面里没怪时，往一个方向走探索。
+
+        行为:
+          - 往探索方向走
+          - 遇到平台边缘（脚下没地板）就跳
+          - 卡住时反向走
+          - 长时间没遇到怪就换方向
+        """
+        self._explore_frame_count += 1
+
+        if self._stuck_counter >= STUCK_FRAMES:
+            self._log("[探索] 卡住了，跳跃并反向")
+            self._explore_direction = "left" if self._explore_direction == "right" else "right"
+            self.executor.press_key("alt", cooldown=1.0)
+            self._stuck_counter = 0
+            return
+
+        # 长时间探索没遇到怪，换方向
+        if self._explore_frame_count >= EXPLORE_DIRECTION_SWITCH_FRAMES:
+            self._explore_direction = "left" if self._explore_direction == "right" else "right"
+            self._explore_frame_count = 0
+            self._log(f"[探索] 换方向 → {self._explore_direction}")
+
+        # 检测脚下是否有地板
+        if ctx.self_position and not self._has_floor_under(ctx, ctx.self_position):
+            self._log("[探索] 脚下没地板，跳跃")
+            self.executor.press_key("alt", cooldown=1.0)
+            return
+
+        # 往前走
+        self.executor.press_key(self._explore_direction, cooldown=0.05)
 
     # =========================================================================
     # 技能释放
     # =========================================================================
 
     def _cast_skill(self):
-        """轮转释放技能。
-
-        遍历技能列表，跳过冷却中的技能，释放第一个可用的。
-        """
+        """轮转释放技能。"""
         skills = self.config.skills
+        if not skills:
+            return
         for _ in range(len(skills)):
             skill = skills[self._skill_index % len(skills)]
             self._skill_index += 1

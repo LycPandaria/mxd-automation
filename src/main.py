@@ -10,10 +10,10 @@
   │  (截图)          │       │  (数据载体)       │     │  (动作聚合)      │
   │                  │       │                  │     │                  │
   │ YoloDetector     │──框──▶│ DecisionEngine   │──▶│ KeyboardController│
-  │  (YOLO检测)      │       │  (决策逻辑)       │     │  (按键注入)      │
+  │  (YOLO检测)      │       │  (反应式决策)     │     │  (按键注入)      │
   │                  │       │                  │     │                  │
-  │ detect_bar_ratio │──比─▶│ 加血/蓝/选怪/技能│     │ MouseController  │
-  │  (HP/MP检测)     │       │                  │     │  (鼠标注入)      │
+  │ detect_bar_ratio │──比─▶│ 同平台追击/爬绳  │     │ MouseController  │
+  │  (HP/MP检测)     │       │ 下落/探索/技能   │     │  (鼠标注入)      │
   │                  │       │                  │     │                  │
   │ OCRNameLocator   │──坐─▶│ self_position    │     │                  │
   │  (名字定位)       │       │  (自身坐标)      │     │                  │
@@ -24,12 +24,12 @@
 ================================================================================
 
   1. ScreenCapture.grab()          → frame (numpy BGR 数组)
-  2. YoloDetector.detect(frame)    → [Detection, ...]  (怪物/地板/绳索/玩家)
+  2. YoloDetector.detect(frame)    → [Detection, ...]  (怪物/地板/绳索)
   3. detect_bar_ratio(hp_region)   → hp_ratio (0.0~1.0)
   4. detect_bar_ratio(mp_region)   → mp_ratio (0.0~1.0)
   5. OCRNameLocator.locate(frame)  → self_position (cx, cy) 或 None
   6. Context(monsters, floors, ..., hp_ratio, mp_ratio, self_position)
-  7. DecisionEngine.decide(ctx)    → 加血/加蓝/选目标/释放技能
+  7. DecisionEngine.decide(ctx)    → 反应式决策（同平台追击/爬绳/下落/探索/技能）
   8. on_frame(frame, ...)          → 预览回调（UI 渲染检测框）
 
 ================================================================================
@@ -113,9 +113,9 @@ class Automation:
         self.executor = ActionExecutor()  # 聚合键盘 + 鼠标控制器
 
         # ---- 决策层 ----
-        # DecisionEngine 需要 capture 引用，用于把窗口内坐标转屏幕坐标（点击怪物时）
+        # 反应式决策引擎：基于 YOLO 画面实时决策，不需要地图
         self.engine = DecisionEngine(
-            config, self.executor, self.capture,
+            config, self.executor,
             on_log=on_log or (lambda m: None)
         )
 
@@ -260,7 +260,6 @@ class Automation:
             monsters = [d for d in detections if d.cls_name in monster_classes]
             floors = [d for d in detections if d.cls_name in self._floor_classes()]
             ropes = [d for d in detections if d.cls_name in self._rope_classes()]
-            players = [d for d in detections if d.cls_name in self._player_classes()]
 
             # ---- 3. HP 检测 ----
             # scale_region(): 把参考分辨率下的坐标缩放到当前帧的实际像素
@@ -294,7 +293,6 @@ class Automation:
                 monsters=monsters,
                 floors=floors,
                 ropes=ropes,
-                players=players,
                 self_position=self_pos,  # 自身脚底坐标 (cx, cy) 或 None
                 hp_ratio=hp_ratio,        # 0.0~1.0
                 mp_ratio=mp_ratio,        # 0.0~1.0
@@ -326,9 +324,6 @@ class Automation:
 
     def _rope_classes(self):
         return [c.strip() for c in self.config.rope_classes.split(",") if c.strip()]
-
-    def _player_classes(self):
-        return [c.strip() for c in self.config.player_classes.split(",") if c.strip()]
 
     # =========================================================================
     # 自身定位
