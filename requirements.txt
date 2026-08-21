@@ -1,6 +1,10 @@
 PyQt5>=5.15.11
 opencv-python>=4.10.0
-numpy>=2.0.0
+# 注意: onnxruntime 必须用 1.20.1
+#   - 1.28.x 与 PyQt5 在 Windows 上存在 DLL 加载冲突（"DLL 初始化例程失败"）
+#   - 1.17.x 需要 numpy<2，与 numpy 2.x 不兼容
+onnxruntime==1.20.1
+numpy>=1.26.0
 Pillow>=11.0.0
 mss>=10.0.0
 pywin32>=312

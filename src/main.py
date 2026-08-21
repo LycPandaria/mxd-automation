@@ -33,22 +33,15 @@
   8. on_frame(frame, ...)          → 预览回调（UI 渲染检测框）
 
 ================================================================================
-自身定位策略（三级优先级）
+自身定位策略
 ================================================================================
 
-  优先级 1: HP 条偏移推算
-    原理: 角色头顶 HP 条 → 向下偏移 85px → 脚底坐标
-    条件: 有组队、HP 条区域已配置
-    优点: 最快、最准
-
-  优先级 2: RapidOCR 文字识别
+  RapidOCR 文字识别（唯一方案，每帧实时执行）
     原理: OCR 识别画面中的角色名字（如"我是立立"）→ 名字中心 = 脚底
-    条件: 已配置 self_name，每 30 帧执行一次
-    优点: 不依赖 HP 条，换时装不受影响
-
-  优先级 3: None
-    条件: 以上方案都不可用
-    后果: 决策层无法使用自身位置，寻路/移动功能不可用
+    条件: 已配置 self_name；每帧执行，与 YOLO 检测同节奏，无缓存兜底
+    说明: 早期"HP 条偏移推算"用的是 UI 底部固定血条（hp_region），
+          不随角色移动，算出的坐标恒定不变（定位 bug），已移除。
+          搜索区域限定在画面中下部 35%~100%，以降低 OCR 耗时。
 
 ================================================================================
 运行方式
@@ -129,21 +122,14 @@ class Automation:
         self._frame_count = 0  # 帧计数器（用于限频日志）
 
         # ---- OCR 名字定位器（延迟初始化，首次使用时才加载模型）----
-        # ocr_interval=30: 每 30 帧执行一次 OCR（约 2.3 秒 @13fps）
+        # ocr_interval=1: 每帧执行 OCR，与 YOLO 检测同节奏，实时定位
         self._ocr = OCRNameLocator(
-            name_offset=40, ocr_interval=30,
+            name_offset=40, ocr_interval=1,
             on_log=self.on_log,
         )
 
-        # ---- 自身位置缓存 ----
-        # OCR 每 30 帧才执行一次，其余帧用缓存兜底
-        self._cached_self_pos: Optional[Tuple[int, int]] = None
-        self._cached_self_frame: int = 0
-        self._cache_max_age: int = 60  # 缓存过期帧数（约 5 秒）
-
-        # ---- 角色中心点缓存（由 OCR 定位时产生）----
+        # ---- 角色中心点缓存（由 OCR 定位时记录，供状态日志显示）----
         self._cached_center: Optional[Tuple[int, int]] = None
-        self._cached_center_frame: int = 0
 
         # ---- HP/MP 变化追踪 ----
         self._last_hp_ratio: Optional[float] = None
@@ -418,36 +404,23 @@ class Automation:
     def _locate_self(self, frame: np.ndarray) -> Optional[Tuple[int, int]]:
         """定位自身脚底在画面中的坐标。
 
-        策略（按优先级）:
-          1. HP 条偏移推算 - 最快最准，需要 hp_region 已配置
-          2. RapidOCR 文字识别 - 通过角色名字定位，每 30 帧执行一次
-          3. 缓存兜底 - OCR 非执行帧返回上次缓存，60 帧过期
+        策略:
+          RapidOCR 文字识别 - 每帧实时执行，识别到即返回（与 YOLO 同节奏）
+
+        说明:
+          早期版本优先用"HP 条偏移推算"（hp_region + self_offset），
+          但 hp_region 是 UI 底部固定的血条，不随角色移动，
+          算出的坐标恒定不变，导致定位失效（bug），已移除该方案。
+          不做缓存兜底：本帧未识别到名字即返回 None，
+          由决策层按"未定位"处理，避免使用过期位置。
 
         Returns:
-            (cx, cy) 脚底坐标，None 表示无法定位
+            (cx, cy) 脚底坐标，None 表示本帧未识别到角色名字
         """
-        # ---- 方案1: HP 条偏移推算 ----
-        if self.config.hp_region:
-            hp_region = self.config.scale_region(
-                self.config.hp_region, frame.shape[1], frame.shape[0]
-            )
-            if hp_region:
-                hx, hy, hw, hh = hp_region
-                offset = self.config.scale_offset(self.config.self_offset, frame.shape[0])
-                pos = (hx + hw // 2, hy + hh + offset)
-                self._cached_self_pos = pos
-                self._cached_self_frame = self._frame_count
-                return pos
-
-        # ---- 方案2: RapidOCR 文字识别 ----
-        search_region = None
-        if self.config.hp_region:
-            hp_region = self.config.scale_region(
-                self.config.hp_region, frame.shape[1], frame.shape[0]
-            )
-            if hp_region:
-                hx, hy, hw, hh = hp_region
-                search_region = (hx - 100, hy + hh, hw + 200, 200)
+        # 搜索区域：画面中下部 35%~100%（角色名字出现在脚下，
+        # 且打怪时角色通常在中下部；限制区域可大幅降低 OCR 耗时）
+        h, w = frame.shape[:2]
+        search_region = (0, int(h * 0.35), w, int(h * 0.65))
 
         result = self._ocr.locate(frame, self.config.self_name,
                                   search_region=search_region)
@@ -455,27 +428,14 @@ class Automation:
             center_x, center_y, foot_x, foot_y = result
             # 记录中心点（用于日志）
             self._cached_center = (center_x, center_y)
-            self._cached_center_frame = self._frame_count
-            foot = (foot_x, foot_y)
-            self._cached_self_pos = foot
-            self._cached_self_frame = self._frame_count
-            return foot
+            return (foot_x, foot_y)
 
-        # ---- 方案3: 缓存兜底 ----
-        if self._cached_self_pos is not None:
-            age = self._frame_count - self._cached_self_frame
-            if age < self._cache_max_age:
-                return self._cached_self_pos
-
+        # 本帧未识别到 → 不返回缓存，直接视为未定位
         return None
 
     def _get_last_center(self) -> Optional[Tuple[int, int]]:
-        """获取上次定位到的角色中心点（供日志用）。"""
-        if self._cached_center is not None:
-            age = self._frame_count - self._cached_center_frame
-            if age < self._cache_max_age:
-                return self._cached_center
-        return None
+        """获取最近一次定位到的角色中心点（供日志用）。"""
+        return self._cached_center
 
 
 def main():
