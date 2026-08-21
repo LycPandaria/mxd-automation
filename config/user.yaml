@@ -1,9 +1,10 @@
-window_title: ''
+window_title: 冒险岛怀旧服
 start_stop_hotkey: F6
 reference_width: 1368
 reference_height: 800
-fps: 20
-confidence: 0.5
+fps: 30
+keyboard_mode: sendinput
+confidence: 0.8
 model_path: E:/pythonProjects/mxd-automation/train/scripts/02_train_yolo/model/best.pt
 monster_classes: monster
 floor_classes: floor
@@ -21,7 +22,7 @@ hp_color:
 - 88
 hp_tolerance: 20
 hp_threshold: 0.6
-hp_key: t
+hp_key: end
 mp_region:
 - 0.4458
 - 0.9753
@@ -33,10 +34,15 @@ mp_color:
 - 231
 mp_tolerance: 20
 mp_threshold: 0.6
-mp_key: y
+mp_key: pdn
 target_key: tab
 jump_key: c
+attack_range: 100
+attack_range_y: 50
 skills:
 - name: 技能1
-  key: x
+  key: a
   cooldown: 1.0
+- name: 技能2
+  key: shift
+  cooldown: 300.0

@@ -105,7 +105,11 @@ class Automation:
 
         # ---- 执行层 ----
         # 聚合键盘 + 鼠标控制器；on_log 用于上报按键注入结果（是否已锁定窗口等）
-        self.executor = ActionExecutor(on_log=on_log or (lambda m: None))
+        # 按键模式取自配置: sendinput=前台真实按键(冒险岛有效) / postmessage=后台注入
+        self.executor = ActionExecutor(
+            mode=getattr(config, "keyboard_mode", "sendinput"),
+            on_log=on_log or (lambda m: None),
+        )
 
         # ---- 决策层 ----
         # 反应式决策引擎：基于 YOLO 画面实时决策，不需要地图
@@ -308,12 +312,20 @@ class Automation:
         floors = [d for d in detections if d.cls_name in self._floor_classes()]
         ropes = [d for d in detections if d.cls_name in self._rope_classes()]
 
-        # 每 30 帧输出一次怪物坐标（避免刷屏）
-        if monsters and self._frame_count % 30 == 0:
-            coords = ", ".join(
-                f"({d.center[0]},{d.center[1]})" for d in monsters
-            )
-            self.on_log(f"[怪物] {len(monsters)}只, 坐标: {coords}")
+        # 每 30 帧输出一次地图元素概览（YOLO 基于当前截图分析的结果）
+        if self._frame_count % 30 == 0:
+            parts = []
+            if monsters:
+                coords = ", ".join(
+                    f"({d.center[0]},{d.center[1]})" for d in monsters
+                )
+                parts.append(f"怪{len(monsters)}只:{coords}")
+            if floors:
+                parts.append(f"平台{len(floors)}个")
+            if ropes:
+                parts.append(f"绳索{len(ropes)}条")
+            if parts:
+                self.on_log("[地图] " + " | ".join(parts))
 
         # ---- 3. HP 检测 ----
         # scale_region(): 把参考分辨率下的坐标缩放到当前帧的实际像素
@@ -336,6 +348,7 @@ class Automation:
             frame, mp_region,
             tuple(self.config.mp_color) if self.config.mp_color else None,
             self.config.mp_tolerance,
+            expand=3,  # MP 条下方是同色蓝色面板，减小扩展避免背景混入
         )
 
         # ---- 5. 自身定位 ----

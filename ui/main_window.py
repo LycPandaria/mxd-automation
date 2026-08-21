@@ -272,16 +272,32 @@ class MainWindow(QMainWindow):
         box = QGroupBox("战斗设置")
         v = QVBoxLayout(box)
 
-        g = QGridLayout()
-        g.addWidget(QLabel("选中目标键:"), 0, 0)
-        self.target_key_edit = QLineEdit("tab")
-        self.target_key_edit.setPlaceholderText("tab")
-        g.addWidget(self.target_key_edit, 0, 1)
-        g.addWidget(QLabel("跳跃键:"), 1, 0)
+        # 跳跃键、攻击距离、垂直容差 合成一行3个
+        row = QHBoxLayout()
+        row.addWidget(QLabel("跳跃键:"))
         self.jump_key_edit = QLineEdit("alt")
         self.jump_key_edit.setPlaceholderText("alt / space")
-        g.addWidget(self.jump_key_edit, 1, 1)
-        v.addLayout(g)
+        self.jump_key_edit.setFixedWidth(60)
+        row.addWidget(self.jump_key_edit)
+
+        row.addWidget(QLabel("攻击距离px:"))
+        self.attack_range_spin = QSpinBox()
+        self.attack_range_spin.setRange(30, 800)
+        self.attack_range_spin.setValue(200)
+        self.attack_range_spin.setToolTip("人物与怪物水平差小于此值才触发攻击")
+        self.attack_range_spin.setFixedWidth(70)
+        row.addWidget(self.attack_range_spin)
+
+        row.addWidget(QLabel("垂直容差px:"))
+        self.attack_range_y_spin = QSpinBox()
+        self.attack_range_y_spin.setRange(10, 300)
+        self.attack_range_y_spin.setValue(60)
+        self.attack_range_y_spin.setToolTip("垂直差小于此值时即使不同层也直接攻击（不绕路）")
+        self.attack_range_y_spin.setFixedWidth(70)
+        row.addWidget(self.attack_range_y_spin)
+
+        row.addStretch()
+        v.addLayout(row)
 
         # 技能表
         v.addWidget(QLabel("技能列表 (轮转释放):"))
@@ -337,8 +353,9 @@ class MainWindow(QMainWindow):
                 f"x={c.mp_region[0]:.1%} y={c.mp_region[1]:.1%} "
                 f"w={c.mp_region[2]:.1%} h={c.mp_region[3]:.1%}"
             )
-        self.target_key_edit.setText(c.target_key)
         self.jump_key_edit.setText(c.jump_key)
+        self.attack_range_spin.setValue(int(getattr(c, "attack_range", 200)))
+        self.attack_range_y_spin.setValue(int(getattr(c, "attack_range_y", 60)))
         # 技能表
         self.skill_table.setRowCount(0)
         for s in c.skills:
@@ -358,8 +375,9 @@ class MainWindow(QMainWindow):
         # mp
         c.mp_key = self.mp_key_edit.text().strip()
         c.mp_threshold = self.mp_thr_spin.value() / 100
-        c.target_key = self.target_key_edit.text().strip()
         c.jump_key = self.jump_key_edit.text().strip() or "alt"
+        c.attack_range = self.attack_range_spin.value()
+        c.attack_range_y = self.attack_range_y_spin.value()
         # 技能
         skills = []
         for r in range(self.skill_table.rowCount()):

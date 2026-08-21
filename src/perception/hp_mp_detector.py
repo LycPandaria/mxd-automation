@@ -163,13 +163,47 @@ def detect_bar_ratio(frame: np.ndarray, region, color=None,
             return None
         return 0.0  # 区域有内容但无目标色 → 空血
 
-    # ---- 4. 取匹配像素最多的行（条中心行），算最长连续色带 ----
-    # 比例 = 色带长度 / 区域宽。区域宽即条宽（框选时宽度对齐条两端），
-    # 垂直偏移已由 expand 扩展吸收，横向按比例缩放误差很小，无需额外校正。
-    best_row = int(row_counts.argmax())
+    # ---- 4. 定位条所在行并计算比例 ----
+    # 血/蓝条本身高度通常在 6~14px 之间。如果 expand 扩到了同色背景
+    #（如 MP 条下方蓝色 UI 面板），匹配像素会分散在很大的垂直范围内，
+    # 导致 fill_len = 全宽、ratio 恒为 100%。
+    # 策略：找到匹配像素最集中的连续区域，若区域过宽则收缩到中心附近，
+    # 确保只在该集中区域内找最佳行。
+    BAR_MAX_HEIGHT = 16
+    w_roi = roi_rgb.shape[1]
+
+    # 找连续高匹配行（匹配像素数 > 30% 区域宽）
+    threshold = w_roi * 0.3
+    regions = []
+    in_region = False
+    start = 0
+    for i, c in enumerate(row_counts):
+        if c >= threshold and not in_region:
+            start = i
+            in_region = True
+        elif c < threshold and in_region:
+            regions.append((start, i))
+            in_region = False
+    if in_region:
+        regions.append((start, len(row_counts)))
+
+    if regions:
+        # 选匹配像素总数最多的区域（大概率是条所在区域）
+        best_region = max(regions, key=lambda r: int(row_counts[r[0]:r[1]].sum()))
+        # 区域过宽 → 背景混入，收缩到中心附近
+        if best_region[1] - best_region[0] > BAR_MAX_HEIGHT:
+            center = (best_region[0] + best_region[1]) // 2
+            half = BAR_MAX_HEIGHT // 2
+            y0 = max(0, center - half)
+            y1 = min(len(row_counts), center + half)
+            best_region = (y0, y1)
+        best_row = int(np.argmax(row_counts[best_region[0]:best_region[1]])) + best_region[0]
+    else:
+        best_row = int(row_counts.argmax())
+
     fill_len = _longest_run(mask[best_row])
     if fill_len <= 0:
         return None
 
-    ratio = fill_len / roi_rgb.shape[1]
+    ratio = fill_len / w_roi
     return float(max(0.0, min(1.0, ratio)))

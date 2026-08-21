@@ -148,6 +148,13 @@ def _defaults() -> Dict[str, Any]:
         "reference_height": 768,
         # ---- 性能 ----
         "fps": 13,
+        # ---- 执行 ----
+        # 键盘注入模式:
+        #   "sendinput"（默认）: 前台真实按键，对冒险岛这类读取全局键盘状态
+        #     的游戏有效，游戏窗口需保持在前台。
+        #   "postmessage": 后台注入，无需前台，但只对走窗口消息的游戏有效
+        #     （冒险岛无效）。
+        "keyboard_mode": "sendinput",
         # ---- 模型 ----
         "confidence": 0.5,
         "model_path": "assets/models/best.pt",
@@ -173,6 +180,9 @@ def _defaults() -> Dict[str, Any]:
         # ---- 战斗 ----
         "target_key": "tab",  # 选目标键
         "jump_key": "alt",    # 跳跃键
+        "attack_range": 200,  # 攻击距离（px）：人物与怪物水平差小于此值才触发攻击
+        "attack_range_y": 60, # 攻击垂直容差（px）：垂直差小于此值时怪物就在身边，
+                              # 即使路径被推算为 rope/jump 也直接攻击，不绕路
         "skills": [
             {"name": "技能1", "key": "1", "cooldown": 1.0},
             {"name": "技能2", "key": "2", "cooldown": 3.0},
