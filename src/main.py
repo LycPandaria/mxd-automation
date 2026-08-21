@@ -129,11 +129,10 @@ class Automation:
         self._frame_count = 0  # 帧计数器（用于限频日志）
 
         # ---- OCR 名字定位器（延迟初始化，首次使用时才加载模型）----
-        # ocr_interval=10: 每 10 帧执行一次 OCR，其余帧用缓存（大幅降低 OCR 耗时，
-        #                  避免每帧 OCR 拖慢主循环帧率）
+        # ocr_interval=1: 每帧都执行 OCR（和 YOLO 一样），位置实时更新
         # character_height=60: 人物高度约 60px，角色中心 = 名字中心 - 高度一半（向上）
         self._ocr = OCRNameLocator(
-            character_height=60, ocr_interval=10,
+            character_height=60, ocr_interval=1,
             exact_match=True,  # 精确匹配角色名，避免"包含匹配"误识别聊天框/UI文字
             on_log=self.on_log,
         )
@@ -452,11 +451,12 @@ class Automation:
         Returns:
             (cx, cy) 脚底坐标，None 表示本帧未识别到角色名字
         """
-        # 搜索区域：画面 10%~100%（角色跳跃/位于地图上部时名字也能识别到；
-        # 之前的 35%~100% 在角色于画面上部时定位直接丢失 → 行为错乱）
-        # ocr_interval=10 已限制 OCR 频率，扩大区域不会显著拖慢帧率
+        # 搜索区域：画面 10%~92%
+        # 底部 8% 是 UI 面板（HP/MP/角色名固定显示），排除掉，
+        # 否则 OCR 会匹配到 UI 里的角色名（固定位置永不变化），
+        # 导致定位锁死在 (385,760) 这种错误坐标
         h, w = frame.shape[:2]
-        search_region = (0, int(h * 0.10), w, int(h * 0.90))
+        search_region = (0, int(h * 0.10), w, int(h * 0.82))
 
         result = self._ocr.locate(frame, self.config.self_name,
                                   search_region=search_region)

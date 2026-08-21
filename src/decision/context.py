@@ -275,6 +275,16 @@ class DecisionEngine:
         """
         target = self._resolve_locked_target(ctx)
 
+        # ---- 无有效目标（same_platform_only 过滤后无同平台怪）----
+        # 不走 CRASH 路径，释放移动键并转探索，避免角色卡在上一帧的移动状态
+        if target is None:
+            self._target_monster = None
+            self._attack_stale_counter = 0
+            self._release_move()
+            self._fsm.transition(State.IDLE)
+            self._explore(ctx)
+            return
+
         # ---- 攻击超时检测（残影防护）----
         # 持续攻击同一只怪（上帧目标 == 本帧最近目标）才累计
         if self._target_monster is not None and self._is_same_monster(
@@ -326,7 +336,8 @@ class DecisionEngine:
         self._distance_log_frame_count += 1
         if self._distance_log_frame_count >= DISTANCE_LOG_FRAMES:
             self._distance_log_frame_count = 0
-            # 输出 YOLO 分析出的路线详情，便于验证规划基于地图元素
+            vy = abs(py - monster_foot[1])
+            same_plat = self._same_platform(py, monster_foot[1])
             plan_str = ""
             if est.path_type == "jump" and est.path_floors:
                 seq = "→".join(
@@ -338,8 +349,10 @@ class DecisionEngine:
                 plan_str = f" 绳索: ({r.center[0]},{r.y}) 长{r.h}"
             self._log(
                 f"[距离] 人物脚底({px},{py}) → 怪脚底({monster_foot[0]},{monster_foot[1]}) "
+                f"同平台={'是' if same_plat else '否'}"
+                f"(垂直差{vy} 容差{getattr(self.config, 'attack_range_y', 60)}) "
                 f"路径={est.path_type} 距离={est.distance}px "
-                f"(水平={abs(px - mx)} 垂直={abs(py - monster_foot[1])}"
+                f"(水平={abs(px - mx)})"
                 + (f" 绳长={est.rope_length}" if est.path_type == "rope" else "")
                 + (f" 跳数={est.jump_count}" if est.path_type == "jump" else "")
                 + f"){plan_str}"

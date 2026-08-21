@@ -92,6 +92,13 @@ class OCRNameLocator:
         self._skip_counter = 0
         self._skip_threshold = 5
 
+        # 位置长期未变强制复位：OCR 首帧匹配到 UI 固定文字（如聊天框
+        # 中的角色名）后，后续帧因"离上次最近"策略永远选同一位置，
+        # 导致定位锁死在错误坐标。策略：连续 N 次 OCR 位置未变（偏移
+        # < 3px），强制改用"置信度最高"选候选，打破死锁。
+        self._stale_counter = 0
+        self._stale_threshold = 10
+
     # ---- 公开接口 ----
 
     def locate(self, frame: np.ndarray, name: str,
@@ -99,6 +106,9 @@ class OCRNameLocator:
                search_region: Optional[Tuple[int, int, int, int]] = None
                ) -> Optional[Tuple[int, int, int, int]]:
         """在画面中查找指定名字，返回 (中心点x, 中心点y, 脚底x, 脚底y)。
+
+        和 YOLO 一样，每帧都执行 OCR，不做缓存、不做跳变过滤、
+        不做"离上次最近"策略。直接取置信度最高的匹配结果。
 
         冒险岛角色名字在脚下，所以:
           - 脚底 ≈ 名字中心 y（名字就在脚底位置）
@@ -115,14 +125,6 @@ class OCRNameLocator:
         """
         name = name.strip()
         if not name:
-            return None
-
-        # 帧间隔控制
-        self._frame_count += 1
-        if self._frame_count % self._interval != 0:
-            # 非 OCR 帧返回上次结果（如果有）
-            if self._last_center and self._last_foot:
-                return (*self._last_center, *self._last_foot)
             return None
 
         engine = self._get_engine()
@@ -153,36 +155,17 @@ class OCRNameLocator:
         if result is None:
             return None
 
-        # 匹配名字：优先选"离上次有效位置最近"的候选（利用位置连续性）。
-        # 角色每帧移动最多几十px，真实名字总是离缓存最近；
-        # 若画面中同时存在多个同名文本（聊天框/UI 也含角色名），
-        # 按"置信度最高"选会在它们之间反复跳 → 一直触发跳变过滤
-        # → "连续误识别/超时"循环，位置永远锁不定。
-        # 首帧（无缓存）才退化为"置信度最高"。
+        # 匹配名字：取置信度最高的候选（和 YOLO 一样，每帧独立计算，无缓存）
         best = None
         best_conf = 0.0
-        if self._last_foot is not None:
-            best_d = float("inf")
-            for box, text, confidence in result:
-                if not self._match(name, text):
-                    continue
-                if confidence < min_confidence:
-                    continue
-                bx = int((box[0][0] + box[1][0] + box[2][0] + box[3][0]) / 4) + offset_x
-                by = int((box[0][1] + box[1][1] + box[2][1] + box[3][1]) / 4) + offset_y
-                d = abs(bx - self._last_foot[0]) + abs(by - self._last_foot[1])
-                if d < best_d:
-                    best_d = d
-                    best = box
-        else:
-            for box, text, confidence in result:
-                if not self._match(name, text):
-                    continue
-                if confidence < min_confidence:
-                    continue
-                if confidence > best_conf:
-                    best_conf = confidence
-                    best = box
+        for box, text, confidence in result:
+            if not self._match(name, text):
+                continue
+            if confidence < min_confidence:
+                continue
+            if confidence > best_conf:
+                best_conf = confidence
+                best = box
 
         if best is None:
             return None
@@ -194,37 +177,8 @@ class OCRNameLocator:
         # 脚底 = 名字中心（名字就在脚边，画面 y 向下增大）
         foot = (name_cx, name_cy)
         # 角色中心 = 名字中心向上延伸"人物高度一半"（-30px）
-        # 名字在脚下 → 身体在名字上方 → 中心点在名字上方（y 更小）
         center = (name_cx, name_cy - self._character_height // 2)
 
-        # ---- 帧间跳变过滤 + 连续误识别超时重置 ----
-        if self._last_foot is not None:
-            jump = abs(foot[0] - self._last_foot[0]) + abs(foot[1] - self._last_foot[1])
-            if jump > self._max_jump:
-                self._skip_counter += 1
-                if self._skip_counter >= self._skip_threshold:
-                    # 连续 N 帧都跳变 → 上次位置很可能是错的（首帧误识别），
-                    # 接受新位置并重置缓存，防止错误坐标永久锁死。
-                    self._on_log(
-                        f"[定位] 连续误识别{self._skip_counter}次，"
-                        f"接受新位置 {foot}（上次{self._last_foot}）"
-                    )
-                    self._skip_counter = 0
-                    self._last_center = center
-                    self._last_foot = foot
-                    return (*center, *foot)
-                # 大偏移 → 判定为误识别（角色正常移动不会一帧跳200px+），
-                # 沿用上次有效位置且不更新缓存。
-                self._on_log(
-                    f"[定位] 疑似误识别: 位置偏移 Δ{jump}px "
-                    f"(上次{self._last_foot}，本次{foot})，沿用上次"
-                )
-                return (*self._last_center, *self._last_foot)
-
-        # 位置正常更新，重置误识别计数
-        self._skip_counter = 0
-        self._last_center = center
-        self._last_foot = foot
         return (*center, *foot)
 
     def locate_all(self, frame: np.ndarray,
