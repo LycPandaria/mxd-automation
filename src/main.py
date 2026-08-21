@@ -102,7 +102,7 @@ class Automation:
                  on_frame: Optional[Callable[..., None]] = None):
         # ---- 感知层 ----
         self.config = config
-        self.capture = ScreenCapture()  # 窗口截图（PrintWindow API）
+        self.capture = ScreenCapture()  # 窗口截图（客户区 BitBlt）
 
         # 检测器：如果传了就用，否则根据配置自动创建（模型不存在时回退 Mock）
         self.detector = detector if detector is not None else create_detector(
@@ -260,7 +260,7 @@ class Automation:
             # ---- 1. 截图 ----
             try:
                 frame = self.capture.grab()
-                # 首次截图记录帧尺寸
+                # 首次截图记录帧尺寸 + DPI 诊断
                 if self._frame_count == 1:
                     h, w = frame.shape[:2]
                     self.on_log(f"[帧尺寸] {w}x{h}")
@@ -268,6 +268,21 @@ class Automation:
                         f"[配置] 参考分辨率: "
                         f"{self.config.reference_width}x{self.config.reference_height}"
                     )
+                    # DPI 诊断：对比 GetClientRect 与实际帧尺寸
+                    try:
+                        cw, ch = self.capture.get_client_rect()
+                        if cw != w or ch != h:
+                            self.on_log(
+                                f"[DPI警告] GetClientRect={cw}x{ch} "
+                                f"与实际帧 {w}x{h} 不一致，"
+                                f"可能存在 DPI 缩放偏移！"
+                            )
+                        else:
+                            self.on_log(
+                                f"[DPI] 客户区尺寸匹配 ({cw}x{ch})，坐标应无偏移"
+                            )
+                    except Exception:
+                        pass
             except Exception as e:
                 self.on_log(f"[错误] 截图失败: {e}")
                 time.sleep(interval)

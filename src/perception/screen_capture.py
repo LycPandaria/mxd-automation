@@ -1,6 +1,7 @@
 """窗口锁定与高性能截图。
 
-锁定游戏窗口后使用 Win32 ``PrintWindow`` API 直接从窗口 DC 读取像素：
+锁定游戏窗口后使用 Win32 ``BitBlt`` API 截取客户区（游戏内容区）：
+  - 使用 GetClientRect + GetDC 获取客户区 DC，排除标题栏/边框
   - 不受屏幕遮挡影响（即使被其他窗口盖住也能截到）
   - 不会截到自己的工具窗
   - 适合窗口模式（可见）的游戏
@@ -9,8 +10,7 @@
 替换实现即可，外部调用方代码无需改动）。
 
 参考：项目硬约束要求截屏优先使用 mss（比 pyautogui 快 20 倍）；当前
-PrintWindow 实现针对"窗口锁定 + 不受遮挡"场景，二者取舍可在 ``ScreenCapture``
-子类中切换。
+BitBlt 客户区实现针对"窗口锁定 + 不受遮挡 + 排除边框"场景。
 """
 import ctypes
 import ctypes.wintypes
@@ -21,8 +21,12 @@ import cv2
 
 
 # ---- DPI 感知：让截图返回物理像素而非逻辑像素 ----
-# 高 DPI 显示器上，如果不设置 DPI 感知，GetWindowRect 返回逻辑坐标
-# 而 PrintWindow 返回物理像素，两者不匹配导致坐标偏移
+# 高 DPI 显示器上，如果不设置 DPI 感知，GetClientRect 返回逻辑坐标
+# 而 BitBlt 返回物理像素，两者不匹配导致坐标偏移。
+#
+# 注意：此调用可能因 PyQt5 先初始化而失效（GUI 模式下）。
+# 真正生效的 DPI 设置在 main.py / ui/main_window.py 中完成，
+# 那里在 QApplication 创建之前就调用了 SetProcessDPIAware()。
 try:
     ctypes.windll.user32.SetProcessDPIAware()
 except Exception:
@@ -39,6 +43,7 @@ class ScreenCapture:
     def __init__(self):
         self._hwnd = None
         self._title = None
+        self._last_rect = None  # 上次客户区尺寸诊断
 
     # ---------------- 窗口枚举/锁定 ----------------
 
@@ -78,6 +83,18 @@ class ScreenCapture:
             raise RuntimeError("未锁定窗口")
         left, top, right, bottom = win32gui.GetWindowRect(self._hwnd)
         return (left, top, right - left, bottom - top)
+
+    def get_client_rect(self):
+        """返回客户区尺寸 (width, height)，使用物理像素。
+
+        用于诊断 DPI 缩放是否导致客户区尺寸与截图帧尺寸不一致。
+        """
+        if not self._hwnd:
+            raise RuntimeError("未锁定窗口")
+        rect = ctypes.wintypes.RECT()
+        user32 = ctypes.windll.user32
+        user32.GetClientRect(self._hwnd, ctypes.byref(rect))
+        return (rect.right - rect.left, rect.bottom - rect.top)
 
     # ---------------- 截图 ----------------
 

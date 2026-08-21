@@ -24,13 +24,44 @@ sys.path 处理
 """
 import sys
 import os
+import ctypes
+
+# ---- DPI 感知必须在 PyQt5 导入/创建 QApplication 之前设置 ----
+# PyQt5 在创建 QApplication 时会自动设置 DPI 模式，如果先创建了 QApplication
+# 再调用 SetProcessDPIAware，该调用将失效，导致 BitBlt 截图在高 DPI 屏幕上
+# 出现右上角偏移 10~30 像素的问题。
+#
+# 同时禁用 Qt 内部的 DPI 缩放（让 Qt 渲染使用逻辑像素，而我们的 BitBlt
+# 使用物理像素，两者不一致会导致 UI 映射坐标到物理像素时出现偏移）。
+#
+# QT_SCALE_FACTOR=1: 禁用 Qt 的字体/控件缩放
+# QT_ENABLE_HIGHDPI_SCALING=0: 禁用 Qt 高 DPI 自适应（PyQt5 5.14+ 默认开启）
+os.environ["QT_SCALE_FACTOR"] = "1"
+os.environ["QT_ENABLE_HIGHDPI_SCALING"] = "0"
+os.environ["QT_AUTO_SCREEN_SCALE_FACTOR"] = "0"
+
+# 设置 Windows 进程级 DPI 感知
+try:
+    ctypes.windll.user32.SetProcessDPIAware()
+except Exception:
+    pass
 
 # 把项目根目录加入 sys.path，让 `src` / `ui` 作为顶层包可被导入
 _PROJECT_ROOT = os.path.dirname(os.path.abspath(__file__))
 if _PROJECT_ROOT not in sys.path:
     sys.path.insert(0, _PROJECT_ROOT)
 
+from PyQt5.QtCore import Qt
 from PyQt5.QtWidgets import QApplication
+
+# 禁用 Qt 内部高 DPI 缩放（PyQt5 5.14+），让 Qt 使用物理像素坐标
+# 这样屏幕坐标、鼠标坐标、BitBlt 截图坐标全部一致
+try:
+    QApplication.setAttribute(Qt.AA_DontCreateNativeWidgetSiblings, True)
+    QApplication.setAttribute(Qt.AA_EnableHighDpiScaling, False)
+    QApplication.setAttribute(Qt.AA_UseHighDpiPixmaps, False)
+except Exception:
+    pass
 
 from ui.main_window import MainWindow
 
