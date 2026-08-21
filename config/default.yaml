@@ -1,5 +1,5 @@
 # 全局默认配置（程序自带，请勿手动修改）
-# 运行时用户改动会写入 config/user.json，加载时以此处为底、user.json 覆盖
+# 运行时用户改动会写入 config/user.yaml，加载时以此处为底、user.yaml 覆盖
 
 # ---- 窗口 ----
 window:

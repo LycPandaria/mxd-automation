@@ -8,6 +8,6 @@
 from .logger import get_logger  # noqa: F401
 from .config_loader import (  # noqa: F401
     Config, load_config, save_user_config, save_config,
-    config_path, default_yaml_path, user_json_path,
+    config_path,
 )
 from .geometry import distance, in_range  # noqa: F401

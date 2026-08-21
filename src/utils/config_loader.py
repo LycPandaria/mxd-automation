@@ -6,14 +6,22 @@
 
   配置分为两层:
     - 默认配置: 内置在代码中，提供合理的出厂默认值
-    - 用户配置: 保存在 config/user.json，覆盖默认值
+    - 用户配置: 保存在 config/user.yaml (或 user.json)，覆盖默认值
 
   双层覆盖机制:
     1. 先加载默认配置（_defaults()）
-    2. 再读取 user.json，用用户配置覆盖同名字段
+    2. 再读取 user.yaml / user.json，用用户配置覆盖同名字段
     3. 最终 Config 对象包含合并后的值
 
   这样用户只需要配置自己关心的字段，其余使用默认值即可。
+
+================================================================================
+YAML / JSON 双格式支持
+================================================================================
+
+  优先读取 config/user.yaml（推荐格式，支持中文注释）。
+  若 user.yaml 不存在，回退读取 config/user.json（向后兼容）。
+  保存时统一写入 user.yaml。
 
 ================================================================================
 坐标自适应
@@ -32,7 +40,7 @@
     scaled_y = y * scale_y
 
 ================================================================================
-JSON 配置字段说明
+YAML 配置字段说明
 ================================================================================
 
   window_title:     游戏窗口标题（用于 FindWindow 锁定）
@@ -46,7 +54,7 @@ JSON 配置字段说明
   rope_classes:    绳索类别名
   self_name:        自身角色名字（用于 OCR 定位）
   self_offset:      自身 HP 条底部到脚底的偏移像素数
-  hp_region:        HP 条参考区域 [x, y, w, h]
+  hp_region:        HP 条参考区域 [x, y, w, h] 或百分比
   hp_color:         HP 条颜色 [R, G, B]
   hp_tolerance:     HP 条颜色容差
   hp_threshold:     HP 加血阈值 (0.0~1.0)
@@ -59,29 +67,71 @@ JSON 配置字段说明
   target_key:       选目标键
   skills:           技能列表 [{name, key, cooldown}, ...]
 """
-import json
 import os
 from typing import List, Optional, Dict, Any, Tuple
+
+import yaml
 
 
 # ---- 路径常量 ----
 PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 CONFIG_DIR = os.path.join(PROJECT_ROOT, "config")
-DEFAULT_CONFIG_PATH = os.path.join(CONFIG_DIR, "user.json")
+DEFAULT_YAML_PATH = os.path.join(CONFIG_DIR, "user.yaml")
+DEFAULT_JSON_PATH = os.path.join(CONFIG_DIR, "user.json")
 
-# 别名，供外部导入
-config_path = DEFAULT_CONFIG_PATH
-user_json_path = DEFAULT_CONFIG_PATH
-default_yaml_path = os.path.join(PROJECT_ROOT, "assets", "default.yaml")
+
+def config_path() -> str:
+    """返回当前生效的配置文件路径（优先 YAML，回退 JSON）。"""
+    if os.path.isfile(DEFAULT_YAML_PATH):
+        return DEFAULT_YAML_PATH
+    if os.path.isfile(DEFAULT_JSON_PATH):
+        return DEFAULT_JSON_PATH
+    return DEFAULT_YAML_PATH
+
+
+def _load_yaml(path: str) -> Dict[str, Any]:
+    """从 YAML 文件加载配置。"""
+    if not os.path.isfile(path):
+        return {}
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            data = yaml.safe_load(f)
+        if data is None:
+            return {}
+        if not isinstance(data, dict):
+            return {}
+        return data
+    except Exception:
+        return {}
+
+
+def _load_json(path: str) -> Dict[str, Any]:
+    """从 JSON 文件加载配置（向后兼容）。"""
+    if not os.path.isfile(path):
+        return {}
+    try:
+        import json
+        with open(path, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return {}
+
+
+def _load_user_config() -> Dict[str, Any]:
+    """加载用户配置：优先 YAML，回退 JSON。"""
+    data = _load_yaml(DEFAULT_YAML_PATH)
+    if not data:
+        data = _load_json(DEFAULT_JSON_PATH)
+    return data
 
 
 def _defaults() -> Dict[str, Any]:
     """返回默认配置字典。
 
-    这里定义了所有配置项的默认值。用户 JSON 中未配置的字段
+    这里定义了所有配置项的默认值。用户 YAML/JSON 中未配置的字段
     会使用这些默认值。
 
-    修改这些默认值会影响所有用户（除非用户在 user.json 中覆盖）。
+    修改这些默认值会影响所有用户（除非用户在 user.yaml 中覆盖）。
 
     Returns:
         包含所有默认配置的字典
@@ -135,12 +185,12 @@ class Config:
     封装双层配置（默认 + 用户），提供属性访问和坐标缩放功能。
 
     用法:
-        cfg = Config.load()  # 从 config/user.json 加载
+        cfg = Config.load()  # 从 config/user.yaml 加载
         cfg = Config(overrides={"hp_region": [100, 200, 50, 10]})  # 覆盖某项
 
     Attributes:
-        所有 JSON 配置字段都作为属性直接访问，如 cfg.hp_threshold, cfg.fps 等。
-        属性名与 JSON 字段名一致（下划线命名）。
+        所有 YAML 配置字段都作为属性直接访问，如 cfg.hp_threshold, cfg.fps 等。
+        属性名与 YAML 字段名一致（下划线命名）。
     """
 
     def __init__(self, overrides: Optional[Dict[str, Any]] = None):
@@ -152,14 +202,9 @@ class Config:
         # 1. 加载默认配置
         data = _defaults()
 
-        # 2. 用用户 JSON 覆盖
-        if os.path.isfile(DEFAULT_CONFIG_PATH):
-            try:
-                with open(DEFAULT_CONFIG_PATH, "r", encoding="utf-8") as f:
-                    user = json.load(f)
-                data.update(user)  # 用户配置覆盖默认配置
-            except Exception:
-                pass  # JSON 解析失败时忽略，使用默认值
+        # 2. 用用户配置覆盖（YAML 优先，JSON 回退）
+        user = _load_user_config()
+        data.update(user)
 
         # 3. 用运行时覆盖项覆盖
         if overrides:
@@ -176,30 +221,44 @@ class Config:
         """从指定路径加载配置。
 
         Args:
-            path: JSON 配置文件路径，None 时使用默认路径 config/user.json
+            path: 配置文件路径（.yaml 或 .json），None 时自动查找默认路径
 
         Returns:
             Config 实例
         """
         if path is None:
-            path = DEFAULT_CONFIG_PATH
+            path = config_path()
+
         data = _defaults()
-        if os.path.isfile(path):
-            with open(path, "r", encoding="utf-8") as f:
-                data.update(json.load(f))
-        return cls(overrides=None)  # 上面的 data 处理逻辑在 __init__ 中
+        if path.endswith((".yaml", ".yml")):
+            data.update(_load_yaml(path))
+        elif path.endswith(".json"):
+            data.update(_load_json(path))
+        else:
+            # 尝试 YAML 再尝试 JSON
+            data.update(_load_yaml(path))
+            if not data:
+                data.update(_load_json(path))
+
+        return cls(overrides=None)
 
     def save(self, path: Optional[str] = None):
-        """保存当前配置到 JSON 文件。
+        """保存当前配置到 YAML 文件。
 
         Args:
-            path: 保存路径，None 时使用默认路径
+            path: 保存路径，None 时使用默认路径 config/user.yaml
         """
         if path is None:
-            path = DEFAULT_CONFIG_PATH
+            path = DEFAULT_YAML_PATH
         os.makedirs(os.path.dirname(path), exist_ok=True)
+        # 清理 None 值，使 YAML 更干净
+        clean_data = {}
+        for k, v in self._data.items():
+            if v is not None:
+                clean_data[k] = v
         with open(path, "w", encoding="utf-8") as f:
-            json.dump(self._data, f, ensure_ascii=False, indent=2)
+            yaml.dump(clean_data, f, allow_unicode=True, default_flow_style=False,
+                      sort_keys=False, width=120)
 
     def merge(self, updates: Dict[str, Any]):
         """合并配置项（运行时修改）。
@@ -317,7 +376,7 @@ def load_config(path: Optional[str] = None) -> Config:
     """快捷函数：加载配置。
 
     Args:
-        path: JSON 配置文件路径，None 使用默认路径
+        path: 配置文件路径（.yaml / .json），None 自动查找默认路径
 
     Returns:
         Config 实例
@@ -336,9 +395,9 @@ def save_config(config: Config, path: str):
 
 
 def save_user_config(config: Config):
-    """保存配置到默认用户配置文件。
+    """保存配置到默认用户配置文件 (config/user.yaml)。
 
     Args:
         config: Config 实例
     """
-    config.save(DEFAULT_CONFIG_PATH)
+    config.save(DEFAULT_YAML_PATH)

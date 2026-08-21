@@ -488,7 +488,7 @@ def main():
 
     cfg = load_config()
     if not cfg.window_title:
-        log.error("未配置 window_title，请在 config/user.json 中设置")
+        log.error("未配置 window_title，请在 config/user.yaml 中设置")
         return
 
     auto = Automation(cfg, on_log=lambda m: log.info(m))
