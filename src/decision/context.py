@@ -173,23 +173,26 @@ class DecisionEngine:
 
         # ---- 优先级 1: 没血加血 ----
         if ctx.hp_ratio is not None and ctx.hp_ratio < self.config.hp_threshold:
-            self._fsm.transition(State.HEALING)
-            if self.executor.press_key(self.config.hp_key, cooldown=1.5):
-                self._log(
-                    f"[加血] HP={ctx.hp_ratio:.0%} < {self.config.hp_threshold:.0%}，"
-                    f"按下 {self.config.hp_key}"
-                )
-                return
+            # 满状态（>=95%）不触发，防止刚加完又按
+            if ctx.hp_ratio < 0.95:
+                self._fsm.transition(State.HEALING)
+                if self.executor.press_key(self.config.hp_key, cooldown=1.5):
+                    self._log(
+                        f"[加血] HP={ctx.hp_ratio:.0%} < {self.config.hp_threshold:.0%}，"
+                        f"按下 {self.config.hp_key}"
+                    )
+                    return
 
         # ---- 优先级 2: 没蓝加蓝 ----
         if ctx.mp_ratio is not None and ctx.mp_ratio < self.config.mp_threshold:
-            self._fsm.transition(State.RECOVERING)
-            if self.executor.press_key(self.config.mp_key, cooldown=1.5):
-                self._log(
-                    f"[加蓝] MP={ctx.mp_ratio:.0%} < {self.config.mp_threshold:.0%}，"
-                    f"按下 {self.config.mp_key}"
-                )
-                return
+            if ctx.mp_ratio < 0.95:
+                self._fsm.transition(State.RECOVERING)
+                if self.executor.press_key(self.config.mp_key, cooldown=1.5):
+                    self._log(
+                        f"[加蓝] MP={ctx.mp_ratio:.0%} < {self.config.mp_threshold:.0%}，"
+                        f"按下 {self.config.mp_key}"
+                    )
+                    return
 
         # ---- 优先级 3: 检测到怪物 ----
         if ctx.monsters:

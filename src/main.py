@@ -130,7 +130,24 @@ class Automation:
 
         # ---- OCR 名字定位器（延迟初始化，首次使用时才加载模型）----
         # ocr_interval=30: 每 30 帧执行一次 OCR（约 2.3 秒 @13fps）
-        self._ocr = OCRNameLocator(on_log=self.on_log, ocr_interval=30)
+        self._ocr = OCRNameLocator(
+            name_offset=40, ocr_interval=30,
+            on_log=self.on_log,
+        )
+
+        # ---- 自身位置缓存 ----
+        # OCR 每 30 帧才执行一次，其余帧用缓存兜底
+        self._cached_self_pos: Optional[Tuple[int, int]] = None
+        self._cached_self_frame: int = 0
+        self._cache_max_age: int = 60  # 缓存过期帧数（约 5 秒）
+
+        # ---- 角色中心点缓存（由 OCR 定位时产生）----
+        self._cached_center: Optional[Tuple[int, int]] = None
+        self._cached_center_frame: int = 0
+
+        # ---- HP/MP 变化追踪 ----
+        self._last_hp_ratio: Optional[float] = None
+        self._last_mp_ratio: Optional[float] = None
 
     # =========================================================================
     # 窗口管理
@@ -243,6 +260,14 @@ class Automation:
             # ---- 1. 截图 ----
             try:
                 frame = self.capture.grab()
+                # 首次截图记录帧尺寸
+                if self._frame_count == 1:
+                    h, w = frame.shape[:2]
+                    self.on_log(f"[帧尺寸] {w}x{h}")
+                    self.on_log(
+                        f"[配置] 参考分辨率: "
+                        f"{self.config.reference_width}x{self.config.reference_height}"
+                    )
             except Exception as e:
                 self.on_log(f"[错误] 截图失败: {e}")
                 time.sleep(interval)
@@ -296,6 +321,39 @@ class Automation:
             # ---- 5. 自身定位 ----
             self_pos = self._locate_self(frame)
 
+            # ---- HP/MP 变化检测 ----
+            if hp_ratio is not None:
+                if self._last_hp_ratio is None or abs(hp_ratio - self._last_hp_ratio) >= 0.05:
+                    self._last_hp_ratio = hp_ratio
+                    self.on_log(f"[HP] {hp_ratio:.0%}")
+            if mp_ratio is not None:
+                if self._last_mp_ratio is None or abs(mp_ratio - self._last_mp_ratio) >= 0.05:
+                    self._last_mp_ratio = mp_ratio
+                    self.on_log(f"[MP] {mp_ratio:.0%}")
+
+            # 每 30 帧输出一次状态
+            if self._frame_count % 30 == 0:
+                # HP/MP 比例
+                hp_str = f"{hp_ratio:.0%}" if hp_ratio is not None else "N/A"
+                mp_str = f"{mp_ratio:.0%}" if mp_ratio is not None else "N/A"
+
+                # 自身坐标
+                center = self._get_last_center()
+                if self_pos:
+                    if center:
+                        self.on_log(
+                            f"[状态] HP={hp_str} MP={mp_str} "
+                            f"中心:({center[0]},{center[1]}) "
+                            f"脚底:({self_pos[0]},{self_pos[1]})"
+                        )
+                    else:
+                        self.on_log(
+                            f"[状态] HP={hp_str} MP={mp_str} "
+                            f"脚底:({self_pos[0]},{self_pos[1]})"
+                        )
+                else:
+                    self.on_log(f"[状态] HP={hp_str} MP={mp_str} 自身未定位")
+
             # ---- 6. 决策与执行 ----
             # Context 是感知层 → 决策层的数据载体
             ctx = Context(
@@ -345,38 +403,64 @@ class Automation:
     def _locate_self(self, frame: np.ndarray) -> Optional[Tuple[int, int]]:
         """定位自身脚底在画面中的坐标。
 
-        返回值是该帧中角色脚底像素的 (x, y) 坐标（窗口内坐标）。
-
         策略（按优先级）:
-          1. HP 条偏移推算 - 需要 hp_region 已配置
-             原理: 角色头顶 HP 条中心 → 向下偏移 self_offset 像素 → 脚底
-             优点: 最快（O(1)），最准
-
-          2. RapidOCR 文字识别 - 需要 self_name 已配置
-             原理: 在画面中搜索角色名字文字 → 文字区域中心 = 脚底
-             优点: 不依赖 HP 条，换时装不受影响
-             注意: 每 30 帧才执行一次（OCR 速度较慢）
+          1. HP 条偏移推算 - 最快最准，需要 hp_region 已配置
+          2. RapidOCR 文字识别 - 通过角色名字定位，每 30 帧执行一次
+          3. 缓存兜底 - OCR 非执行帧返回上次缓存，60 帧过期
 
         Returns:
             (cx, cy) 脚底坐标，None 表示无法定位
         """
         # ---- 方案1: HP 条偏移推算 ----
-        # hp_region 为 None 表示用户未框选 HP 条区域
         if self.config.hp_region:
-            # 把参考分辨率下的坐标缩放到当前帧
             hp_region = self.config.scale_region(
                 self.config.hp_region, frame.shape[1], frame.shape[0]
             )
             if hp_region:
                 hx, hy, hw, hh = hp_region
-                # 偏移量也按窗口高度缩放
                 offset = self.config.scale_offset(self.config.self_offset, frame.shape[0])
-                # HP 条中心 + 向下偏移 = 脚底坐标
-                return (hx + hw // 2, hy + hh + offset)
+                pos = (hx + hw // 2, hy + hh + offset)
+                self._cached_self_pos = pos
+                self._cached_self_frame = self._frame_count
+                return pos
 
         # ---- 方案2: RapidOCR 文字识别 ----
-        # OCRNameLocator 内部有帧间隔控制，不是每帧都执行
-        return self._ocr.locate(frame, self.config.self_name)
+        search_region = None
+        if self.config.hp_region:
+            hp_region = self.config.scale_region(
+                self.config.hp_region, frame.shape[1], frame.shape[0]
+            )
+            if hp_region:
+                hx, hy, hw, hh = hp_region
+                search_region = (hx - 100, hy + hh, hw + 200, 200)
+
+        result = self._ocr.locate(frame, self.config.self_name,
+                                  search_region=search_region)
+        if result is not None:
+            center_x, center_y, foot_x, foot_y = result
+            # 记录中心点（用于日志）
+            self._cached_center = (center_x, center_y)
+            self._cached_center_frame = self._frame_count
+            foot = (foot_x, foot_y)
+            self._cached_self_pos = foot
+            self._cached_self_frame = self._frame_count
+            return foot
+
+        # ---- 方案3: 缓存兜底 ----
+        if self._cached_self_pos is not None:
+            age = self._frame_count - self._cached_self_frame
+            if age < self._cache_max_age:
+                return self._cached_self_pos
+
+        return None
+
+    def _get_last_center(self) -> Optional[Tuple[int, int]]:
+        """获取上次定位到的角色中心点（供日志用）。"""
+        if self._cached_center is not None:
+            age = self._frame_count - self._cached_center_frame
+            if age < self._cache_max_age:
+                return self._cached_center
+        return None
 
 
 def main():

@@ -244,33 +244,59 @@ class Config:
     # 坐标自适应缩放
     # =========================================================================
 
-    def scale_region(self, region: Optional[List[int]],
+    def scale_region(self, region: Optional[List],
                      frame_width: int, frame_height: int) -> Optional[Tuple[int, int, int, int]]:
-        """将参考分辨率下的区域坐标缩放到当前帧。
+        """将配置区域转换为当前帧像素坐标。
 
-        公式:
-          scaled_x = x * (frame_width / reference_width)
-          scaled_y = y * (frame_height / reference_height)
+        支持两种格式:
+          1. 百分比 [x%, y%, w%, h%]  每个值 0.0~1.0，相对帧宽高
+          2. 像素 [x, y, w, h]  整数，基于 reference_width/reference_height 缩放
 
         Args:
-            region:      参考分辨率下的区域 [x, y, w, h]，None 返回 None
+            region:       区域 [x, y, w, h]，None 返回 None
             frame_width:  当前帧宽度（像素）
             frame_height: 当前帧高度（像素）
 
         Returns:
-            缩放后的区域 (x, y, w, h)，region 为 None 时返回 None
+            区域 (x, y, w, h) 像素坐标，无效时返回 None
         """
         if region is None:
             return None
-        x, y, w, h = region
-        sx = frame_width / self.reference_width
-        sy = frame_height / self.reference_height
-        return (
-            int(x * sx),   # 缩放后的 x
-            int(y * sy),   # 缩放后的 y
-            int(w * sx),   # 缩放后的宽度
-            int(h * sy),   # 缩放后的高度
-        )
+        if len(region) < 4:
+            return None
+
+        # 判断格式：浮点或 <= 1.0 → 百分比，否则 → 像素缩放
+        is_percent = any(isinstance(v, float) for v in region) or max(region) <= 1.0
+
+        if is_percent:
+            # 百分比：直接乘以帧尺寸
+            sx_i = int(region[0] * frame_width)
+            sy_i = int(region[1] * frame_height)
+            sw_i = int(region[2] * frame_width)
+            sh_i = int(region[3] * frame_height)
+        else:
+            # 像素：按参考分辨率缩放
+            sx = frame_width / self.reference_width
+            sy = frame_height / self.reference_height
+            sx_i = int(region[0] * sx)
+            sy_i = int(region[1] * sy)
+            sw_i = int(region[2] * sx)
+            sh_i = int(region[3] * sy)
+
+        # 边界保护
+        if sx_i < 0:
+            sw_i += sx_i
+            sx_i = 0
+        if sy_i < 0:
+            sh_i += sy_i
+            sy_i = 0
+        if sx_i + sw_i > frame_width:
+            sw_i = frame_width - sx_i
+        if sy_i + sh_i > frame_height:
+            sh_i = frame_height - sy_i
+        if sw_i <= 0 or sh_i <= 0:
+            return None
+        return (sx_i, sy_i, sw_i, sh_i)
 
     def scale_offset(self, offset: int, frame_height: int) -> int:
         """将参考分辨率下的偏移量缩放到当前帧高度。

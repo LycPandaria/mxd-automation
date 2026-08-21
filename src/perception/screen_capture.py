@@ -13,10 +13,20 @@ PrintWindow 实现针对"窗口锁定 + 不受遮挡"场景，二者取舍可在
 子类中切换。
 """
 import ctypes
+import ctypes.wintypes
 import win32gui
 import win32con
 import numpy as np
 import cv2
+
+
+# ---- DPI 感知：让截图返回物理像素而非逻辑像素 ----
+# 高 DPI 显示器上，如果不设置 DPI 感知，GetWindowRect 返回逻辑坐标
+# 而 PrintWindow 返回物理像素，两者不匹配导致坐标偏移
+try:
+    ctypes.windll.user32.SetProcessDPIAware()
+except Exception:
+    pass
 
 
 class ScreenCapture:
@@ -72,25 +82,29 @@ class ScreenCapture:
     # ---------------- 截图 ----------------
 
     def grab(self) -> np.ndarray:
-        """截取锁定窗口画面，返回 BGR numpy 数组。
+        """截取锁定窗口客户区（游戏内容区），返回 BGR numpy 数组。
 
-        使用 ``PrintWindow`` API 直接从窗口 DC 捕获，不受屏幕遮挡影响。
+        使用 ``GetDC(hwnd)`` + ``BitBlt`` 截取客户区而非整个窗口，
+        避免标题栏/边框导致的坐标偏移。
         """
         if not self._hwnd:
             raise RuntimeError("未锁定窗口")
 
         hwnd = self._hwnd
-        left, top, right, bottom = win32gui.GetWindowRect(hwnd)
-        width = right - left
-        height = bottom - top
-
-        if width <= 0 or height <= 0:
-            raise RuntimeError("窗口尺寸无效")
-
         user32 = ctypes.windll.user32
         gdi32 = ctypes.windll.gdi32
 
-        hwnd_dc = user32.GetWindowDC(hwnd)
+        # 获取客户区尺寸（游戏实际内容区域，不含标题栏/边框）
+        rect = ctypes.wintypes.RECT()
+        user32.GetClientRect(hwnd, ctypes.byref(rect))
+        width = rect.right - rect.left
+        height = rect.bottom - rect.top
+
+        if width <= 0 or height <= 0:
+            raise RuntimeError("客户区尺寸无效")
+
+        # 客户区 DC（GetDC 而非 GetWindowDC）
+        hwnd_dc = user32.GetDC(hwnd)
         if not hwnd_dc:
             raise RuntimeError("获取窗口 DC 失败")
 
@@ -98,14 +112,16 @@ class ScreenCapture:
         save_bitmap = gdi32.CreateCompatibleBitmap(hwnd_dc, width, height)
         gdi32.SelectObject(mfc_dc, save_bitmap)
 
-        PW_RENDERFULLCONTENT = 0x00000002
-        result = user32.PrintWindow(hwnd, mfc_dc, PW_RENDERFULLCONTENT)
+        # BitBlt 从客户区 DC 拷贝
+        result = gdi32.BitBlt(
+            mfc_dc, 0, 0, width, height, hwnd_dc, 0, 0, win32con.SRCCOPY
+        )
 
         if not result:
-            # 兜底：使用 BitBlt 从窗口 DC 拷贝
-            result = gdi32.BitBlt(
-                mfc_dc, 0, 0, width, height, hwnd_dc, 0, 0, win32con.SRCCOPY
-            )
+            user32.ReleaseDC(hwnd, hwnd_dc)
+            gdi32.DeleteDC(mfc_dc)
+            gdi32.DeleteObject(save_bitmap)
+            raise RuntimeError("BitBlt 截图失败")
 
         # 读取位图数据
         bmi = ctypes.create_string_buffer(32)
@@ -121,10 +137,9 @@ class ScreenCapture:
 
         # 转换为 numpy 数组 (BGRA -> BGR)
         arr = np.frombuffer(bmp_data.raw, dtype=np.uint8)
-        # 每行对齐到 4 字节
         row_size = ((width * 32 + 31) // 32) * 4
         arr = arr.reshape(height, row_size)[:, :width * 4]
-        frame = arr.reshape(height, width, 4)  # BGRA
+        frame = arr.reshape(height, width, 4)
         return cv2.cvtColor(frame, cv2.COLOR_BGRA2BGR)
 
     # ---------------- 属性 ----------------

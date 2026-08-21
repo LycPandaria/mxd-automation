@@ -1,32 +1,42 @@
 {
   "window_title": "冒险岛怀旧服",
   "start_stop_hotkey": "F6",
-  "reference_width": 1366,
-  "reference_height": 768,
+  "reference_width": 1368,
+  "reference_height": 800,
   "fps": 5,
   "confidence": 0.5,
   "model_path": "E:/pythonProjects/mxd-automation/train/scripts/02_train_yolo/model/best.pt",
   "monster_classes": "monster",
   "floor_classes": "floor",
   "rope_classes": "rope",
-  "self_name": "",
+  "self_name": "我是立立",
   "self_offset": 85,
-  "hp_region": null,
-  "hp_color": [
-    51,
-    204,
-    51
+  "hp_region": [
+    0.373,
+    0.971,
+    0.079,
+    0.021
   ],
-  "hp_tolerance": 30,
+  "hp_color": [
+    231,
+    34,
+    34
+  ],
+  "hp_tolerance": 20,
   "hp_threshold": 0.3,
   "hp_key": "f",
-  "mp_region": null,
-  "mp_color": [
-    51,
-    153,
-    255
+  "mp_region": [
+    0.453,
+    0.971,
+    0.077,
+    0.023
   ],
-  "mp_tolerance": 30,
+  "mp_color": [
+    3,
+    130,
+    232
+  ],
+  "mp_tolerance": 20,
   "mp_threshold": 0.3,
   "mp_key": "g",
   "target_key": "tab",
@@ -36,69 +46,5 @@
       "key": "x",
       "cooldown": 1.0
     }
-  ],
-  "window": {
-    "title": "冒险岛怀旧服"
-  },
-  "detection": {
-    "model_path": "",
-    "confidence": 0.5,
-    "monster_classes": "monster",
-    "fps": 13
-  },
-  "hp": {
-    "key": "f",
-    "threshold": 0.99,
-    "color": [
-      231,
-      34,
-      34
-    ],
-    "tolerance": 20,
-    "region": [
-      510,
-      777,
-      108,
-      17
-    ]
-  },
-  "mp": {
-    "key": "g",
-    "threshold": 0.3,
-    "color": [
-      3,
-      130,
-      232
-    ],
-    "tolerance": 20,
-    "region": [
-      620,
-      777,
-      106,
-      18
-    ]
-  },
-  "combat": {
-    "target_key": "tab",
-    "skills": [
-      {
-        "name": "技能1",
-        "key": "1",
-        "cooldown": 1.0
-      },
-      {
-        "name": "技能2",
-        "key": "2",
-        "cooldown": 3.0
-      },
-      {
-        "name": "技能3",
-        "key": "3",
-        "cooldown": 8.0
-      }
-    ]
-  },
-  "hotkey": {
-    "start_stop": "f12"
-  }
+  ]
 }

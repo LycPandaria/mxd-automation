@@ -1,6 +1,7 @@
 """
 自动识别窗口并无感截图的程序
 支持：按窗口标题、类名、进程名查找窗口，并静默截图保存
+仅截取客户区（不含标题栏/边框），避免坐标偏移
 """
 
 import ctypes
@@ -14,6 +15,13 @@ import win32con
 import win32gui
 import win32process
 from PIL import Image
+
+
+# ---- DPI 感知：让截图返回物理像素而非逻辑像素 ----
+try:
+    ctypes.windll.user32.SetProcessDPIAware()
+except Exception:
+    pass
 
 
 class WindowInfo:
@@ -154,24 +162,22 @@ class StealthScreenshot:
         os.makedirs(save_dir, exist_ok=True)
 
     def capture_window(self, hwnd):
-        """截取指定窗口（即使被遮挡也能截取）"""
+        """截取指定窗口客户区（游戏内容区，不含标题栏/边框）。"""
         from ctypes import windll
 
         user32 = windll.user32
 
-        try:
-            rect = win32gui.GetWindowRect(hwnd)
-        except Exception:
-            return None
-
-        left, top, right, bottom = rect
-        width = right - left
-        height = bottom - top
+        # 获取客户区尺寸
+        rect = wintypes.RECT()
+        user32.GetClientRect(hwnd, ctypes.byref(rect))
+        width = rect.right - rect.left
+        height = rect.bottom - rect.top
 
         if width <= 0 or height <= 0:
             return None
 
-        hwnd_dc = user32.GetWindowDC(hwnd)
+        # 客户区 DC（GetDC 而非 GetWindowDC）
+        hwnd_dc = user32.GetDC(hwnd)
         if not hwnd_dc:
             return None
 

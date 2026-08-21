@@ -319,7 +319,8 @@ class MainWindow(QMainWindow):
             self._set_swatch(self.hp_swatch, c.hp_color)
         if c.hp_region:
             self.hp_region_label.setText(
-                f"{c.hp_region[0]},{c.hp_region[1]} {c.hp_region[2]}x{c.hp_region[3]}"
+                f"x={c.hp_region[0]:.1%} y={c.hp_region[1]:.1%} "
+                f"w={c.hp_region[2]:.1%} h={c.hp_region[3]:.1%}"
             )
         # MP
         self.mp_key_edit.setText(c.mp_key)
@@ -328,7 +329,8 @@ class MainWindow(QMainWindow):
             self._set_swatch(self.mp_swatch, c.mp_color)
         if c.mp_region:
             self.mp_region_label.setText(
-                f"{c.mp_region[0]},{c.mp_region[1]} {c.mp_region[2]}x{c.mp_region[3]}"
+                f"x={c.mp_region[0]:.1%} y={c.mp_region[1]:.1%} "
+                f"w={c.mp_region[2]:.1%} h={c.mp_region[3]:.1%}"
             )
         self.target_key_edit.setText(c.target_key)
         # 技能表
@@ -425,31 +427,57 @@ class MainWindow(QMainWindow):
         )
 
     def _on_region_selected(self, target, x, y, w, h):
-        """框选区域后自动识别颜色并写入配置，同时记录参考分辨率。"""
+        """框选区域后自动识别颜色并写入配置（存储为百分比）。"""
         frame = self.automation.capture.grab()
         fh, fw = frame.shape[:2]
-        self.config.ref_width = fw
-        self.config.ref_height = fh
+        # 转换为百分比存储
+        region_pct = [x / fw, y / fh, w / fw, h / fh]
         if target == "mp":
-            self.config.mp_region = [x, y, w, h]
-            self.mp_region_label.setText(f"{x},{y} {w}x{h}")
+            self.config.mp_region = region_pct
+            self.mp_region_label.setText(
+                f"x={region_pct[0]:.1%} y={region_pct[1]:.1%} "
+                f"w={region_pct[2]:.1%} h={region_pct[3]:.1%}"
+            )
             color = self._detect_region_color(x, y, w, h)
             if color:
                 self.config.mp_color = color
                 self._set_swatch(self.mp_swatch, color)
-                self._log(f"[蓝量] 区域已设置: ({x},{y}) {w}x{h} | 自动识别颜色: RGB{tuple(color)}")
+                self._log(
+                    f"[蓝量] 区域已设置: "
+                    f"x={region_pct[0]:.1%} y={region_pct[1]:.1%} "
+                    f"w={region_pct[2]:.1%} h={region_pct[3]:.1%} "
+                    f"| 颜色: RGB{tuple(color)}"
+                )
             else:
-                self._log(f"[蓝量] 区域已设置: ({x},{y}) {w}x{h} | 颜色识别失败")
+                self._log(
+                    f"[蓝量] 区域已设置: "
+                    f"x={region_pct[0]:.1%} y={region_pct[1]:.1%} "
+                    f"w={region_pct[2]:.1%} h={region_pct[3]:.1%} "
+                    f"| 颜色识别失败"
+                )
         else:
-            self.config.hp_region = [x, y, w, h]
-            self.hp_region_label.setText(f"{x},{y} {w}x{h}")
+            self.config.hp_region = region_pct
+            self.hp_region_label.setText(
+                f"x={region_pct[0]:.1%} y={region_pct[1]:.1%} "
+                f"w={region_pct[2]:.1%} h={region_pct[3]:.1%}"
+            )
             color = self._detect_region_color(x, y, w, h)
             if color:
                 self.config.hp_color = color
                 self._set_swatch(self.hp_swatch, color)
-                self._log(f"[血量] 区域已设置: ({x},{y}) {w}x{h} | 自动识别颜色: RGB{tuple(color)}")
+                self._log(
+                    f"[血量] 区域已设置: "
+                    f"x={region_pct[0]:.1%} y={region_pct[1]:.1%} "
+                    f"w={region_pct[2]:.1%} h={region_pct[3]:.1%} "
+                    f"| 颜色: RGB{tuple(color)}"
+                )
             else:
-                self._log(f"[血量] 区域已设置: ({x},{y}) {w}x{h} | 颜色识别失败")
+                self._log(
+                    f"[血量] 区域已设置: "
+                    f"x={region_pct[0]:.1%} y={region_pct[1]:.1%} "
+                    f"w={region_pct[2]:.1%} h={region_pct[3]:.1%} "
+                    f"| 颜色识别失败"
+                )
 
     def _detect_region_color(self, x, y, w, h):
         """从当前窗口截图中识别指定区域的主颜色。"""
