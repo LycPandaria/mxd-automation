@@ -38,11 +38,12 @@
 
   RapidOCR 文字识别（唯一方案，每帧实时执行）
     原理: OCR 识别画面中的角色名字（如"我是立立"）→ 名字中心 ≈ 脚底；
-          角色中心点 = 名字中心向下延伸"人物高度一半"（character_height//2，约 30px）
+          角色中心点 = 名字中心向上延伸"人物高度一半"（character_height//2，约 30px）
+          名字在脚下 → 角色身体在名字上方 → 中心点在名字上方（y 更小）
     条件: 已配置 self_name；每帧执行，与 YOLO 检测同节奏，无缓存兜底
     说明: 早期"HP 条偏移推算"用的是 UI 底部固定血条（hp_region），
           不随角色移动，算出的坐标恒定不变（定位 bug），已移除。
-          搜索区域限定在画面中下部 35%~100%，以降低 OCR 耗时。
+          搜索区域为画面 10%~100%，以兼顾角色跳跃/高处时的定位。
 
 ================================================================================
 运行方式
@@ -130,9 +131,10 @@ class Automation:
         # ---- OCR 名字定位器（延迟初始化，首次使用时才加载模型）----
         # ocr_interval=10: 每 10 帧执行一次 OCR，其余帧用缓存（大幅降低 OCR 耗时，
         #                  避免每帧 OCR 拖慢主循环帧率）
-        # character_height=60: 人物高度约 60px，角色中心 = 名字中心 + 高度一半（向下）
+        # character_height=60: 人物高度约 60px，角色中心 = 名字中心 - 高度一半（向上）
         self._ocr = OCRNameLocator(
             character_height=60, ocr_interval=10,
+            exact_match=True,  # 精确匹配角色名，避免"包含匹配"误识别聊天框/UI文字
             on_log=self.on_log,
         )
 
@@ -450,10 +452,11 @@ class Automation:
         Returns:
             (cx, cy) 脚底坐标，None 表示本帧未识别到角色名字
         """
-        # 搜索区域：画面中下部 35%~100%（角色名字出现在脚下，
-        # 且打怪时角色通常在中下部；限制区域可大幅降低 OCR 耗时）
+        # 搜索区域：画面 10%~100%（角色跳跃/位于地图上部时名字也能识别到；
+        # 之前的 35%~100% 在角色于画面上部时定位直接丢失 → 行为错乱）
+        # ocr_interval=10 已限制 OCR 频率，扩大区域不会显著拖慢帧率
         h, w = frame.shape[:2]
-        search_region = (0, int(h * 0.35), w, int(h * 0.65))
+        search_region = (0, int(h * 0.10), w, int(h * 0.90))
 
         result = self._ocr.locate(frame, self.config.self_name,
                                   search_region=search_region)

@@ -6,20 +6,20 @@
 原理（冒险岛实际布局）
 ================================================================================
 
-  角色名字显示在角色脚下。名字中心 ≈ 角色脚底，从名字中心向下
-  延伸"人物高度一半"得到角色中心点：
+  角色名字显示在角色脚下。名字中心 ≈ 角色脚底，从名字中心向上
+  延伸"人物高度一半"得到角色中心点（角色身体在名字上方）：
 
-    ╔═══════╗
-    ║ 角色   ║
-    ║        ║  ← 人物高度（character_height，约 60px）
-    ╚═══╤═══╝
+    ╔═══════════╗   ← 名字中心 y - 30 = 角色中心点 y（往上）
+    ║  我是立立   ║
+    ╚═══╤═══════╝
         │  ↑ 名字中心 = 脚底
         │
-        │  ↓ + 人物高度一半（character_height // 2）
+        │  ↑ - 人物高度一半（character_height // 2）
         │
-    ╔═══╧═══════╗   ← 名字中心 y + 30 = 角色中心点 y
-    ║  我是立立   ║
-    ╚═══════════╝
+    ╔═══╧═══╗
+    ║ 角色   ║
+    ║        ║  ← 人物高度（character_height，约 60px）
+    ╚═══════╝
 
 ================================================================================
 用法
@@ -49,13 +49,13 @@ class OCRNameLocator:
     """基于 RapidOCR 的角色名字定位器。
 
     冒险岛角色名字显示在脚下，名字中心 ≈ 脚底；
-    角色中心点 = 名字中心向下延伸"人物高度一半"。
+    角色中心点 = 名字中心向上延伸"人物高度一半"。
 
     每帧调用 locate()，内部有帧间隔控制（默认每 30 帧执行一次 OCR）。
     同时返回角色中心点和脚底坐标。
 
     Args:
-        character_height: 人物高度像素数，默认 60；角色中心 = 名字中心 + 高度一半
+        character_height: 人物高度像素数，默认 60；角色中心 = 名字中心 - 高度一半
         ocr_interval:     OCR 执行间隔（帧数），默认 30 帧
         exact_match:      是否精确匹配名字（True=完全相等，False=包含即可）
         on_log:           日志回调
@@ -75,6 +75,23 @@ class OCRNameLocator:
         self._last_center: Optional[Tuple[int, int]] = None
         self._last_foot: Optional[Tuple[int, int]] = None
 
+        # 帧间跳变过滤：OCR 偶尔会把画面中固定位置的 UI 文字（聊天框、
+        # 任务栏、怪物名等）误识别为角色名（匹配是"包含"逻辑），
+        # 导致角色坐标瞬间跳到别处，决策层基于错误坐标把同平台的怪
+        # 判成跨层 → 一直移动不攻击。
+        # 策略：新识别位置与上次有效位置偏移超过阈值 → 直接判定为
+        # 误识别，沿用上次位置且不更新缓存。角色正常移动每帧最多几十
+        # px，超过上限只能是误识别（游戏无瞬移）；换图后 OCR 找不到
+        # 名字会返回 None，由决策层按未定位处理，不会用错误位置。
+        self._max_jump = 200  # 单次识别相对上次有效位置的偏移上限(px)
+
+        # 连续误识别超时重置：如果首帧就识别到了错误位置（比如匹配到
+        # UI 固定文字），后续所有帧都会被 _max_jump 过滤掉，位置永远
+        # 卡在错误坐标上。策略：连续 N 帧都被跳变过滤 → 接受新位置
+        # 并重置缓存，防止首帧错误永久锁死定位。
+        self._skip_counter = 0
+        self._skip_threshold = 5
+
     # ---- 公开接口 ----
 
     def locate(self, frame: np.ndarray, name: str,
@@ -85,7 +102,7 @@ class OCRNameLocator:
 
         冒险岛角色名字在脚下，所以:
           - 脚底 ≈ 名字中心 y（名字就在脚底位置）
-          - 角色中心 = 名字中心 + character_height // 2（向下延伸人物高度一半）
+          - 角色中心 = 名字中心 - character_height // 2（向上延伸人物高度一半）
 
         Args:
             frame:         BGR 截图 (H, W, 3)
@@ -136,17 +153,36 @@ class OCRNameLocator:
         if result is None:
             return None
 
-        # 匹配名字
+        # 匹配名字：优先选"离上次有效位置最近"的候选（利用位置连续性）。
+        # 角色每帧移动最多几十px，真实名字总是离缓存最近；
+        # 若画面中同时存在多个同名文本（聊天框/UI 也含角色名），
+        # 按"置信度最高"选会在它们之间反复跳 → 一直触发跳变过滤
+        # → "连续误识别/超时"循环，位置永远锁不定。
+        # 首帧（无缓存）才退化为"置信度最高"。
         best = None
         best_conf = 0.0
-        for box, text, confidence in result:
-            if not self._match(name, text):
-                continue
-            if confidence < min_confidence:
-                continue
-            if confidence > best_conf:
-                best_conf = confidence
-                best = box
+        if self._last_foot is not None:
+            best_d = float("inf")
+            for box, text, confidence in result:
+                if not self._match(name, text):
+                    continue
+                if confidence < min_confidence:
+                    continue
+                bx = int((box[0][0] + box[1][0] + box[2][0] + box[3][0]) / 4) + offset_x
+                by = int((box[0][1] + box[1][1] + box[2][1] + box[3][1]) / 4) + offset_y
+                d = abs(bx - self._last_foot[0]) + abs(by - self._last_foot[1])
+                if d < best_d:
+                    best_d = d
+                    best = box
+        else:
+            for box, text, confidence in result:
+                if not self._match(name, text):
+                    continue
+                if confidence < min_confidence:
+                    continue
+                if confidence > best_conf:
+                    best_conf = confidence
+                    best = box
 
         if best is None:
             return None
@@ -155,11 +191,38 @@ class OCRNameLocator:
         name_cx = int((best[0][0] + best[1][0] + best[2][0] + best[3][0]) / 4) + offset_x
         name_cy = int((best[0][1] + best[1][1] + best[2][1] + best[3][1]) / 4) + offset_y
 
-        # 脚底 = 名字中心（名字就在脚边）
+        # 脚底 = 名字中心（名字就在脚边，画面 y 向下增大）
         foot = (name_cx, name_cy)
-        # 角色中心 = 名字中心向下延伸"人物高度一半"
-        center = (name_cx, name_cy + self._character_height // 2)
+        # 角色中心 = 名字中心向上延伸"人物高度一半"（-30px）
+        # 名字在脚下 → 身体在名字上方 → 中心点在名字上方（y 更小）
+        center = (name_cx, name_cy - self._character_height // 2)
 
+        # ---- 帧间跳变过滤 + 连续误识别超时重置 ----
+        if self._last_foot is not None:
+            jump = abs(foot[0] - self._last_foot[0]) + abs(foot[1] - self._last_foot[1])
+            if jump > self._max_jump:
+                self._skip_counter += 1
+                if self._skip_counter >= self._skip_threshold:
+                    # 连续 N 帧都跳变 → 上次位置很可能是错的（首帧误识别），
+                    # 接受新位置并重置缓存，防止错误坐标永久锁死。
+                    self._on_log(
+                        f"[定位] 连续误识别{self._skip_counter}次，"
+                        f"接受新位置 {foot}（上次{self._last_foot}）"
+                    )
+                    self._skip_counter = 0
+                    self._last_center = center
+                    self._last_foot = foot
+                    return (*center, *foot)
+                # 大偏移 → 判定为误识别（角色正常移动不会一帧跳200px+），
+                # 沿用上次有效位置且不更新缓存。
+                self._on_log(
+                    f"[定位] 疑似误识别: 位置偏移 Δ{jump}px "
+                    f"(上次{self._last_foot}，本次{foot})，沿用上次"
+                )
+                return (*self._last_center, *self._last_foot)
+
+        # 位置正常更新，重置误识别计数
+        self._skip_counter = 0
         self._last_center = center
         self._last_foot = foot
         return (*center, *foot)

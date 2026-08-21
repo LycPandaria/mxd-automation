@@ -38,7 +38,7 @@ mp_key: pdn
 target_key: tab
 jump_key: c
 attack_range: 100
-attack_range_y: 50
+attack_range_y: 30
 skills:
 - name: 技能1
   key: a
