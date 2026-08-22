@@ -649,15 +649,16 @@ class DecisionEngine:
             elif dx < -FACE_TURN_X:
                 need = "left"
             if need is not None and need != self._face_dir:
-                # 只有当前朝向与目标方向不一致时才按键转向（用 _face_dir
-                # 记忆朝向）；已面向怪物则不再按，避免攻击中反复按方向键
-                # 导致角色位移、跑出攻击范围来回抖动。
+                # 朝向不对 → 本帧只按方向键转向，不放技能。
+                # 下一帧方向生效后 _face_dir 已更新，不会再进这个分支，
+                # 技能才会打出去，确保面对面攻击不空放。
                 if self.executor.press_key(need, cooldown=0.3):
                     self._face_dir = need
                     self._log(
                         f"[朝向] 怪物在{'右' if need == 'right' else '左'}"
-                        f"({dx:+d}px)，按{need}转向后攻击"
+                        f"({dx:+d}px)，按{need}转向，下一帧攻击"
                     )
+                return
 
         self._cast_skill()
 
