@@ -4,39 +4,14 @@
 发送模式
 ================================================================================
 
-  本模块支持两种按键注入模式，通过构造参数 mode 选择（默认 sendinput）:
+  使用 SendInput() 从驱动层模拟真实全局按键，经过系统全局键盘输入队列，
+  DirectX/DirectInput 游戏可以收到。
 
-  ┌──────────────┬────────────────────────────────────────────────────────────┐
-  │ mode         │ 说明                                                        │
-  ├──────────────┼────────────────────────────────────────────────────────────┤
-  │ sendinput    │ 前台真实按键（默认）                                        │
-  │              │   原理: SendInput() 从驱动层模拟真实全局按键，经过系统全局  │
-  │              │         键盘输入队列，DirectX/DirectInput 游戏可以收到。    │
-  │              │   优点: 对冒险岛这类读取全局键盘状态的游戏有效              │
-  │              │          （PostMessage 注入对这类游戏无效，已验证）         │
-  │              │   代价: 占用真实键盘，游戏窗口必须处于前台/激活状态，       │
-  │              │         运行期间不能切换去操作其它程序                      │
-  ├──────────────┼────────────────────────────────────────────────────────────┤
-  │ postmessage  │ 后台注入                                                    │
-  │              │   原理: PostMessageW() 向目标窗口消息队列投递              │
-  │              │         WM_KEYDOWN / WM_KEYUP，游戏在窗口过程(WndProc)     │
-  │              │         中处理这些消息。                                    │
-  │              │   优点: 纯后台输入，窗口无需在前台，可自由切换程序。        │
-  │              │   代价: 只对通过"窗口消息"接收键盘的游戏有效；             │
-  │              │         若游戏用 DirectInput / GetAsyncKeyState 读键盘     │
-  │              │         （冒险岛就是这样），此模式完全无效。                │
-  └──────────────┴────────────────────────────────────────────────────────────┘
+  优点: 对冒险岛这类读取全局键盘状态的游戏有效。
+  代价: 占用真实键盘，游戏窗口必须处于前台/激活状态，
+        运行期间不能切换去操作其它程序。
 
-  【重要】两种模式都只在锁定窗口后生效。
-  未锁定窗口时 press_key() 会返回 False 并记录日志。
-
-  PostMessage 模式的 lParam 按标准键盘消息编码:
-    bit 0-15  重复计数(repeat count) = 1
-    bit 16-23 硬件扫描码(scan code)
-    bit 24    扩展键标志(extended key，方向键等)
-    bit 29    上下文代码(context code)
-    bit 30    先前键状态(previous key state，KEYUP 时=1)
-    bit 31    转换状态(transition state，KEYUP 时=1)
+  只在锁定窗口后生效。未锁定窗口时 press_key() 会返回 False 并记录日志。
 
 ================================================================================
 虚拟键码（VK Code）
@@ -49,9 +24,7 @@
     - Tab:    0x09
     - Enter:  0x0D
 
-  两种模式都依赖虚拟键码:
-    - SendInput:    扫描码由 MapVirtualKeyW(vk, 0) 获得（KEYEVENTF_SCANCODE）
-    - PostMessage:  wParam=虚拟键码，lParam 内嵌扫描码
+  SendInput 使用扫描码模式: 扫描码由 MapVirtualKeyW(vk, 0) 获得（KEYEVENTF_SCANCODE）。
 
 ================================================================================
 按键冷却
@@ -69,23 +42,6 @@ from ctypes import wintypes
 
 # ---- Windows API 常量 ----
 user32 = ctypes.windll.user32
-
-# ---- 模式常量 ----
-MODE_SENDINPUT = "sendinput"     # 前台真实按键（默认，冒险岛有效）
-MODE_POSTMESSAGE = "postmessage" # 后台注入（仅对走窗口消息的游戏有效）
-
-# ---- 窗口消息常量（PostMessage 模式）----
-WM_KEYDOWN = 0x0100  # 按键按下消息
-WM_KEYUP = 0x0101    # 按键抬起消息
-WM_CHAR = 0x0102     # 字符消息（一般不需要）
-
-# ---- PostMessage lParam 位标志 ----
-# bit 24: 扩展键标志（方向键/Insert/Delete 等有独立扩展扫描码）
-_LPARAM_EXTENDED = 0x01000000
-# bit 30: 先前键状态（KEYUP 时为 1）
-_LPARAM_PREV_DOWN = 0x40000000
-# bit 31: 转换状态（KEYUP 时为 1）
-_LPARAM_TRANSITION = 0x80000000
 
 # ---- SendInput 常量 ----
 INPUT_KEYBOARD = 1               # INPUT 类型: 键盘输入
@@ -199,29 +155,23 @@ del _i, _c  # 清理循环变量，避免污染命名空间
 class KeyboardController:
     """键盘控制器。
 
-    支持两种注入模式（构造参数 mode 指定）:
-      - "sendinput"（默认）: 前台真实按键，游戏窗口必须在前台。
-        冒险岛怀旧服读取全局键盘状态，必须使用此模式。
-      - "postmessage": 后台注入，无需前台，但对冒险岛无效。
+    使用 SendInput 从驱动层模拟真实全局按键。冒险岛怀旧服读取全局键盘状态，
+    游戏窗口必须保持在前台激活状态。
 
     用法:
-        kb = KeyboardController(mode="sendinput")
+        kb = KeyboardController()
         kb.set_target_window(hwnd)  # 设置目标窗口
         kb.press_key("f")           # 按 F 键（点按）
         kb.key_down("right")        # 按住右方向键（持续移动）
         kb.key_up("right")          # 释放右方向键（停止移动）
     """
 
-    def __init__(self, mode: str = MODE_SENDINPUT, on_log=None):
+    def __init__(self, on_log=None):
         """构造键盘控制器。
 
         Args:
-            mode:   "sendinput"（默认，前台真实按键）或 "postmessage"（后台注入）
             on_log: 日志回调 (message: str) -> None
         """
-        if mode not in (MODE_SENDINPUT, MODE_POSTMESSAGE):
-            mode = MODE_SENDINPUT
-        self._mode = mode
         self._last_press = {}  # key -> 上次触发时间戳（秒）
         self._held_keys = set()  # 当前被按住未释放的键
         self._hwnd = None      # 目标窗口句柄
@@ -239,25 +189,18 @@ class KeyboardController:
     def set_target_window(self, hwnd):
         """设置目标窗口句柄。
 
-        两种模式差异:
-          - sendinput: 锁定后每次按键前会自动把游戏窗口激活到前台
-          - postmessage: 仅投递消息到该窗口，无需激活（对冒险岛无效）
+        锁定后每次按键前会自动把游戏窗口激活到前台（SendInput 全局按键，
+        只有前台窗口才能收到）。
 
         Args:
             hwnd: Windows 窗口句柄（整数）
         """
         self._hwnd = hwnd
         if hwnd:
-            if self._mode == MODE_SENDINPUT:
-                self._on_log(
-                    f"[按键] 目标窗口已锁定, hwnd=0x{hwnd:X}"
-                    "（SendInput 真实按键模式: 请保持游戏窗口在前台）"
-                )
-            else:
-                self._on_log(
-                    f"[按键] 目标窗口已锁定, hwnd=0x{hwnd:X}"
-                    "（PostMessage 后台注入模式: 无需保持游戏窗口在前台）"
-                )
+            self._on_log(
+                f"[按键] 目标窗口已锁定, hwnd=0x{hwnd:X}"
+                "（请保持游戏窗口在前台）"
+            )
 
     # =========================================================================
     # 按键
@@ -346,40 +289,13 @@ class KeyboardController:
         return True
 
     # -------------------------------------------------------------------------
-    # PostMessage 实现（后台注入，可选模式）
-    # -------------------------------------------------------------------------
-
-    def _make_lparam(self, vk_code: int, keyup: bool = False) -> int:
-        """构造键盘消息的 lParam（扫描码 + 扩展键 + 按键状态标志）。"""
-        scan = user32.MapVirtualKeyW(vk_code, 0)
-        lparam = 1  # 重复计数 = 1
-        lparam |= scan << 16
-        if vk_code in _EXTENDED_KEYS:
-            lparam |= _LPARAM_EXTENDED
-        if keyup:
-            lparam |= _LPARAM_PREV_DOWN | _LPARAM_TRANSITION
-        return lparam
-
-    def _post_key(self, key: str, vk_code: int, keyup: bool) -> bool:
-        """向目标窗口投递一条键盘消息（PostMessage 异步）。"""
-        msg = WM_KEYUP if keyup else WM_KEYDOWN
-        lparam = self._make_lparam(vk_code, keyup)
-        ok = bool(user32.PostMessageW(self._hwnd, msg, vk_code, lparam))
-        if not ok:
-            self._on_log(
-                f"[按键] PostMessage 投递失败: key={key}, up={keyup}"
-            )
-        return ok
-
-    # -------------------------------------------------------------------------
-    # 点按 / 按住 / 释放（按模式分发）
+    # 点按 / 按住 / 释放
     # -------------------------------------------------------------------------
 
     def _press_single_key(self, key: str) -> bool:
         """点按单个按键。
 
-        SendInput 流程:    激活窗口 → KEYDOWN → sleep → KEYUP
-        PostMessage 流程:  投递 KEYDOWN → sleep → 投递 KEYUP
+        流程: 激活窗口 → KEYDOWN → sleep → KEYUP
 
         Returns:
             True: 按键已发送
@@ -394,14 +310,6 @@ class KeyboardController:
             self._on_log(f"[按键] 未锁定窗口，拒绝发送按键: {key}")
             return False
 
-        if self._mode == MODE_POSTMESSAGE:
-            # PostMessage: 异步投递，无需激活窗口
-            if not self._post_key(key, vk_code, keyup=False):
-                return False
-            time.sleep(0.03)  # 让游戏有时间处理按下事件
-            return self._post_key(key, vk_code, keyup=True)
-
-        # SendInput: 真实全局按键，需激活窗口到前台
         if not self._si_send_key(key, vk_code, keyup=False):
             return False
         time.sleep(0.03)  # 让游戏有时间处理按下事件
@@ -429,10 +337,7 @@ class KeyboardController:
         if key in self._held_keys:
             return True  # 已按住，避免重复发送 KEYDOWN
 
-        if self._mode == MODE_POSTMESSAGE:
-            ok = self._post_key(key, vk_code, keyup=False)
-        else:
-            ok = self._si_send_key(key, vk_code, keyup=False)
+        ok = self._si_send_key(key, vk_code, keyup=False)
         if not ok:
             self._on_log(f"[按键] 按住失败: key={key}")
             return False
@@ -454,10 +359,7 @@ class KeyboardController:
         if not vk_code:
             return False
 
-        if self._mode == MODE_POSTMESSAGE:
-            ok = self._post_key(key, vk_code, keyup=True)
-        else:
-            ok = self._si_send_key(key, vk_code, keyup=True)
+        ok = self._si_send_key(key, vk_code, keyup=True)
         if not ok:
             self._on_log(f"[按键] 释放失败: key={key}")
             return False
@@ -467,19 +369,13 @@ class KeyboardController:
     def press_key(self, key: str, cooldown: float = 0.0) -> bool:
         """按下指定键，支持多字符序列（如 "hm" 依次按 h、m）。
 
-        【SendInput 流程】
+        【流程】
         1. 获取虚拟键码
         2. 激活窗口到前台（SetForegroundWindow）
         3. 获取硬件扫描码（MapVirtualKeyW）
         4. SendInput 发送 KEYDOWN（扫描码模式，扩展键加标志）
         5. sleep(0.03s) 让游戏有时间处理
         6. SendInput 发送 KEYUP
-
-        【PostMessage 流程】
-        1. 获取虚拟键码
-        2. 投递 WM_KEYDOWN 到目标窗口（后台注入，无需前台）
-        3. sleep(0.03s) 让游戏有时间处理
-        4. 投递 WM_KEYUP
 
         【冷却机制】
         cooldown > 0 时，在冷却时间内再次调用返回 False。

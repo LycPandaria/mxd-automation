@@ -150,10 +150,8 @@ def _defaults() -> Dict[str, Any]:
         "fps": 13,
         # ---- 执行 ----
         # 键盘注入模式:
-        #   "sendinput"（默认）: 前台真实按键，对冒险岛这类读取全局键盘状态
-        #     的游戏有效，游戏窗口需保持在前台。
-        #   "postmessage": 后台注入，无需前台，但只对走窗口消息的游戏有效
-        #     （冒险岛无效）。
+        #   使用 SendInput 驱动层模拟真实全局按键，游戏窗口必须在前台。
+        #   冒险岛通过 DirectInput 读取全局键盘状态，这是唯一有效的方式。
         "keyboard_mode": "sendinput",
         # ---- 模型 ----
         "confidence": 0.5,

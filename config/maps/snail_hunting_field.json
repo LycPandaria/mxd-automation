@@ -1,6 +1,0 @@
-{
-  "_comment": "上帝视角地图拓扑结构占位。从 WZ 拆包提取后填充 nodes/edges，供 A* 寻路使用。",
-  "map_name": "snail_hunting_field",
-  "nodes": [],
-  "edges": []
-}

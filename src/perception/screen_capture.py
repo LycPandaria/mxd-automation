@@ -171,7 +171,7 @@ class ScreenCapture:
 
     @property
     def hwnd(self):
-        """锁定的窗口句柄（供执行层做 PostMessage 注入用）。"""
+        """锁定的窗口句柄（供执行层做按键注入用）。"""
         return self._hwnd
 
 

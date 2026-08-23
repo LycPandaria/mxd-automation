@@ -3,7 +3,7 @@ start_stop_hotkey: F6
 reference_width: 1368
 reference_height: 800
 fps: 30
-keyboard_mode: sendinput
+keyboard_mode: sendinput  # 按键模式（固定使用 SendInput 驱动层注入，游戏窗口必须在前台）
 confidence: 0.8
 model_path: E:/pythonProjects/mxd-automation/train/scripts/02_train_yolo/model/best.pt
 monster_classes: monster

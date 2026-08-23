@@ -12,16 +12,12 @@
     executor.click(500, 300)     → 点击
     executor.set_target_window() → 绑定窗口
 
-  不需要关心底层是 PostMessage 还是 SendInput（由 mode 参数决定）。
-
 ================================================================================
 按键模式
 ================================================================================
 
-  ActionExecutor 透传 mode 给 KeyboardController:
-    - "sendinput"（默认）: 前台真实按键，对冒险岛等读取全局键盘状态的
-      游戏有效，游戏窗口需保持在前台。
-    - "postmessage": 后台注入，无需前台，但冒险岛无效（它不走窗口消息）。
+  使用 SendInput 驱动层模拟真实全局按键，冒险岛通过 DirectInput
+  读取全局键盘状态，游戏窗口必须保持在前台。
 
 ================================================================================
 冷却机制
@@ -52,15 +48,13 @@ class ActionExecutor:
         executor.reset()                  # 重置所有冷却
     """
 
-    def __init__(self, mode: str = "sendinput", on_log=None):
+    def __init__(self, on_log=None):
         """构造动作执行器。
 
         Args:
-            mode:   按键模式，可选 "sendinput"（默认，前台真实按键，
-                    冒险岛有效）或 "postmessage"（后台注入，冒险岛无效）
             on_log: 日志回调 (message: str) -> None
         """
-        self._kb = KeyboardController(mode=mode, on_log=on_log)  # 键盘控制器
+        self._kb = KeyboardController(on_log=on_log)  # 键盘控制器
         self._mouse = MouseController()  # 鼠标控制器
 
     # =========================================================================
@@ -69,9 +63,6 @@ class ActionExecutor:
 
     def set_target_window(self, hwnd: int):
         """设置目标窗口句柄，同时传给键盘和鼠标控制器。
-
-        PostMessage 后台模式只需绑定窗口句柄，按键消息直接投递到窗口，
-        无需激活游戏窗口到前台。
 
         Args:
             hwnd: Windows 窗口句柄

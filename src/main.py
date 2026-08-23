@@ -106,9 +106,8 @@ class Automation:
 
         # ---- 执行层 ----
         # 聚合键盘 + 鼠标控制器；on_log 用于上报按键注入结果（是否已锁定窗口等）
-        # 按键模式取自配置: sendinput=前台真实按键(冒险岛有效) / postmessage=后台注入
+        # 使用 SendInput 驱动层模拟真实全局按键，游戏窗口必须在前台
         self.executor = ActionExecutor(
-            mode=getattr(config, "keyboard_mode", "sendinput"),
             on_log=on_log or (lambda m: None),
         )
 
@@ -160,7 +159,7 @@ class Automation:
 
         锁定后：
         1. ScreenCapture 可以截取该窗口画面
-        2. ActionExecutor 的 PostMessage 会注入到该窗口
+        2. ActionExecutor 的 SendInput 会注入到该窗口
 
         Returns:
             锁定后的窗口标题（用于确认）
