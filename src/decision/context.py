@@ -76,14 +76,9 @@ from .distance import (
 ATTACK_RANGE_X = 200
 """攻击范围默认值：自身与怪物 X 坐标差小于此值才开始攻击（像素）。
 
+长手/短手共用 config.attack_range 这一个数值；
 实际生效值取 config.attack_range（用户可在配置/UI 调整），
 此常量仅作 __init__ 里的兜底默认值。
-"""
-
-MELEE_ATTACK_RANGE_X = 40
-"""短手攻击范围默认值：近战模式下的默认攻击距离（像素）。
-
-实际生效值取 config.melee_attack_range。
 """
 
 ROPE_SEARCH_RANGE_X = 200
@@ -317,6 +312,13 @@ class DecisionEngine:
 
         self._target_monster = target
 
+        # ---- 短手（近战）走独立攻击流程，长手走远程流程 ----
+        # 近战判定与远程完全不同：必须贴脸才打，未贴脸就径直追上，
+        # 攻击中怪物走远立即转为追击，没有远程的"站定攻击+大滞回"。
+        if getattr(self.config, "attack_type", "long") == "short":
+            self._handle_melee(ctx, target)
+            return
+
         mx, my = target.center
 
         # ---- 攻击判定（规则1/2/3/4）----
@@ -393,6 +395,112 @@ class DecisionEngine:
         self._release_move()
         self._fsm.transition(State.IDLE)
         self._explore(ctx)
+
+    # =========================================================================
+    # 短手（近战）独立攻击流程
+    # =========================================================================
+
+    def _handle_melee(self, ctx: Context, target: Detection):
+        """短手（近战）独立攻击判定。
+
+        与长手（远程）完全不同，核心是【贴脸】:
+          - 未贴脸（水平差 > melee_attack_range）→ 不攻击，径直走向怪物贴身
+          - 贴脸（水平差 ≤ melee_attack_range 且同平台）→ 停止移动，转向 + 攻击
+          - 攻击中怪物走远 → 下一帧判定未贴脸 → 立即转为追击，不停在原地空打
+        没有远程那套"站定攻击 + 大滞回窗口"的逻辑。
+        """
+        if target is None:
+            self._target_monster = None
+            self._attack_stale_counter = 0
+            self._release_move()
+            self._fsm.transition(State.IDLE)
+            self._explore(ctx)
+            return
+
+        foot = ctx.self_position
+        if foot is None:
+            # 无法定位自身 → 无法判断贴脸，转探索避免盲打
+            self._target_monster = None
+            self._attack_stale_counter = 0
+            self._release_move()
+            self._fsm.transition(State.IDLE)
+            self._explore(ctx)
+            return
+
+        sx, sy = foot
+        mx = target.center[0]
+        mfoot_y = target.y + target.h
+        dx = abs(sx - mx)
+        dy = abs(sy - mfoot_y)
+        melee_range = self._get_attack_range()
+        ry = getattr(self.config, "attack_range_y", 60)
+
+        # 不同平台：放弃该目标（与长手一致，不跨层）
+        if dy > ry:
+            self._target_monster = None
+            self._attack_stale_counter = 0
+            self._release_move()
+            self._fsm.transition(State.IDLE)
+            self._explore(ctx)
+            return
+
+        # 未贴脸 → 追击（直接走向怪物，不转向不攻击）
+        if dx > melee_range:
+            self._fsm.transition(State.CHASING)
+            self._melee_chase(ctx, target)
+            return
+
+        # 已贴脸 → 转向 + 攻击
+        self._fsm.transition(State.ATTACKING)
+        self._melee_attack(ctx, target)
+
+    def _melee_chase(self, ctx: Context, target: Detection):
+        """近战贴身追击：径直走向怪物，直到进入贴脸距离。"""
+        if ctx.self_position is None:
+            self._release_move()
+            return
+        sx = ctx.self_position[0]
+        tx = target.center[0]
+        melee_range = self._get_attack_range()
+
+        if self._stuck_counter >= STUCK_FRAMES:
+            self._log("[近战] 卡住了，尝试跳跃")
+            self._release_move()
+            self.executor.press_key(self.config.jump_key, cooldown=1.0)
+            self._stuck_counter = 0
+            return
+
+        # 走到贴脸距离-5px 处停下（留余量，避免在边界来回蹭）
+        stop_at = max(5, melee_range - 5)
+        if tx > sx + stop_at:
+            self._hold_move("right")
+        elif tx < sx - stop_at:
+            self._hold_move("left")
+        else:
+            self._release_move()
+
+    def _melee_attack(self, ctx: Context, target: Detection):
+        """近战攻击：贴脸时转向面向怪物并释放技能。"""
+        self._release_move()  # 攻击时站定
+
+        # 转向：怪物在右→按右键，怪物在左→按左键
+        if target is not None and ctx.self_position is not None:
+            sx = ctx.self_position[0]
+            dx = target.center[0] - sx
+            need = None
+            if dx > FACE_TURN_X:
+                need = "right"
+            elif dx < -FACE_TURN_X:
+                need = "left"
+            if need is not None and need != self._face_dir:
+                if self.executor.press_key(need, cooldown=0.3):
+                    self._face_dir = need
+                    self._log(
+                        f"[朝向] 怪物在{'右' if need == 'right' else '左'}"
+                        f"({dx:+d}px)，按{need}转向"
+                    )
+
+        self._cast_skill()
 
     # =========================================================================
     # 按住移动
