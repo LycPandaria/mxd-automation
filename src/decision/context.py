@@ -376,22 +376,15 @@ class DecisionEngine:
                 self._chase(ctx, target)
             return
 
-        # 不同平台：基于 YOLO 识别内容判断附近是否有绳索，有就上绳。
-        # 无论路径推算结果是 rope/jump/unreachable，只要附近有可达绳索
-        # 就先爬绳（优先用规划选定的绳，回退找最近绳索）。
-        if self._try_climb(ctx, target, est.climb_rope):
-            self._fsm.transition(State.CLIMBING)
-            return
-
-        # 附近无绳索 → 按路径推算结果处理
-        if est.path_type == "jump":
-            self._fsm.transition(State.CHASING)
-            self._jump_chase(ctx, target, est)
-            return
-
-        # 兜底：路径推算失败（找不到平台/绳索）→ 朝怪物水平方向移动靠近
-        self._fsm.transition(State.CHASING)
-        self._chase(ctx, target)
+        # 不同平台：直接放弃该目标，只打同平台怪物。
+        # 不爬绳、不跳跃、不兜底追击——目标在另一层时当前层打不到，
+        # 跨层追过去成本高且容易卡地形。释放移动转探索，
+        # 等画面里出现同平台怪物再攻击。
+        self._target_monster = None
+        self._attack_stale_counter = 0
+        self._release_move()
+        self._fsm.transition(State.IDLE)
+        self._explore(ctx)
 
     # =========================================================================
     # 按住移动
@@ -429,16 +422,22 @@ class DecisionEngine:
 
         优先沿用已锁定目标：只要同一只怪仍在画面中就继续打它，
         避免 YOLO 帧间检测波动导致目标来回切换、攻击刚触发就中断；
-        已锁定目标消失/被击杀/残影超时后，才重新选离角色最近的一只。
-        首次选目标时按"最近"原则（_pick_best_target）。
+        已锁定目标消失/被击杀/残影超时/离开同平台后，才重新选目标。
+        首次选目标时按"同平台最近"原则（_pick_best_target）。
 
         Returns:
-            当前应攻击的怪物；若画面中有怪，必定返回一个。
+            当前应攻击的怪物；若画面中没有同平台怪，返回 None。
         """
         if self._target_monster is not None:
             for m in ctx.monsters:
                 if self._is_same_monster(self._target_monster, m):
+                    # 锁定目标仍在画面，但已不在角色同一平台
+                    # （跨层/掉下平台）→ 放弃锁定，只打同层怪
+                    if ctx.self_position is not None and not self._same_platform(
+                            ctx.self_position[1], m.y + m.h):
+                        break
                     return m
+            self._target_monster = None
         return self._pick_best_target(ctx)
 
     def _is_same_monster(self, a: Detection, b: Detection) -> bool:
@@ -455,19 +454,17 @@ class DecisionEngine:
 
     def _pick_best_target(self, ctx: Context,
                           exclude: Optional[Detection] = None) -> Detection:
-        """选择离角色最近的怪物。
+        """选择离角色最近的【同平台】怪物。
 
-        距离计算规则（与 exe 界面"垂直容差px"设置联动）：
-        - 角色脚底（名字中心）与怪物脚底（bbox 底部）的垂直差 ≤
-          垂直容差（attack_range_y）→ 视为同一平台（站在同一条地面线），
-          距离只算水平方向：dx = |角色x - 怪物中心x|
-        - 否则视为不同平台，按城市距离（曼哈顿距离）计算：
-          距离 = 水平距离 + 垂直距离
+        只打同平台的怪：角色脚底（名字中心）与怪物脚底（bbox 底部）
+        的垂直差 ≤ 垂直容差（attack_range_y，exe 界面"垂直容差px"）
+        才视为可攻击目标，距离只算水平方向：dx = |角色x - 怪物中心x|。
+        跨层怪物直接忽略（不爬绳/不跳跃/不追击），画面里没有同平台怪
+        时返回 None，转探索等自己走到那一层再打。
+
         说明：同平台必须用"脚底 vs 脚底"。若用"角色中心y vs 怪物bbox中心y"，
         高大怪物（如 150px 高）的中心点比角色中心高出 40~50px，
         超过 30px 容差 → 同平台的怪被误判为跨层 → 一直爬绳/跳跃/乱跑不攻击。
-        不做路径可达性过滤——即便隔层/需爬绳，也先锁定最近的怪，
-        由 _handle_monsters 决定如何到达（同层追击/爬绳/跳跃）。
         无法定位自身时回退为画面中最大的怪物。
 
         Args:
@@ -486,21 +483,19 @@ class DecisionEngine:
         if player is None:
             return max(monsters, key=lambda d: d.w * d.h)
 
+        # 【只打同平台】仅考虑与角色在同一平台的怪物：
+        # 脚底垂直差 ≤ 垂直容差（attack_range_y）。
+        # 跨层怪物直接忽略——不爬绳不跳跃，等角色自己走到那层再打。
         best = None
         best_dist = float("inf")
         for m in monsters:
-            mx = m.center[0]
             mfoot = m.y + m.h  # 怪物脚底（bbox 底部）
-            dx = abs(player[0] - mx)
-            if self._same_platform(player[1], mfoot):
-                # 同一平台：只看水平距离
-                d = dx
-            else:
-                # 不同平台：城市距离 = 水平 + 垂直
-                d = dx + abs(player[1] - mfoot)
-            if d < best_dist:
+            if not self._same_platform(player[1], mfoot):
+                continue
+            dx = abs(player[0] - m.center[0])
+            if dx < best_dist:
                 best = m
-                best_dist = d
+                best_dist = dx
         return best
 
     # =========================================================================
@@ -528,8 +523,9 @@ class DecisionEngine:
 
         入参为"角色x"与"怪物中心x"，水平差 ≤ 配置的
         attack_range（exe 界面"攻击距离px"）即视为可攻击。
+        用 <= 而非 <，让边界情况（刚好等于攻击距离）也能攻击。
         """
-        return abs(sx - tx) < self.config.attack_range
+        return abs(sx - tx) <= self.config.attack_range
 
     def _same_platform(self, y1: int, y2: int) -> bool:
         """判断两个纵坐标是否在同一平台（规则1：垂直容差内）。
@@ -560,14 +556,13 @@ class DecisionEngine:
         ry = getattr(self.config, "attack_range_y", 60)
 
         # 硬阈值：同平台 + 在攻击距离内
-        if dx < self.config.attack_range and dy <= ry:
+        if dx <= self.config.attack_range and dy <= ry:
             return True
-        # 滞回：攻击中轻微超出（怪物中心/bbox 波动、OCR 抖动）不中断
-        # 滞回窗口 = attack_range + min(30, attack_range * 0.3)，
-        # 攻击距离设得小时滞回也相应缩小，避免"设20px却能打到80px外"
+        # 滞回：攻击中轻微超出（怪物中心/bbox 波动、OCR 抖动、角色攻击位移）不中断
+        # 滞回窗口固定 +60px（与攻击距离解耦），防止攻击距离设得小时
+        # 角色一转身/怪物一后退就退出攻击 → 一直追击不攻击。
         if self._fsm.current == State.ATTACKING:
-            hysteresis = self.config.attack_range + min(30, int(self.config.attack_range * 0.3))
-            if dx < hysteresis and dy <= ry + 20:
+            if dx <= self.config.attack_range + 60 and dy <= ry + 40:
                 return True
         return False
 
@@ -608,7 +603,8 @@ class DecisionEngine:
         else:
             # 已贴近目标：若仍在攻击范围外，则保持原方向小步逼近；
             # 已进入攻击范围则停止，交给攻击判定。
-            if self._in_attack_range(sx, tx):
+            # 追击停止阈值比攻击距离大 10px，防止在边缘来回横跳。
+            if abs(sx - tx) <= self.config.attack_range + 10:
                 self._release_move()
             else:
                 # 保持当前朝向逼近（不翻转），避免边缘抖动左右跑
@@ -662,16 +658,14 @@ class DecisionEngine:
             elif dx < -FACE_TURN_X:
                 need = "left"
             if need is not None and need != self._face_dir:
-                # 朝向不对 → 本帧只按方向键转向，不放技能。
-                # 下一帧方向生效后 _face_dir 已更新，不会再进这个分支，
-                # 技能才会打出去，确保面对面攻击不空放。
+                # 朝向不对 → 先转向，然后继续释放技能。
+                # 冒险岛转向和攻击可在同一帧完成，不需要等下一帧。
                 if self.executor.press_key(need, cooldown=0.3):
                     self._face_dir = need
                     self._log(
                         f"[朝向] 怪物在{'右' if need == 'right' else '左'}"
-                        f"({dx:+d}px)，按{need}转向，下一帧攻击"
+                        f"({dx:+d}px)，按{need}转向"
                     )
-                return
 
         self._cast_skill()
 

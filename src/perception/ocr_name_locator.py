@@ -51,12 +51,13 @@ class OCRNameLocator:
     冒险岛角色名字显示在脚下，名字中心 ≈ 脚底；
     角色中心点 = 名字中心向上延伸"人物高度一半"。
 
-    每帧调用 locate()，内部有帧间隔控制（默认每 30 帧执行一次 OCR）。
+    每帧调用 locate()。为提升定位更新频率，优先在"上次位置附近的小窗口"
+    内 OCR（小图识别快，几十 ms/次），找不到再回退全屏搜索区域。
     同时返回角色中心点和脚底坐标。
 
     Args:
         character_height: 人物高度像素数，默认 60；角色中心 = 名字中心 - 高度一半
-        ocr_interval:     OCR 执行间隔（帧数），默认 30 帧
+        ocr_interval:     保留参数（不再按帧节流，每帧都尝试定位）
         exact_match:      是否精确匹配名字（True=完全相等，False=包含即可）
         on_log:           日志回调
     """
@@ -99,6 +100,13 @@ class OCRNameLocator:
         self._stale_counter = 0
         self._stale_threshold = 10
 
+        # 局部搜索窗口：优先在上次位置附近的小窗口内 OCR。
+        # 小图识别快（几十 ms）→ 定位可每帧高频更新，角色移动时
+        # 坐标变动更及时；且窗口外区域（聊天框/UI 同名文本）天然
+        # 被排除，误识别更少。窗口内找不到再回退全屏搜索区域。
+        self._window_w = 640
+        self._window_h = 400
+
     # ---- 公开接口 ----
 
     def locate(self, frame: np.ndarray, name: str,
@@ -131,12 +139,32 @@ class OCRNameLocator:
         if engine is None:
             return None
 
-        # 裁剪搜索区域（加速 OCR）
+        h, w = frame.shape[:2]
+
+        # ---- 1. 优先在"上次位置附近的局部窗口"内搜索 ----
+        # 角色每帧移动最多几十px，以上次脚底为中心裁一个小窗口即可覆盖。
+        # 小图 OCR 快得多（几十 ms/次）→ 定位可每帧高频更新，角色移动
+        # 时坐标变动更及时；且窗口外区域（聊天框/UI 同名文本）被天然排除。
+        # 窗口内找不到（换图/瞬移/被遮挡）再回退全屏搜索区域。
+        if self._last_foot is not None:
+            win_w = min(self._window_w, w)
+            win_h = min(self._window_h, h)
+            cx, cy = self._last_foot
+            x1 = max(0, min(w - win_w, cx - win_w // 2))
+            y1 = max(0, min(h - win_h, cy - win_h // 2))
+            roi = frame[y1:y1 + win_h, x1:x1 + win_w]
+            found = self._match_in_roi(engine, roi, name, min_confidence, x1, y1)
+            if found is not None:
+                center, foot = found
+                self._last_center = center
+                self._last_foot = foot
+                return (*center, *foot)
+
+        # ---- 2. 回退：全屏搜索区域 ----
         roi = frame
         offset_x, offset_y = 0, 0
         if search_region is not None:
             sx, sy, sw, sh = search_region
-            h, w = frame.shape[:2]
             x1 = max(0, sx)
             y1 = max(0, sy)
             x2 = min(w, sx + sw)
@@ -146,7 +174,28 @@ class OCRNameLocator:
             roi = frame[y1:y2, x1:x2]
             offset_x, offset_y = x1, y1
 
-        # 执行 OCR（引擎执行异常时降级返回 None，不让异常扩散到主循环）
+        found = self._match_in_roi(engine, roi, name, min_confidence, offset_x, offset_y)
+        if found is None:
+            return None
+        center, foot = found
+        self._last_center = center
+        self._last_foot = foot
+        return (*center, *foot)
+
+    def _match_in_roi(self, engine, roi, name, min_confidence,
+                      offset_x, offset_y):
+        """在裁剪区域 roi 内执行 OCR 并匹配名字。
+
+        Args:
+            engine:       RapidOCR 引擎
+            roi:          裁剪后的图片
+            name:         角色名
+            min_confidence: 最低置信度
+            offset_x, offset_y: roi 左上角在整帧中的偏移
+
+        Returns:
+            (center, foot) 或 None（未匹配到）
+        """
         try:
             result, _ = engine(roi)
         except Exception as e:
@@ -155,7 +204,7 @@ class OCRNameLocator:
         if result is None:
             return None
 
-        # 匹配名字：取置信度最高的候选（和 YOLO 一样，每帧独立计算，无缓存）
+        # 匹配名字：取置信度最高的候选
         best = None
         best_conf = 0.0
         for box, text, confidence in result:
@@ -179,7 +228,7 @@ class OCRNameLocator:
         # 角色中心 = 名字中心向上延伸"人物高度一半"（-30px）
         center = (name_cx, name_cy - self._character_height // 2)
 
-        return (*center, *foot)
+        return center, foot
 
     def locate_all(self, frame: np.ndarray,
                    min_confidence: float = 0.5) -> list:
