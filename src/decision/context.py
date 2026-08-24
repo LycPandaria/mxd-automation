@@ -80,6 +80,12 @@ ATTACK_RANGE_X = 200
 此常量仅作 __init__ 里的兜底默认值。
 """
 
+MELEE_ATTACK_RANGE_X = 40
+"""短手攻击范围默认值：近战模式下的默认攻击距离（像素）。
+
+实际生效值取 config.melee_attack_range。
+"""
+
 ROPE_SEARCH_RANGE_X = 200
 """搜索绳索的水平范围（像素）"""
 
@@ -359,6 +365,8 @@ class DecisionEngine:
                 f"(垂直差{vy} 容差{getattr(self.config, 'attack_range_y', 60)}) "
                 f"路径={est.path_type} 距离={est.distance}px "
                 f"(水平={abs(px - mx)})"
+                f" [{('短手' if getattr(self.config, 'attack_type', 'long') == 'short' else '长手')}"
+                f"有效攻击距={self._get_attack_range()}px]"
                 + (f" 绳长={est.rope_length}" if est.path_type == "rope" else "")
                 + (f" 跳数={est.jump_count}" if est.path_type == "jump" else "")
                 + f"){plan_str}"
@@ -518,14 +526,21 @@ class DecisionEngine:
     # 攻击范围判定
     # =========================================================================
 
-    def _in_attack_range(self, sx: int, tx: int) -> bool:
-        """判断是否在攻击距离内（规则2：水平距离 ≤ attack_range）。
+    def _get_attack_range(self) -> int:
+        """根据攻击类型返回当前生效的攻击距离（像素）。
 
-        入参为"角色x"与"怪物中心x"，水平差 ≤ 配置的
-        attack_range（exe 界面"攻击距离px"）即视为可攻击。
-        用 <= 而非 <，让边界情况（刚好等于攻击距离）也能攻击。
+        短手(近战)模式使用 melee_attack_range，长手模式使用 attack_range。
         """
-        return abs(sx - tx) <= self.config.attack_range
+        if getattr(self.config, "attack_type", "long") == "short":
+            return getattr(self.config, "melee_attack_range", MELEE_ATTACK_RANGE_X)
+        return self.config.attack_range
+
+    def _in_attack_range(self, sx: int, tx: int) -> bool:
+        """判断是否在攻击距离内（规则2：水平距离 ≤ 当前生效攻击距离）。
+
+        短手模式使用 melee_attack_range，长手模式使用 attack_range。
+        """
+        return abs(sx - tx) <= self._get_attack_range()
 
     def _same_platform(self, y1: int, y2: int) -> bool:
         """判断两个纵坐标是否在同一平台（规则1：垂直容差内）。
@@ -540,7 +555,8 @@ class DecisionEngine:
         """综合攻击判定（规则1/2 + 滞回防抖）。
 
         - 规则1: 同一平台 = 角色脚底y 与 怪物脚底y(bbox底部) 垂直差 ≤ 容差
-        - 规则2: 攻击距离 = 角色x 与 怪物中心x 水平差 ≤ attack_range
+        - 规则2: 攻击距离 = 角色x 与 怪物中心x 水平差 ≤ 当前生效攻击距离
+          (短手用 melee_attack_range, 长手用 attack_range)
         攻击中（FSM 处于 ATTACKING）且轻微超限时仍允许攻击，
         避免 OCR/YOLO 帧间几像素抖动导致"攻击刚触发就中断、来回跑"。
         目标已明显离开（超过滞回窗口）才判定不可攻击。
@@ -554,15 +570,16 @@ class DecisionEngine:
         dx = abs(sx - mx)
         dy = abs(sy - mfoot)
         ry = getattr(self.config, "attack_range_y", 60)
+        attack_range = self._get_attack_range()
 
         # 硬阈值：同平台 + 在攻击距离内
-        if dx <= self.config.attack_range and dy <= ry:
+        if dx <= attack_range and dy <= ry:
             return True
         # 滞回：攻击中轻微超出（怪物中心/bbox 波动、OCR 抖动、角色攻击位移）不中断
-        # 滞回窗口固定 +60px（与攻击距离解耦），防止攻击距离设得小时
-        # 角色一转身/怪物一后退就退出攻击 → 一直追击不攻击。
+        # 滞回窗口: 长手 +60px, 短手 +20px (近战不需要那么大滞回)
         if self._fsm.current == State.ATTACKING:
-            if dx <= self.config.attack_range + 60 and dy <= ry + 40:
+            hysteresis = 60 if getattr(self.config, "attack_type", "long") == "long" else 20
+            if dx <= attack_range + hysteresis and dy <= ry + 40:
                 return True
         return False
 
@@ -573,8 +590,9 @@ class DecisionEngine:
     def _chase(self, ctx: Context, target: Detection):
         """按住方向键持续走向怪物（同一平台内直线接近）。
 
-        到达攻击范围前不松手（按住方向键移动），进入攻击范围后
-        由上层切换为攻击状态并释放方向键。
+        长手模式: 到达 attack_range 前不松手，进入攻击范围后释放方向键。
+        短手模式: 到达 melee_attack_range 前不松手，需要走到贴脸距离才停。
+
         贴近目标后保持朝向（不翻转），交给攻击判定，避免原地乱跑抖动。
         """
         if ctx.self_position is None:
@@ -582,6 +600,8 @@ class DecisionEngine:
             return
         sx = ctx.self_position[0]
         tx = target.center[0]
+        attack_range = self._get_attack_range()
+        is_melee = getattr(self.config, "attack_type", "long") == "short"
 
         if self._stuck_counter >= STUCK_FRAMES:
             self._log("[追击] 卡住了，尝试跳跃")
@@ -591,11 +611,12 @@ class DecisionEngine:
             return
 
         # ---- 方向滞回：x 差超过死区才切换方向 ----
-        # OCR 定位每帧有抖动，若在 ±10px 边缘判断，方向会在左右间快速翻转，
-        # 角色表现为"到处乱跑"。死区放大后：
-        #   dx > DEAD_ZONE → 向右走；dx < -DEAD_ZONE → 向左走；
-        #   中间 → 已极近目标，保持当前朝向不再移动（等攻击判定）。
-        dead_zone = min(30, max(15, self.config.attack_range // 4))
+        # 短手模式死区更小（近战需要更精确对位），长手模式保持原有逻辑
+        if is_melee:
+            dead_zone = min(15, max(8, attack_range // 3))
+        else:
+            dead_zone = min(30, max(15, self.config.attack_range // 4))
+
         if tx > sx + dead_zone:
             self._hold_move("right")
         elif tx < sx - dead_zone:
@@ -603,8 +624,9 @@ class DecisionEngine:
         else:
             # 已贴近目标：若仍在攻击范围外，则保持原方向小步逼近；
             # 已进入攻击范围则停止，交给攻击判定。
-            # 追击停止阈值比攻击距离大 10px，防止在边缘来回横跳。
-            if abs(sx - tx) <= self.config.attack_range + 10:
+            # 追击停止阈值: 长手在攻击范围+10px 处停下，短手在攻击范围+5px 处停下
+            stop_margin = 5 if is_melee else 10
+            if abs(sx - tx) <= attack_range + stop_margin:
                 self._release_move()
             else:
                 # 保持当前朝向逼近（不翻转），避免边缘抖动左右跑
@@ -617,14 +639,17 @@ class DecisionEngine:
     def _attack(self, ctx: Context, target: Detection):
         """在攻击范围内原地释放技能（攻击时不移动）。
 
+        长手模式: 在攻击距离外原地释放远程技能。
+        短手模式: 在极近距离释放近战技能，角色贴脸攻击。
+
         攻击前【每次】都判断怪物在角色左边还是右边，然后执行对应方向键
         转向（怪物在右 → 按右键，怪物在左 → 按左键），确保角色面向怪物
         后技能才能打中。短按（约30ms）只转向不位移；冷却 0.2s 防止攻击
         状态每帧狂按方向键抖动。
 
         【距离守卫】攻击前统一校验：必须满足两个条件才发动攻击：
-        1. 同一平台：垂直差 ≤ attack_range_y（exe 界面"垂直容差px"）
-        2. 水平差 < attack_range（"攻击距离px"）
+        1. 同一平台：垂直差 ≤ attack_range_y
+        2. 水平差 < 当前生效攻击距离
         否则直接放弃攻击（不释放技能），避免怪物不在附近时一直空打。
         """
         self._release_move()  # 攻击时保持不动

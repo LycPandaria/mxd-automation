@@ -75,6 +75,8 @@ class MainWindow(QMainWindow):
         # 攻击距离修改时实时同步到 YAML
         self.attack_range_spin.valueChanged.connect(self._on_attack_range_changed)
         self.attack_range_y_spin.valueChanged.connect(self._on_attack_range_y_changed)
+        self.attack_type_combo.currentIndexChanged.connect(self._on_attack_type_changed)
+        self.melee_range_spin.valueChanged.connect(self._on_melee_range_changed)
 
         self.log_signal.connect(self._on_log)
         self.frame_signal.connect(self._on_frame)
@@ -279,6 +281,30 @@ class MainWindow(QMainWindow):
         box = QGroupBox("战斗设置")
         v = QVBoxLayout(box)
 
+        # 攻击类型 (长手/短手)
+        type_row = QHBoxLayout()
+        type_row.addWidget(QLabel("攻击类型:"))
+        self.attack_type_combo = QComboBox()
+        self.attack_type_combo.addItem("长手 (远程攻击)", "long")
+        self.attack_type_combo.addItem("短手 (近战攻击)", "short")
+        self.attack_type_combo.setToolTip(
+            "长手: 远程职业(弓/弩/法), 在较远距离攻击\n"
+            "短手: 近战职业(战/盗), 贴近怪物才能攻击"
+        )
+        self.attack_type_combo.setFixedWidth(140)
+        type_row.addWidget(self.attack_type_combo)
+
+        type_row.addWidget(QLabel("近战距离px:"))
+        self.melee_range_spin = QSpinBox()
+        self.melee_range_spin.setRange(10, 200)
+        self.melee_range_spin.setValue(40)
+        self.melee_range_spin.setToolTip("短手模式下的攻击距离（像素），建议 20~60")
+        self.melee_range_spin.setFixedWidth(70)
+        type_row.addWidget(self.melee_range_spin)
+
+        type_row.addStretch()
+        v.addLayout(type_row)
+
         # 跳跃键、攻击距离、垂直容差 合成一行3个
         row = QHBoxLayout()
         row.addWidget(QLabel("跳跃键:"))
@@ -384,6 +410,11 @@ class MainWindow(QMainWindow):
                 f"w={c.mp_region[2]:.1%} h={c.mp_region[3]:.1%}"
             )
         self.jump_key_edit.setText(c.jump_key)
+        # 攻击类型
+        atk_type = getattr(c, "attack_type", "long")
+        idx = self.attack_type_combo.findData(atk_type)
+        self.attack_type_combo.setCurrentIndex(idx if idx >= 0 else 0)
+        self.melee_range_spin.setValue(int(getattr(c, "melee_attack_range", 40)))
         self.attack_range_spin.setValue(int(getattr(c, "attack_range", 200)))
         self.attack_range_y_spin.setValue(int(getattr(c, "attack_range_y", 60)))
         # 拾取
@@ -420,6 +451,8 @@ class MainWindow(QMainWindow):
         c.mp_key = self.mp_key_edit.text().strip()
         c.mp_threshold = self.mp_thr_spin.value() / 100
         c.jump_key = self.jump_key_edit.text().strip() or "alt"
+        c.attack_type = self.attack_type_combo.currentData()
+        c.melee_attack_range = self.melee_range_spin.value()
         c.attack_range = self.attack_range_spin.value()
         c.attack_range_y = self.attack_range_y_spin.value()
         # 拾取
@@ -465,6 +498,16 @@ class MainWindow(QMainWindow):
     def _on_attack_range_y_changed(self, value):
         """垂直容差微调框变化时，实时同步到 config 并保存到 YAML。"""
         self.config.attack_range_y = value
+        save_user_config(self.config)
+
+    def _on_attack_type_changed(self, index):
+        """攻击类型切换时，实时同步到 config 并保存到 YAML。"""
+        self.config.attack_type = self.attack_type_combo.currentData()
+        save_user_config(self.config)
+
+    def _on_melee_range_changed(self, value):
+        """近战距离微调框变化时，实时同步到 config 并保存到 YAML。"""
+        self.config.melee_attack_range = value
         save_user_config(self.config)
 
     # ---------------- 事件处理 ----------------
