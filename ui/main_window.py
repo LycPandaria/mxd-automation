@@ -406,7 +406,8 @@ class MainWindow(QMainWindow):
         atk_type = getattr(c, "attack_type", "long")
         idx = self.attack_type_combo.findData(atk_type)
         self.attack_type_combo.setCurrentIndex(idx if idx >= 0 else 0)
-        self._sync_distance_ui()
+        # 长手/短手共用同一个攻击距离 attack_range
+        self.distance_spin.setValue(int(getattr(c, "attack_range", 200)))
         self.attack_range_y_spin.setValue(int(getattr(c, "attack_range_y", 60)))
         # 拾取
         self.pickup_checkbox.setChecked(getattr(c, "pickup_enabled", True))
@@ -443,10 +444,7 @@ class MainWindow(QMainWindow):
         c.mp_threshold = self.mp_thr_spin.value() / 100
         c.jump_key = self.jump_key_edit.text().strip() or "alt"
         c.attack_type = self.attack_type_combo.currentData()
-        if c.attack_type == "short":
-            c.melee_attack_range = self.distance_spin.value()
-        else:
-            c.attack_range = self.distance_spin.value()
+        c.attack_range = self.distance_spin.value()  # 长手/短手共用攻击距离
         c.attack_range_y = self.attack_range_y_spin.value()
         # 拾取
         c.pickup_enabled = self.pickup_checkbox.isChecked()
@@ -496,26 +494,25 @@ class MainWindow(QMainWindow):
         save_user_config(self.config)
 
     def _sync_distance_ui(self):
-        """根据攻击类型切换距离标签、范围和数值，并保存到对应变量。"""
-        self.distance_spin.blockSignals(True)
+        """根据攻击类型切换距离提示文字（数值共用 attack_range，保持不变）。"""
         if self.config.attack_type == "short":
-            self.distance_label.setText("近战距离px:")
-            self.distance_spin.setRange(10, 200)
-            self.distance_spin.setValue(int(getattr(self.config, "melee_attack_range", 40)))
-            self.distance_spin.setToolTip("短手模式下的攻击距离（像素），建议 20~60")
+            self.distance_label.setText("攻击距离px:")
+            self.distance_spin.setToolTip(
+                "短手(近战): 与怪物水平差≤此值判定为贴脸可攻击；"
+                "未贴脸径直追上，怪物走远立即追击"
+            )
         else:
             self.distance_label.setText("攻击距离px:")
-            self.distance_spin.setRange(10, 800)
-            self.distance_spin.setValue(int(getattr(self.config, "attack_range", 200)))
-            self.distance_spin.setToolTip("人物与怪物水平差小于此值才触发攻击")
-        self.distance_spin.blockSignals(False)
+            self.distance_spin.setToolTip(
+                "长手(远程): 与怪物水平差≤此值才触发攻击，攻击中轻微波动不中断"
+            )
 
     def _on_distance_changed(self, value):
-        """距离微调框变化时，按攻击类型保存到对应变量。"""
-        if self.config.attack_type == "short":
-            self.config.melee_attack_range = value
-        else:
-            self.config.attack_range = value
+        """攻击距离微调框变化时，实时同步到 config 并保存到 YAML。
+
+        长手/短手共用同一个 attack_range。
+        """
+        self.config.attack_range = value
         save_user_config(self.config)
 
     # ---------------- 事件处理 ----------------

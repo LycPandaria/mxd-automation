@@ -404,10 +404,11 @@ class DecisionEngine:
         """短手（近战）独立攻击判定。
 
         与长手（远程）完全不同，核心是【贴脸】:
-          - 未贴脸（水平差 > melee_attack_range）→ 不攻击，径直走向怪物贴身
-          - 贴脸（水平差 ≤ melee_attack_range 且同平台）→ 停止移动，转向 + 攻击
+          - 未贴脸（水平差 > 攻击距离 attack_range）→ 不攻击，径直走向怪物贴身
+          - 贴脸（水平差 ≤ attack_range 且同平台）→ 停止移动，转向 + 攻击
           - 攻击中怪物走远 → 下一帧判定未贴脸 → 立即转为追击，不停在原地空打
         没有远程那套"站定攻击 + 大滞回窗口"的逻辑。
+        攻击距离与长手共用 config.attack_range。
         """
         if target is None:
             self._target_monster = None
@@ -635,18 +636,18 @@ class DecisionEngine:
     # =========================================================================
 
     def _get_attack_range(self) -> int:
-        """根据攻击类型返回当前生效的攻击距离（像素）。
+        """返回当前生效的攻击距离（像素）。
 
-        短手(近战)模式使用 melee_attack_range，长手模式使用 attack_range。
+        长手/短手共用同一个 attack_range 数值，切换的是攻击判定代码：
+        - 长手: 远程站定攻击（_can_attack/_chase/_attack）
+        - 短手: 近战贴脸攻击（_handle_melee/_melee_chase/_melee_attack）
         """
-        if getattr(self.config, "attack_type", "long") == "short":
-            return getattr(self.config, "melee_attack_range", MELEE_ATTACK_RANGE_X)
-        return self.config.attack_range
+        return getattr(self.config, "attack_range", ATTACK_RANGE_X)
 
     def _in_attack_range(self, sx: int, tx: int) -> bool:
         """判断是否在攻击距离内（规则2：水平距离 ≤ 当前生效攻击距离）。
 
-        短手模式使用 melee_attack_range，长手模式使用 attack_range。
+        长手/短手共用 attack_range，此处仅做水平距离判定。
         """
         return abs(sx - tx) <= self._get_attack_range()
 
@@ -662,9 +663,10 @@ class DecisionEngine:
     def _can_attack(self, ctx: Context, target: Detection) -> bool:
         """综合攻击判定（规则1/2 + 滞回防抖）。
 
+        仅长手(远程)模式走这里；短手(近战)走独立的 _handle_melee。
         - 规则1: 同一平台 = 角色脚底y 与 怪物脚底y(bbox底部) 垂直差 ≤ 容差
         - 规则2: 攻击距离 = 角色x 与 怪物中心x 水平差 ≤ 当前生效攻击距离
-          (短手用 melee_attack_range, 长手用 attack_range)
+          (长手/短手共用 attack_range)
         攻击中（FSM 处于 ATTACKING）且轻微超限时仍允许攻击，
         避免 OCR/YOLO 帧间几像素抖动导致"攻击刚触发就中断、来回跑"。
         目标已明显离开（超过滞回窗口）才判定不可攻击。
@@ -684,10 +686,9 @@ class DecisionEngine:
         if dx <= attack_range and dy <= ry:
             return True
         # 滞回：攻击中轻微超出（怪物中心/bbox 波动、OCR 抖动、角色攻击位移）不中断
-        # 滞回窗口: 长手 +60px, 短手 +20px (近战不需要那么大滞回)
+        # 滞回窗口: 长手 +60px (近战不走这里)
         if self._fsm.current == State.ATTACKING:
-            hysteresis = 60 if getattr(self.config, "attack_type", "long") == "long" else 20
-            if dx <= attack_range + hysteresis and dy <= ry + 40:
+            if dx <= attack_range + 60 and dy <= ry + 40:
                 return True
         return False
 
@@ -698,8 +699,8 @@ class DecisionEngine:
     def _chase(self, ctx: Context, target: Detection):
         """按住方向键持续走向怪物（同一平台内直线接近）。
 
+        仅长手(远程)模式走这里（短手走独立的 _melee_chase 贴脸追击）。
         长手模式: 到达 attack_range 前不松手，进入攻击范围后释放方向键。
-        短手模式: 到达 melee_attack_range 前不松手，需要走到贴脸距离才停。
 
         贴近目标后保持朝向（不翻转），交给攻击判定，避免原地乱跑抖动。
         """
