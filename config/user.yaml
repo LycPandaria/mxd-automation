@@ -37,7 +37,7 @@ mp_threshold: 0.5
 mp_key: pdn
 target_key: tab
 jump_key: c
-attack_range: 200
+attack_range: 30
 attack_range_y: 80
 skills:
 - name: 技能1

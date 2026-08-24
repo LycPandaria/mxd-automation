@@ -320,7 +320,13 @@ class DecisionEngine:
         # 攻击距离 = 水平方向 |角色x - 怪物中心x| ≤ 攻击距离px（规则2）
         foot = ctx.self_position
         if foot is None:
-            self._tab_attack(ctx, target)
+            # OCR 无法定位自身 → 无法判断距离，不能攻击
+            # 转入探索状态，避免盲打空放技能
+            self._target_monster = None
+            self._attack_stale_counter = 0
+            self._release_move()
+            self._fsm.transition(State.IDLE)
+            self._explore(ctx)
             return
         px, py = foot
         monster_foot = (mx, target.y + target.h)
@@ -557,8 +563,11 @@ class DecisionEngine:
         if dx < self.config.attack_range and dy <= ry:
             return True
         # 滞回：攻击中轻微超出（怪物中心/bbox 波动、OCR 抖动）不中断
+        # 滞回窗口 = attack_range + min(30, attack_range * 0.3)，
+        # 攻击距离设得小时滞回也相应缩小，避免"设20px却能打到80px外"
         if self._fsm.current == State.ATTACKING:
-            if dx < self.config.attack_range + 60 and dy <= ry + 40:
+            hysteresis = self.config.attack_range + min(30, int(self.config.attack_range * 0.3))
+            if dx < hysteresis and dy <= ry + 20:
                 return True
         return False
 
@@ -628,7 +637,11 @@ class DecisionEngine:
         # 不满足 → 直接放弃攻击，避免怪物不在附近时一直空打/乱跑。
         # 攻击中带滞回（_can_attack）：轻微抖动/怪物中心波动不中断攻击，
         # 防止"打一下就跑"的横跳。
-        if target is not None and ctx.self_position is not None:
+        if target is not None:
+            if ctx.self_position is None:
+                # OCR 无法定位自身 → 无法判断距离，放弃攻击
+                self._log("[攻击] 无法定位自身位置，放弃攻击")
+                return
             if not self._can_attack(ctx, target):
                 sx, sy = ctx.self_position
                 mx = target.center[0]
@@ -667,12 +680,16 @@ class DecisionEngine:
 
         与 _attack 相同的距离守卫：能拿到自身位置和目标时，
         水平差/垂直差超限就停止攻击，防止怪物不在附近空打。
+        无法定位自身时直接放弃攻击，不盲打。
         """
         self._release_move()
 
         # ---- 距离守卫（规则1/2）：脚底判同平台 + 中心x判攻击距离 ----
-        # 能定位自身时，不同平台或超距 → 不释放技能（不空打）
-        if target is not None and ctx.self_position is not None:
+        # 无法定位自身 → 放弃攻击（不盲打）
+        if target is not None:
+            if ctx.self_position is None:
+                self._log("[攻击] 无法定位自身位置，放弃攻击")
+                return
             if not self._can_attack(ctx, target):
                 sx, sy = ctx.self_position
                 mx = target.center[0]
