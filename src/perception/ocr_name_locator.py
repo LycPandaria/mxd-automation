@@ -40,6 +40,8 @@
   - 如果名字和其他文字重叠，可能匹配失败
   - character_height 需要根据角色实际高度调整（通常 50~70 像素）
 """
+import os
+import sys
 from typing import Callable, Optional, Tuple
 
 import numpy as np
@@ -272,7 +274,12 @@ class OCRNameLocator:
         return target in text
 
     def _get_engine(self):
-        """延迟初始化 RapidOCR 引擎。"""
+        """延迟初始化 RapidOCR 引擎。
+
+        PyInstaller 打包后，rapidocr_onnxruntime 的 config.yaml 和 ONNX 模型
+        需要作为数据文件包含在 _internal/rapidocr_onnxruntime/ 目录下。
+        如果初始化失败，会尝试在 sys._MEIPASS 下查找缺失的文件并给出诊断信息。
+        """
         if self._engine is not None:
             return self._engine if self._engine is not False else None
 
@@ -286,4 +293,36 @@ class OCRNameLocator:
         except Exception as e:
             self._on_log(f"[定位] RapidOCR 初始化失败: {e}")
             self._engine = False
+
+            if getattr(sys, "frozen", False):
+                self._diagnose_frozen_ocr()
+
             return None
+
+    def _diagnose_frozen_ocr(self):
+        """PyInstaller 冻结模式下的 OCR 诊断。
+
+        检查 sys._MEIPASS 下 rapidocr_onnxruntime 包的关键数据文件
+        是否存在，给出缺失文件列表，帮助定位打包遗漏。
+        """
+        meipass = getattr(sys, "_MEIPASS", "")
+        if not meipass:
+            return
+
+        pkg_dir = os.path.join(meipass, "rapidocr_onnxruntime")
+        if not os.path.isdir(pkg_dir):
+            self._on_log(f"[定位] 诊断: _internal 下未找到 rapidocr_onnxruntime 目录")
+            return
+
+        required = [
+            "config.yaml",
+            os.path.join("models", "ch_PP-OCRv4_det_infer.onnx"),
+            os.path.join("models", "ch_PP-OCRv4_rec_infer.onnx"),
+            os.path.join("models", "ch_ppocr_mobile_v2.0_cls_infer.onnx"),
+        ]
+        missing = [f for f in required if not os.path.isfile(os.path.join(pkg_dir, f))]
+        if missing:
+            self._on_log(f"[定位] 诊断: 缺失数据文件: {missing}")
+            self._on_log("[定位] 修复: 重新打包时添加 --collect-data rapidocr_onnxruntime")
+        else:
+            self._on_log("[定位] 诊断: 数据文件完整，初始化失败可能是其他原因")

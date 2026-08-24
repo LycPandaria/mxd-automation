@@ -69,16 +69,41 @@ YAML 配置字段说明
   skills:           技能列表 [{name, key, cooldown}, ...]
 """
 import os
+import sys
 from typing import List, Optional, Dict, Any, Tuple
 
 import yaml
 
 
 # ---- 路径常量 ----
-PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+def _base_dir() -> str:
+    """返回应用基础目录。
+
+    PyInstaller 打包后: sys._MEIPASS（_internal 目录）
+    开发环境:          PROJECT_ROOT（项目根目录）
+    """
+    if getattr(sys, "frozen", False):
+        return sys._MEIPASS
+    return os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+PROJECT_ROOT = _base_dir()
 CONFIG_DIR = os.path.join(PROJECT_ROOT, "config")
 DEFAULT_YAML_PATH = os.path.join(CONFIG_DIR, "user.yaml")
 DEFAULT_JSON_PATH = os.path.join(CONFIG_DIR, "user.json")
+
+
+def resolve_model_path(raw_path: str) -> str:
+    """解析模型路径。
+
+    - 绝对路径: 直接返回
+    - 相对路径: 相对于 PROJECT_ROOT 解析
+    - 在 PyInstaller 打包后，PROJECT_ROOT = sys._MEIPASS（_internal 目录）
+    """
+    if not raw_path:
+        return raw_path
+    if os.path.isabs(raw_path):
+        return raw_path
+    return os.path.normpath(os.path.join(PROJECT_ROOT, raw_path))
 
 
 def config_path() -> str:
@@ -155,7 +180,7 @@ def _defaults() -> Dict[str, Any]:
         "keyboard_mode": "sendinput",
         # ---- 模型 ----
         "confidence": 0.5,
-        "model_path": "assets/models/best.pt",
+        "model_path": "assets/models/best.onnx",
         # ---- 类别 ----
         "monster_classes": "monster",
         "floor_classes": "floor",

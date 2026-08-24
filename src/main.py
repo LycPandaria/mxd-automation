@@ -64,7 +64,7 @@ from .perception.hp_mp_detector import detect_bar_ratio
 from .perception.ocr_name_locator import OCRNameLocator
 from .execution.action_executor import ActionExecutor
 from .decision.context import Context, DecisionEngine
-from .utils.config_loader import Config
+from .utils.config_loader import Config, resolve_model_path
 
 
 class Automation:
@@ -100,8 +100,9 @@ class Automation:
         self.capture = ScreenCapture()  # 窗口截图（客户区 BitBlt）
 
         # 检测器：如果传了就用，否则根据配置自动创建（模型不存在时回退 Mock）
+        self.model_path = resolve_model_path(config.model_path)
         self.detector = detector if detector is not None else create_detector(
-            config.model_path, config.confidence, on_log or (lambda m: None)
+            self.model_path, config.confidence, on_log or (lambda m: None)
         )
 
         # ---- 执行层 ----

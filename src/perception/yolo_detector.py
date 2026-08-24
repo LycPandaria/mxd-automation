@@ -1,6 +1,7 @@
 """YOLO 目标检测。
 
-支持三种检测器:
+支持四种检测器:
+  - OnnxDetector: 进程内加载 ONNX 模型 (.onnx)，用 onnxruntime 推理（推荐，体积小）
   - YoloDetector:  进程内加载 ultralytics 模型 (.pt)
   - ExeDetector:   调用外部 EXE 程序，通过临时文件 + stdout JSON 通信
   - MockDetector:  占位检测器，返回空结果
@@ -57,7 +58,7 @@ class YoloDetector(Detector):
     """
 
     def __init__(self, model_path: str, conf: float = 0.5):
-        from ultralytics import YOLO
+        YOLO = __import__("ultralytics", fromlist=["YOLO"]).YOLO
         self.model = YOLO(model_path)
         self.conf = conf
         self._path = model_path  # 供上层判断是否需要重建检测器
@@ -74,6 +75,118 @@ class YoloDetector(Detector):
                     x=int(x1), y=int(y1),
                     w=int(x2 - x1), h=int(y2 - y1),
                 ))
+        return dets
+
+
+class OnnxDetector(Detector):
+    """基于 onnxruntime 的 YOLO 检测器（无需 torch/ultralytics，体积 ~200MB vs ~700MB）。
+
+    预处理:  letterbox resize → RGB → normalize → CHW → batch
+    后处理:  sigmoid scores → NMS → scale back to original frame
+
+    模型输出格式 (YOLOv8, end2end=False):
+      shape (1, 7, 8400)
+      7 = 4 (cx, cy, w, h in 640×640 pixel coords) + 3 (class logits: floor, monster, rope)
+    """
+
+    def __init__(self, model_path: str, conf: float = 0.5, iou: float = 0.45):
+        import onnxruntime as ort
+        self.session = ort.InferenceSession(model_path, providers=["CPUExecutionProvider"])
+        self.conf = conf
+        self.iou = iou
+        self._path = model_path
+
+        meta = self.session.get_modelmeta()
+        self._names = {0: "floor", 1: "monster", 2: "rope"}
+        if meta.custom_metadata_map:
+            import json
+            try:
+                self._names = json.loads(meta.custom_metadata_map.get("names", "{}"))
+                self._names = {int(k): v for k, v in self._names.items()}
+            except (json.JSONDecodeError, ValueError):
+                pass
+
+        self._input_name = self.session.get_inputs()[0].name
+        self._img_size = self.session.get_inputs()[0].shape[2]
+
+    def detect(self, frame: np.ndarray) -> List[Detection]:
+        img, (scale, pad_left, pad_top) = self._preprocess(frame)
+        outputs = self.session.run(None, {self._input_name: img})
+        return self._postprocess(outputs[0], frame, scale, pad_left, pad_top)
+
+    def _preprocess(self, frame: np.ndarray):
+        """letterbox resize + normalize + CHW + batch。"""
+        h, w = frame.shape[:2]
+        scale = min(self._img_size / h, self._img_size / w)
+        new_w, new_h = int(w * scale), int(h * scale)
+        resized = cv2.resize(frame, (new_w, new_h))
+
+        dw = self._img_size - new_w
+        dh = self._img_size - new_h
+        pad_left, pad_top = dw // 2, dh // 2
+        pad_right, pad_bottom = dw - pad_left, dh - pad_top
+        padded = cv2.copyMakeBorder(
+            resized, pad_top, pad_bottom, pad_left, pad_right,
+            cv2.BORDER_CONSTANT, value=(114, 114, 114),
+        )
+
+        img = cv2.cvtColor(padded, cv2.COLOR_BGR2RGB)
+        img = img.astype(np.float32) / 255.0
+        img = np.transpose(img, (2, 0, 1))
+        img = np.expand_dims(img, 0)
+        return img, (scale, pad_left, pad_top)
+
+    def _postprocess(self, output, frame, scale, pad_left, pad_top):
+        """解析 YOLOv8 ONNX 输出，NMS 后返回 Detection 列表。"""
+        pred = output[0].T  # (7, 8400) → (8400, 7)
+        boxes = pred[:, :4]   # (8400, 4)  cx, cy, w, h
+        scores = pred[:, 4:]  # (8400, 3)  class logits
+
+        scores = 1.0 / (1.0 + np.exp(-scores))  # sigmoid
+        max_scores = np.max(scores, axis=1)
+        class_ids = np.argmax(scores, axis=1)
+
+        mask = max_scores > self.conf
+        boxes = boxes[mask]
+        max_scores = max_scores[mask]
+        class_ids = class_ids[mask]
+
+        if len(boxes) == 0:
+            return []
+
+        cx, cy, bw, bh = boxes[:, 0], boxes[:, 1], boxes[:, 2], boxes[:, 3]
+        x1 = cx - bw / 2.0
+        y1 = cy - bh / 2.0
+        x2 = cx + bw / 2.0
+        y2 = cy + bh / 2.0
+
+        x1 = (x1 - pad_left) / scale
+        y1 = (y1 - pad_top) / scale
+        x2 = (x2 - pad_left) / scale
+        y2 = (y2 - pad_top) / scale
+
+        h, w = frame.shape[:2]
+        x1 = np.clip(x1, 0, w)
+        y1 = np.clip(y1, 0, h)
+        x2 = np.clip(x2, 0, w)
+        y2 = np.clip(y2, 0, h)
+
+        bboxes = [[int(x1[i]), int(y1[i]), int(x2[i] - x1[i]), int(y2[i] - y1[i])] for i in range(len(x1))]
+        indices = cv2.dnn.NMSBoxes(
+            bboxes, max_scores.tolist(), self.conf, self.iou,
+        )
+        if len(indices) == 0:
+            return []
+
+        dets = []
+        for i in indices.flatten():
+            cls_id = int(class_ids[i])
+            dets.append(Detection(
+                cls_name=self._names.get(cls_id, f"class_{cls_id}"),
+                confidence=float(max_scores[i]),
+                x=int(x1[i]), y=int(y1[i]),
+                w=int(x2[i] - x1[i]), h=int(y2[i] - y1[i]),
+            ))
         return dets
 
 
@@ -175,20 +288,36 @@ def create_detector(model_path: str, conf: float = 0.5,
                     on_log: Optional[Callable[[str], None]] = None) -> Detector:
     """根据配置创建检测器。
 
-    - 路径以 .exe 结尾 → ExeDetector（调用外部 EXE）
-    - 路径以 .pt/.onnx 结尾 → YoloDetector（进程内 ultralytics）
-    - 路径不存在或为空 → MockDetector（占位）
+    - 路径以 .onnx 结尾 → OnnxDetector（推荐，进程内 onnxruntime，无需 torch）
+    - 路径以 .pt 结尾   → YoloDetector（进程内 ultralytics）
+    - 路径以 .exe 结尾  → ExeDetector（调用外部 EXE）
+    - 路径不存在或为空   → MockDetector（占位）
     """
     log = on_log or (lambda m: None)
     if not model_path:
         log("[提示] 未设置模型路径，使用 Mock 检测器")
         return MockDetector()
 
+    if not os.path.exists(model_path):
+        log(f"[警告] 模型文件不存在: {model_path}，使用 Mock 检测器")
+        return MockDetector()
+
+    path_lower = model_path.lower()
+
+    # ---- ONNX 模式（推荐） ----
+    if path_lower.endswith(".onnx"):
+        try:
+            det = OnnxDetector(model_path, conf)
+            log(f"[检测] 已加载 ONNX 模型: {model_path}")
+            return det
+        except ImportError:
+            log("[警告] 未安装 onnxruntime，回退到 Mock 检测器")
+        except Exception as e:
+            log(f"[警告] 加载 ONNX 模型失败: {e}，回退到 Mock 检测器")
+        return MockDetector()
+
     # ---- EXE 模式 ----
-    if model_path.lower().endswith(".exe"):
-        if not os.path.exists(model_path):
-            log(f"[警告] EXE 文件不存在: {model_path}，使用 Mock 检测器")
-            return MockDetector()
+    if path_lower.endswith(".exe"):
         try:
             det = ExeDetector(model_path, conf, on_log=log)
             return det
@@ -196,11 +325,7 @@ def create_detector(model_path: str, conf: float = 0.5,
             log(f"[警告] 创建 ExeDetector 失败: {e}，回退到 Mock 检测器")
             return MockDetector()
 
-    # ---- .pt / .onnx 模式 ----
-    if not os.path.exists(model_path):
-        log(f"[警告] 模型文件不存在: {model_path}，使用 Mock 检测器")
-        return MockDetector()
-
+    # ---- .pt 模式（ultralytics） ----
     try:
         det = YoloDetector(model_path, conf)
         log(f"[检测] 已加载 YOLO 模型: {model_path}")
