@@ -186,6 +186,10 @@ def _defaults() -> Dict[str, Any]:
             {"name": "技能2", "key": "2", "cooldown": 3.0},
             {"name": "技能3", "key": "3", "cooldown": 8.0},
         ],
+        # ---- 拾取 ----
+        "pickup_enabled": True,   # 是否启用自动拾取
+        "pickup_key": "z",        # 拾取键
+        "pickup_interval": 0.333, # 拾取间隔（秒），默认每秒3次
     }
 
 

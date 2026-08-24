@@ -69,6 +69,10 @@ class MainWindow(QMainWindow):
         self._init_ui()
         self._load_config_to_ui()
 
+        # 攻击距离修改时实时同步到 YAML
+        self.attack_range_spin.valueChanged.connect(self._on_attack_range_changed)
+        self.attack_range_y_spin.valueChanged.connect(self._on_attack_range_y_changed)
+
         self.log_signal.connect(self._on_log)
         self.frame_signal.connect(self._on_frame)
         self.hotkey_signal.connect(self._toggle_run)
@@ -299,6 +303,27 @@ class MainWindow(QMainWindow):
         row.addStretch()
         v.addLayout(row)
 
+        # 拾取设置
+        pickup_row = QHBoxLayout()
+        self.pickup_checkbox = QCheckBox("自动拾取")
+        self.pickup_checkbox.setToolTip("勾选后自动按拾取键捡东西")
+        pickup_row.addWidget(self.pickup_checkbox)
+        pickup_row.addWidget(QLabel("拾取键:"))
+        self.pickup_key_edit = QLineEdit("z")
+        self.pickup_key_edit.setPlaceholderText("z")
+        self.pickup_key_edit.setFixedWidth(50)
+        pickup_row.addWidget(self.pickup_key_edit)
+        pickup_row.addWidget(QLabel("间隔(ms):"))
+        self.pickup_interval_spin = QSpinBox()
+        self.pickup_interval_spin.setRange(100, 2000)
+        self.pickup_interval_spin.setValue(333)
+        self.pickup_interval_spin.setSuffix("ms")
+        self.pickup_interval_spin.setToolTip("拾取间隔（毫秒），333ms=每秒3次")
+        self.pickup_interval_spin.setFixedWidth(80)
+        pickup_row.addWidget(self.pickup_interval_spin)
+        pickup_row.addStretch()
+        v.addLayout(pickup_row)
+
         # 技能表
         v.addWidget(QLabel("技能列表 (轮转释放):"))
         self.skill_table = QTableWidget(0, 3)
@@ -356,6 +381,10 @@ class MainWindow(QMainWindow):
         self.jump_key_edit.setText(c.jump_key)
         self.attack_range_spin.setValue(int(getattr(c, "attack_range", 200)))
         self.attack_range_y_spin.setValue(int(getattr(c, "attack_range_y", 60)))
+        # 拾取
+        self.pickup_checkbox.setChecked(getattr(c, "pickup_enabled", True))
+        self.pickup_key_edit.setText(getattr(c, "pickup_key", "z"))
+        self.pickup_interval_spin.setValue(int(getattr(c, "pickup_interval", 0.333) * 1000))
         # 技能表
         self.skill_table.setRowCount(0)
         for s in c.skills:
@@ -378,6 +407,10 @@ class MainWindow(QMainWindow):
         c.jump_key = self.jump_key_edit.text().strip() or "alt"
         c.attack_range = self.attack_range_spin.value()
         c.attack_range_y = self.attack_range_y_spin.value()
+        # 拾取
+        c.pickup_enabled = self.pickup_checkbox.isChecked()
+        c.pickup_key = self.pickup_key_edit.text().strip() or "z"
+        c.pickup_interval = self.pickup_interval_spin.value() / 1000.0
         # 技能
         skills = []
         for r in range(self.skill_table.rowCount()):
@@ -408,6 +441,16 @@ class MainWindow(QMainWindow):
         self._read_ui_to_config()
         save_user_config(self.config)
         self._log(f"[配置] 已保存到 {config_path()}")
+
+    def _on_attack_range_changed(self, value):
+        """攻击距离微调框变化时，实时同步到 config 并保存到 YAML。"""
+        self.config.attack_range = value
+        save_user_config(self.config)
+
+    def _on_attack_range_y_changed(self, value):
+        """垂直容差微调框变化时，实时同步到 config 并保存到 YAML。"""
+        self.config.attack_range_y = value
+        save_user_config(self.config)
 
     # ---------------- 事件处理 ----------------
     def _refresh_windows(self):

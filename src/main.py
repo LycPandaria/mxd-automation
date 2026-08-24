@@ -143,6 +143,9 @@ class Automation:
         self._last_hp_ratio: Optional[float] = None
         self._last_mp_ratio: Optional[float] = None
 
+        # ---- 自动拾取 ----
+        self._last_pickup_time = 0.0  # 上次拾取按键的时间戳
+
     # =========================================================================
     # 窗口管理
     # =========================================================================
@@ -401,6 +404,9 @@ class Automation:
         )
         self.engine.decide(ctx)  # 决策引擎根据上下文执行动作
 
+        # ---- 6.5. 自动拾取（定时按拾取键，每秒N次）----
+        self._auto_pickup()
+
         # ---- 7. 预览回调 ----
         # 把 frame 和检测结果推给 UI 线程渲染
         self.on_frame(frame, detections, hp_ratio, mp_ratio)
@@ -416,6 +422,24 @@ class Automation:
     # 例如: "monster" → ["monster"]
     #       "monster,boss" → ["monster", "boss"]
     # =========================================================================
+
+    def _auto_pickup(self):
+        """自动拾取：按配置的间隔定时触发拾取键。
+
+        仅在 pickup_enabled=True 且已锁定窗口时生效。
+        间隔由 config.pickup_interval 控制（默认 0.333s = 每秒3次）。
+        """
+        enabled = getattr(self.config, "pickup_enabled", False)
+        if not enabled:
+            return
+        if not self.capture.locked:
+            return
+        now = time.time()
+        interval = getattr(self.config, "pickup_interval", 0.333)
+        if now - self._last_pickup_time >= interval:
+            pickup_key = getattr(self.config, "pickup_key", "z")
+            self.executor.press_key(pickup_key, cooldown=0.0)
+            self._last_pickup_time = now
 
     def _monster_classes(self):
         return [c.strip() for c in self.config.monster_classes.split(",") if c.strip()]
