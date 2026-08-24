@@ -32,7 +32,8 @@ from PyQt5.QtCore import Qt, QTimer, pyqtSignal
 from PyQt5.QtGui import QImage, QPixmap
 
 from src.utils.config_loader import (
-    load_config, save_config, save_user_config, config_path,
+    load_config, save_config, save_user_config, config_path, resolve_model_path,
+    APP_DIR, BUNDLE_DIR,
 )
 from src.perception.yolo_detector import create_detector
 from src.perception.hp_mp_detector import detect_region_color
@@ -53,8 +54,10 @@ class MainWindow(QMainWindow):
         self.resize(1180, 760)
 
         self.config = load_config()
+        # 先解析为绝对路径再创建检测器，避免 CWD 不对导致 os.path.exists 失败
+        model_path = resolve_model_path(self.config.model_path) if self.config.model_path else ""
         self.detector = create_detector(
-            self.config.model_path, self.config.confidence, self._log
+            model_path, self.config.confidence, self._log
         )
         self.automation = Automation(
             self.config, self.detector,
@@ -354,7 +357,9 @@ class MainWindow(QMainWindow):
     # ---------------- 配置 ↔ UI ----------------
     def _load_config_to_ui(self):
         c = self.config
-        self.model_edit.setText(c.model_path)
+        # 显示解析后的完整路径，让用户能直观看到模型实际位置
+        # （打包后相对路径 best.onnx 会解析为 _internal\best.onnx）
+        self.model_edit.setText(resolve_model_path(c.model_path) if c.model_path else "")
         self.conf_slider.setValue(int(c.confidence * 100))
         self.classes_edit.setText(c.monster_classes)
         self.fps_spin.setValue(c.fps)
@@ -393,7 +398,17 @@ class MainWindow(QMainWindow):
     def _read_ui_to_config(self):
         c = self.config
         c.window_title = self.window_combo.currentText().strip()
-        c.model_path = self.model_edit.text().strip()
+        # 若文本框里是 exe 旁边(APP_DIR)或打包内(BUNDLE_DIR)模型的绝对路径，
+        # 保存时转回相对路径(best.onnx)，避免文件夹移动后路径失效
+        _text = self.model_edit.text().strip()
+        if getattr(sys, "frozen", False):
+            _norm = os.path.normpath(_text)
+            for _base in (APP_DIR, BUNDLE_DIR):
+                _base_n = os.path.normpath(_base)
+                if _norm == _base_n or _norm.startswith(_base_n + os.sep):
+                    _text = os.path.relpath(_norm, _base_n)
+                    break
+        c.model_path = _text
         c.confidence = self.conf_slider.value() / 100
         c.monster_classes = self.classes_edit.text().strip() or "monster"
         c.fps = self.fps_spin.value()
@@ -583,10 +598,15 @@ class MainWindow(QMainWindow):
                 QMessageBox.warning(self, "提示", "请先锁定游戏窗口")
                 return
 
-        # 模型路径变化时重建检测器
-        if self.config.model_path and self.config.model_path != getattr(self.detector, "_path", ""):
+        # 模型路径变化时重建检测器（用 resolved 路径比较，避免 UI 截断/相对绝对路径差异导致误重建）
+        resolved_path = resolve_model_path(self.config.model_path) if self.config.model_path else ""
+        detector_path = getattr(self.detector, "_path", "")
+        # detector._path 可能是相对路径，也做一次 resolve 再比较
+        if detector_path:
+            detector_path = resolve_model_path(detector_path)
+        if resolved_path and resolved_path != detector_path:
             self.detector = create_detector(
-                self.config.model_path, self.config.confidence, self._log
+                resolved_path, self.config.confidence, self._log
             )
             self.automation.set_detector(self.detector)
 

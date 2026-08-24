@@ -76,18 +76,39 @@ import yaml
 
 
 # ---- 路径常量 ----
-def _base_dir() -> str:
-    """返回应用基础目录。
+def _bundle_dir() -> str:
+    """打包内资源目录（只读）。
 
-    PyInstaller 打包后: sys._MEIPASS（_internal 目录）
+    PyInstaller 打包后: sys._MEIPASS
+      - onedir 模式  = <程序目录>/_internal
+      - onefile 模式 = 运行时临时解压目录（每次启动都重新生成）
     开发环境:          PROJECT_ROOT（项目根目录）
     """
     if getattr(sys, "frozen", False):
         return sys._MEIPASS
     return os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-PROJECT_ROOT = _base_dir()
-CONFIG_DIR = os.path.join(PROJECT_ROOT, "config")
+
+def _app_dir() -> str:
+    """应用数据目录（用户可见、可写的目录）。
+
+    模型与配置文件外置于此，方便用户查看/替换，且不会因为
+    onefile 解压到临时目录而丢失:
+      - PyInstaller 打包后 = exe 所在目录
+      - 开发环境          = 项目根目录
+    """
+    if getattr(sys, "frozen", False):
+        return os.path.dirname(os.path.abspath(sys.executable))
+    return _bundle_dir()
+
+
+# 兼容旧名称：BUNDLE_DIR 即原 PROJECT_ROOT
+BUNDLE_DIR = _bundle_dir()
+PROJECT_ROOT = BUNDLE_DIR
+APP_DIR = _app_dir()
+
+# 配置文件：优先 exe 旁边（外置、可持久化），打包内仅作为兜底默认值
+CONFIG_DIR = os.path.join(APP_DIR, "config")
 DEFAULT_YAML_PATH = os.path.join(CONFIG_DIR, "user.yaml")
 DEFAULT_JSON_PATH = os.path.join(CONFIG_DIR, "user.json")
 
@@ -96,23 +117,39 @@ def resolve_model_path(raw_path: str) -> str:
     """解析模型路径。
 
     - 绝对路径: 直接返回
-    - 相对路径: 相对于 PROJECT_ROOT 解析
-    - 在 PyInstaller 打包后，PROJECT_ROOT = sys._MEIPASS（_internal 目录）
+    - 相对路径: 优先在 APP_DIR（exe 旁边，外置模型）查找；
+      不存在时回退 BUNDLE_DIR（打包内，兼容旧版把模型打进包的情况）。
     """
     if not raw_path:
         return raw_path
     if os.path.isabs(raw_path):
         return raw_path
-    return os.path.normpath(os.path.join(PROJECT_ROOT, raw_path))
+    for base in (APP_DIR, BUNDLE_DIR):
+        cand = os.path.normpath(os.path.join(base, raw_path))
+        if os.path.isfile(cand):
+            return cand
+    return os.path.normpath(os.path.join(APP_DIR, raw_path))
 
 
 def config_path() -> str:
-    """返回当前生效的配置文件路径（优先 YAML，回退 JSON）。"""
-    if os.path.isfile(DEFAULT_YAML_PATH):
-        return DEFAULT_YAML_PATH
-    if os.path.isfile(DEFAULT_JSON_PATH):
-        return DEFAULT_JSON_PATH
-    return DEFAULT_YAML_PATH
+    """返回当前生效的配置文件路径。
+
+    优先级:
+      1. APP_DIR/config/user.yaml    （exe 旁边，用户配置）
+      2. APP_DIR/config/user.json
+      3. BUNDLE_DIR/config/user.yaml （打包内默认配置）
+      4. BUNDLE_DIR/config/user.json
+    都不存在时返回 APP_DIR/config/user.yaml（首次启动后保存到这里）。
+    """
+    for p in (
+        os.path.join(APP_DIR, "config", "user.yaml"),
+        os.path.join(APP_DIR, "config", "user.json"),
+        os.path.join(BUNDLE_DIR, "config", "user.yaml"),
+        os.path.join(BUNDLE_DIR, "config", "user.json"),
+    ):
+        if os.path.isfile(p):
+            return p
+    return os.path.join(APP_DIR, "config", "user.yaml")
 
 
 def _load_yaml(path: str) -> Dict[str, Any]:
@@ -144,10 +181,10 @@ def _load_json(path: str) -> Dict[str, Any]:
 
 
 def _load_user_config() -> Dict[str, Any]:
-    """加载用户配置：优先 YAML，回退 JSON。"""
-    data = _load_yaml(DEFAULT_YAML_PATH)
+    """加载用户配置：优先 exe 旁边（外置）user.yaml，回退打包内默认。"""
+    data = _load_yaml(config_path())
     if not data:
-        data = _load_json(DEFAULT_JSON_PATH)
+        data = _load_json(config_path())
     return data
 
 
@@ -180,7 +217,7 @@ def _defaults() -> Dict[str, Any]:
         "keyboard_mode": "sendinput",
         # ---- 模型 ----
         "confidence": 0.5,
-        "model_path": "assets/models/best.onnx",
+        "model_path": "best.onnx",  # 相对路径，解析到 exe 旁边的模型
         # ---- 类别 ----
         "monster_classes": "monster",
         "floor_classes": "floor",

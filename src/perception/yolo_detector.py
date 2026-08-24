@@ -140,9 +140,15 @@ class OnnxDetector(Detector):
         """解析 YOLOv8 ONNX 输出，NMS 后返回 Detection 列表。"""
         pred = output[0].T  # (7, 8400) → (8400, 7)
         boxes = pred[:, :4]   # (8400, 4)  cx, cy, w, h
-        scores = pred[:, 4:]  # (8400, 3)  class logits
+        scores = pred[:, 4:]  # (8400, 3)  class scores
 
-        scores = 1.0 / (1.0 + np.exp(-scores))  # sigmoid
+        # ultralytics 导出的 YOLOv8 ONNX 其 Detect 头已内置 Sigmoid，
+        # 此时输出就是概率 (0,1)。只有 raw logits（最大值 > 1）才需要
+        # 再套一次 sigmoid，否则会二次压缩置信度（0.94 -> 0.72），
+        # 并让大量背景噪音抬升到阈值之上，导致框数爆炸。
+        if scores.max() > 1.0:
+            scores = 1.0 / (1.0 + np.exp(-scores))
+
         max_scores = np.max(scores, axis=1)
         class_ids = np.argmax(scores, axis=1)
 
