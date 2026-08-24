@@ -286,7 +286,7 @@ class MainWindow(QMainWindow):
 
         row.addWidget(QLabel("攻击距离px:"))
         self.attack_range_spin = QSpinBox()
-        self.attack_range_spin.setRange(30, 800)
+        self.attack_range_spin.setRange(10, 800)
         self.attack_range_spin.setValue(200)
         self.attack_range_spin.setToolTip("人物与怪物水平差小于此值才触发攻击")
         self.attack_range_spin.setFixedWidth(70)
