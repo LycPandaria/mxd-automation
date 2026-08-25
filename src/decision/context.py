@@ -139,12 +139,15 @@ YOLO 置信度骤降被 conf 阈值过滤 → 本帧看不到锁定目标。
 目标本帧消失 → 判定为被角色遮挡而不是怪真消失。
 """
 
-OCCLUSION_MAX_FRAMES = 150
-"""目标被遮挡时沿用最后已知位置的帧数上限（约 5 秒 @30fps）。
+OCCLUSION_MAX_FRAMES = 300
+"""目标被遮挡时沿用最后已知位置的帧数上限（约 10 秒 @30fps）。
 
 超过该帧数仍未被 YOLO 重新看到 → 判定怪真消失（被击退/逃出
 画面/已死亡），放弃攻击。正常近战 2~4 秒内击杀或怪露出，
-5 秒上限足够宽松，避免误杀正常战斗。
+但厚血怪/被击退后角色追错位置时遮挡可持续更久；若上限太短
+(150=5 秒)会出现"厚血怪被遮 5 秒 → 判定消失 → 转探索/换远处
+目标 → 角色离开 → 怪露出 → 重新贴脸 → 又被遮"的反复空转，
+表现为在怪物堆里到处跑不攻击。
 """
 
 SELF_POS_STALE_FRAMES = 60
@@ -509,12 +512,19 @@ class DecisionEngine:
 
         foot = self._effective_self_pos(ctx)
         if foot is None:
-            # 无法定位自身 → 无法判断贴脸。
-            # 只释放方向键原地等待下一帧定位，不切 IDLE 不转探索，
-            # 避免 OCR 定位"时有时无"导致的 idle↔chasing 高频抖动。
-            # 站定攻击中定位失败由 _effective_self_pos 用最后已知位置兜底。
-            self._release_move()
-            return
+            # 无法定位自身 → 默认无法判断贴脸，原地等待下一帧定位，
+            # 不切 IDLE 不转探索，避免 OCR 定位"时有时无"导致的高频抖动。
+            # 例外：目标仍在最后已知位置的贴脸范围内（近战贴脸怪基本不动，
+            # 角色站定没走远）→ 直接用最后位置继续攻击，避免
+            # "怪已经连上(贴脸)但 OCR 恰好失败 → 角色干等不攻击"。
+            if self._last_self_pos is not None \
+                    and self._self_pos_stale_frames <= SELF_POS_STALE_FRAMES \
+                    and abs(self._last_self_pos[0] - target.center[0]) \
+                        <= self._get_attack_range():
+                foot = self._last_self_pos
+            else:
+                self._release_move()
+                return
 
         sx, sy = foot
         mx = target.center[0]
@@ -544,10 +554,15 @@ class DecisionEngine:
                 # 期间【原地继续攻击、绝不移动】——攻击动画期间按方向键
                 # 会边打边跑、追过头穿越怪物，表现为"贴着怪左右跑"。
                 # 连续超出 MELEE_LEAVE_FRAMES 帧才判定怪物真走远，转追击。
-                self._melee_leave_frames += 1
-                if self._melee_leave_frames < MELEE_LEAVE_FRAMES:
-                    self._melee_attack(ctx, target)
-                    return
+                # 防抖只吸收"击退/位移抖动"（dx 在滞回窗口附近）。
+                # dx 明显超限(> 攻击距离 + 2×滞回)不可能是抖动，而是
+                # 【目标切换】(原怪死亡/消失，重选到远处新怪)或怪大幅走远，
+                # 此时防抖只会对着远处怪空打 + 转向乱走，立即转追击。
+                if dx <= melee_range + MELEE_HYSTERESIS_X * 2:
+                    self._melee_leave_frames += 1
+                    if self._melee_leave_frames < MELEE_LEAVE_FRAMES:
+                        self._melee_attack(ctx, target)
+                        return
                 self._melee_leave_frames = 0
             self._fsm.transition(State.CHASING)
             self._melee_chase(ctx, target)
@@ -600,7 +615,12 @@ class DecisionEngine:
         # 转向：怪物在右→按右键，怪物在左→按左键。
         # 仅当 怪物还没贴脸(|dx| > 攻击距离) 且 朝向不符 才按，
         # 避免贴脸状态下按方向键把角色推过怪物。
-        if target is not None:
+        # 【防抖窗口内】(怪刚超出贴脸、正在确认是否真走远)和
+        # 【遮挡虚拟目标期间】(怪在角色身上/正前方，位置是最后的，
+        # 朝它走=穿越怪)【绝不转向移动】，否则角色会边打边追穿越
+        # 怪物、或朝旧位置左右来回跑，表现为"贴着怪左右晃动"。
+        if target is not None and self._melee_leave_frames == 0 \
+                and self._occluded_frames == 0:
             foot = self._effective_self_pos(ctx)
             if foot is None:
                 self._cast_skill()
