@@ -120,13 +120,26 @@ FACE_TURN_X = 20
 """攻击转向判定：怪物中心 x 与角色 x 差超过此值才调整朝向（像素）。
 小于此值视为怪物在正下方/重叠，保持当前朝向即可。"""
 
-MELEE_HYSTERESIS_X = 40
-"""短手(近战)贴脸攻击的滞回窗口（像素）。
+MELEE_HIT_TOL_X = 10
+"""短手贴脸"命中容差"（像素）。
 
-攻击中(ATTACKING)允许水平差超过贴脸距离不超过此值仍继续攻击。
-作用: 角色攻击位移、怪物被技能推开、转身小步移动都会让水平差在
-下一帧瞬时变大（实测一帧能 +30~40px），若无足够滞回就会出现
-"打一下就被判离开→追→贴脸→打一下"的来回抖动。
+攻击距离 50px 指攻击特效的有效命中距离。角色到怪近侧身体边缘
+≤ 攻击距离+此容差 才判定"能打到"、站定攻击；容差覆盖攻击特效
+判定框冗余 + 检测抖动（±10px），避免怪在边缘 50~60px 处时
+"判定未贴脸→追→怪又贴近→又未贴脸"的抖动。
+超过此容差(>60px)攻击特效够不到，必须追击，不停在原地空打。
+"""
+
+MELEE_HYSTERESIS_X = 40
+"""短手(近战)攻击中"确认怪物走远"的防抖窗口宽度（像素）。
+
+贴脸命中区 = 攻击距离 + MELEE_HIT_TOL_X（例: 50+10=60px）。
+攻击中角色到怪近侧边缘距离超过命中区、但 ≤ 攻击距离+此窗口
+（60~90px）时，先用防抖帧数 MELEE_LEAVE_FRAMES 吸收瞬时抖动
+（攻击位移/怪物被推开 1~3 帧），连续超限才转追击——避免
+"怪被推一下就走远 → 追 → 怪弹回 → 追"的来回抖动。
+超过此窗口(>90px)说明怪真走远或已切换目标，立即追击，不停在
+原地对着够不着的怪空打。
 """
 
 MELEE_LEAVE_FRAMES = 6
@@ -525,10 +538,11 @@ class DecisionEngine:
         攻击距离固定 MELEE_ATTACK_RANGE_X(50px)，不随 exe 配置变化，
         距离判定用"角色到怪近侧身体边缘"，宽怪站旁边就打、不穿越。
 
-        攻击中(ATTACKING)带滞回窗口 MELEE_HYSTERESIS_X + 防抖帧数
-        MELEE_LEAVE_FRAMES：角色攻击位移/怪物被推开/转身小步会让
-        边缘距离瞬时变大 30~40px，滞回+防抖保证"打一下就退走、追来
-        追去贴不上去"的抖动不会发生。
+        贴脸命中区 = 攻击距离 + MELEE_HIT_TOL_X（50+10=60px），超过
+        即攻击特效够不到，立即追击不原地空打。攻击中(ATTACKING)超出
+        命中区但 ≤ 攻击距离+MELEE_HYSTERESIS_X（60~90px）时用防抖帧数
+        MELEE_LEAVE_FRAMES 吸收瞬时抖动（攻击位移/怪物被推开 1~3 帧），
+        连续超限才转追击；超过 90px 说明怪真走远/已换目标，立即追击。
         """
         if target is None:
             self._target_monster = None
@@ -572,37 +586,31 @@ class DecisionEngine:
             self._explore(ctx)
             return
 
-        # 贴脸判定（攻击中带滞回窗口 + 防抖帧数）：
-        # 已贴脸或攻击中轻微超出（≤ 滞回窗口）→ 保持攻击，不切追击
-        melee_hit = melee_range + (
-            MELEE_HYSTERESIS_X if self._fsm.current == State.ATTACKING else 0
-        )
+        # 贴脸命中判定：
+        # 角色到怪近侧边缘 ≤ 攻击距离+命中容差 → 站定攻击（特效够得到）。
+        # 攻击中超出命中区但 ≤ 攻击距离+滞回窗口 → 防抖帧数吸收瞬时
+        # 抖动后仍继续攻击；明显超限(目标切换/怪真走远) → 立即追击，
+        # 不停在原地对着够不着的怪空打。
+        melee_hit = melee_range + MELEE_HIT_TOL_X
         if dx > melee_hit:
-            if self._fsm.current == State.ATTACKING:
-                # 攻击中超出滞回窗口：先用防抖帧数吸收瞬时抖动。
-                # 期间【原地继续攻击、绝不移动】——攻击动画期间按方向键
-                # 会边打边跑、追过头穿越怪物，表现为"贴着怪左右跑"。
-                # 连续超出 MELEE_LEAVE_FRAMES 帧才判定怪物真走远，转追击。
-                # 防抖只吸收"击退/位移抖动"（dx 在滞回窗口附近）。
-                # dx 明显超限(> 攻击距离 + 2×滞回)不可能是抖动，而是
-                # 【目标切换】(原怪死亡/消失，重选到远处新怪)或怪大幅走远，
-                # 此时防抖只会对着远处怪空打 + 转向乱走，立即转追击。
-                if dx <= melee_range + MELEE_HYSTERESIS_X * 2:
-                    self._melee_leave_frames += 1
-                    if self._melee_leave_frames < MELEE_LEAVE_FRAMES:
-                        self._melee_attack(ctx, target)
-                        return
-                self._melee_leave_frames = 0
+            if self._fsm.current == State.ATTACKING \
+                    and dx <= melee_range + MELEE_HYSTERESIS_X:
+                # 攻击中超出命中区但还在防抖窗口内：先用防抖帧数吸收
+                # 瞬时抖动（攻击位移/怪物被推开 1~3 帧）。期间【原地继续
+                # 攻击、绝不移动】——攻击动画期间按方向键会边打边跑、
+                # 追过头穿越怪物，表现为"贴着怪左右跑"。连续超出
+                # MELEE_LEAVE_FRAMES 帧才判定怪物真走远，转追击。
+                self._melee_leave_frames += 1
+                if self._melee_leave_frames < MELEE_LEAVE_FRAMES:
+                    self._melee_attack(ctx, target)
+                    return
+            self._melee_leave_frames = 0
             self._fsm.transition(State.CHASING)
             self._melee_chase(ctx, target)
             return
 
-        # 已贴脸/在滞回窗口内 → 转向 + 攻击
-        # 只有真贴脸(≤攻击距离)才清零防抖计数：滞回窗口内(贴脸~窗口上界)
-        # 攻击时不计数也不清零，避免 dx 在窗口边界抖动导致计数反复清零、
-        # 攻击中怪物走远了却一直切不进追击、原地空打。
-        if dx <= melee_range:
-            self._melee_leave_frames = 0
+        # 已贴脸命中 → 转向 + 攻击（回到命中区即清零防抖计数）
+        self._melee_leave_frames = 0
         self._fsm.transition(State.ATTACKING)
         self._melee_attack(ctx, target)
 
