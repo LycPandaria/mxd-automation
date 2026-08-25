@@ -615,7 +615,11 @@ class DecisionEngine:
         self._melee_attack(ctx, target)
 
     def _melee_chase(self, ctx: Context, target: Detection):
-        """近战贴身追击：径直走向怪物，直到进入贴脸距离。"""
+        """近战追击：径直走向怪物，进入攻击距离即停手攻击。
+
+        与长手语义一致：角色到怪近侧身体边缘 ≤ 攻击距离(50px) 就开始
+        攻击，不需要走到怪物脸上（不追到 攻击距离-5px）。
+        """
         if ctx.self_position is None:
             self._release_move()
             return
@@ -631,8 +635,10 @@ class DecisionEngine:
             self._stuck_counter = 0
             return
 
-        # 走到贴脸距离-5px 处停下（留余量，避免在边界来回蹭）
-        stop_at = max(5, melee_range - 5)
+        # 进入攻击距离即停手攻击，不走到怪物脸上。
+        # 停点 = 攻击距离(50px)；命中容差(+10px)保证停住后攻击能命中，
+        # 不会在边界"差一步打不到 → 蹭一下 → 又超距"来回蹭。
+        stop_at = max(5, melee_range)
         if tx > sx + stop_at:
             self._hold_move("right")
         elif tx < sx - stop_at:
