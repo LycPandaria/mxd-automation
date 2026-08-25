@@ -112,6 +112,51 @@ FACE_TURN_X = 20
 """攻击转向判定：怪物中心 x 与角色 x 差超过此值才调整朝向（像素）。
 小于此值视为怪物在正下方/重叠，保持当前朝向即可。"""
 
+MELEE_HYSTERESIS_X = 40
+"""短手(近战)贴脸攻击的滞回窗口（像素）。
+
+攻击中(ATTACKING)允许水平差超过贴脸距离不超过此值仍继续攻击。
+作用: 角色攻击位移、怪物被技能推开、转身小步移动都会让水平差在
+下一帧瞬时变大（实测一帧能 +30~40px），若无足够滞回就会出现
+"打一下就被判离开→追→贴脸→打一下"的来回抖动。
+"""
+
+MELEE_LEAVE_FRAMES = 6
+"""短手(近战)攻击中连续超出滞回窗口的帧数阈值（约 0.3 秒 @20fps）。
+
+超过滞回窗口后不立即切追击：攻击位移/怪物被推开通常是 1~3 帧的
+瞬时抖动，连续超出该帧数才判定"怪物真走远了"转为追击，避免攻击
+状态 1 帧就断、攻击断断续续。防抖期间原地继续攻击（不移动）。
+"""
+
+OCCLUSION_HALF_WIDTH_X = 40
+"""遮挡判定水平容差（像素）。
+
+短手贴脸攻击时角色站在怪正前方，角色模型+攻击特效会遮住怪物，
+YOLO 置信度骤降被 conf 阈值过滤 → 本帧看不到锁定目标。
+角色脚底 x 与怪中心 x 的最大距离约等于攻击距离(attack_range)，
+再加角色半宽+怪半宽+检测抖动容差(40px)即视为"角色在怪跟前"，
+目标本帧消失 → 判定为被角色遮挡而不是怪真消失。
+"""
+
+OCCLUSION_MAX_FRAMES = 150
+"""目标被遮挡时沿用最后已知位置的帧数上限（约 5 秒 @30fps）。
+
+超过该帧数仍未被 YOLO 重新看到 → 判定怪真消失（被击退/逃出
+画面/已死亡），放弃攻击。正常近战 2~4 秒内击杀或怪露出，
+5 秒上限足够宽松，避免误杀正常战斗。
+"""
+
+SELF_POS_STALE_FRAMES = 60
+"""自身定位(OCR)连续失败的帧数上限（约 2 秒 @30fps）。
+
+站定攻击中角色位置不变，短时定位失败（技能特效遮挡角色名字/
+怪物名与角色名重叠/OCR 抖动）可用最后已知位置(_last_self_pos)
+继续攻击，避免"特效挡名字 → 放弃目标转探索 → 角色离开 →
+特效消失 → 重新定位"的反复空转；
+超过该帧数仍定位不到 → 判定真丢失，避免用过期坐标乱跑。
+"""
+
 
 @dataclass
 class Context:
@@ -173,6 +218,9 @@ class DecisionEngine:
         self._climb_log_count = 0                 # 攀爬日志限频计数
         self._attack_stale_counter = 0            # 锁定同一目标持续攻击的帧数（残影检测）
         self._face_dir: Optional[str] = None      # 记忆的角色朝向（left/right），攻击前据此调整
+        self._melee_leave_frames = 0              # 短手攻击中连续超限帧数（防抖计数）
+        self._occluded_frames = 0                 # 目标被角色遮挡的连续帧数（虚拟目标维持）
+        self._self_pos_stale_frames = 0           # 自身定位连续失败的帧数（最后已知位置时效）
 
     def update_config(self, config: Config):
         self.config = config
@@ -187,6 +235,9 @@ class DecisionEngine:
         self._distance_log_frame_count = 0
         self._attack_stale_counter = 0
         self._face_dir = None
+        self._melee_leave_frames = 0
+        self._occluded_frames = 0
+        self._self_pos_stale_frames = 0
         self.release_keys()
         self._fsm.reset()
         self.executor.reset()
@@ -215,13 +266,17 @@ class DecisionEngine:
         """
         self._fsm.tick()
 
-        # 检测卡住
+        # 检测卡住 + 自身定位时效统计
         if ctx.self_position:
+            self._self_pos_stale_frames = 0
             if self._last_self_pos and self._last_self_pos == ctx.self_position:
                 self._stuck_counter += 1
             else:
                 self._stuck_counter = 0
             self._last_self_pos = ctx.self_position
+        else:
+            # OCR 定位失败帧计数：站定攻击中用最后已知位置兜底的时效依据
+            self._self_pos_stale_frames += 1
 
         # ---- 优先级 1: 没血加血 ----
         if ctx.hp_ratio is not None and ctx.hp_ratio < self.config.hp_threshold:
@@ -279,17 +334,25 @@ class DecisionEngine:
         # ---- 无有效目标（same_platform_only 过滤后无同平台怪）----
         # 不走 CRASH 路径，释放移动键并转探索，避免角色卡在上一帧的移动状态
         if target is None:
-            self._target_monster = None
-            self._attack_stale_counter = 0
-            self._release_move()
-            self._fsm.transition(State.IDLE)
-            self._explore(ctx)
-            return
+            # 攻击中目标短暂从画面消失（YOLO 单帧漏检/波动）→ 沿用旧锁定
+            # 目标继续攻击。若此时重选别的怪，dx 会瞬间翻转、角色左右乱转。
+            # 若怪真被杀/消失，残影检测(ATTACK_STALE_FRAMES)会兜底换目标。
+            if self._fsm.current == State.ATTACKING and self._target_monster is not None:
+                target = self._target_monster
+            else:
+                self._target_monster = None
+                self._attack_stale_counter = 0
+                self._release_move()
+                self._fsm.transition(State.IDLE)
+                self._explore(ctx)
+                return
 
         # ---- 攻击超时检测（残影防护）----
-        # 持续攻击同一只怪（上帧目标 == 本帧最近目标）才累计
-        if self._target_monster is not None and self._is_same_monster(
-                self._target_monster, target):
+        # 持续攻击同一只怪（上帧目标 == 本帧最近目标）才累计；
+        # 目标被角色遮挡期间（虚拟目标维持中）不计入，避免"攻击超时
+        # 判定残影→中断"把遮挡中的正常战斗打断
+        if self._occluded_frames == 0 and self._target_monster is not None \
+                and self._is_same_monster(self._target_monster, target):
             if self._fsm.current == State.ATTACKING:
                 self._attack_stale_counter += 1
             else:
@@ -326,10 +389,12 @@ class DecisionEngine:
         #   —— 脚底对"是否站在同一条地面线"最准确。
         #      若用"中心点y"对比，高大怪物会被误判为跨层(见 _pick_best_target)。
         # 攻击距离 = 水平方向 |角色x - 怪物中心x| ≤ 攻击距离px（规则2）
-        foot = ctx.self_position
+        foot = self._effective_self_pos(ctx)
         if foot is None:
-            # OCR 无法定位自身 → 无法判断距离，不能攻击
-            # 转入探索状态，避免盲打空放技能
+            # OCR 定位失败（技能特效遮挡名字/OCR 抖动）且不在站定攻击中
+            # → 无法判断距离，不能攻击，转入探索状态，避免盲打空放技能。
+            # 站定攻击中定位失败由 _effective_self_pos 用最后已知位置兜底，
+            # 不会走到这里。
             self._target_monster = None
             self._attack_stale_counter = 0
             self._release_move()
@@ -409,6 +474,11 @@ class DecisionEngine:
           - 攻击中怪物走远 → 下一帧判定未贴脸 → 立即转为追击，不停在原地空打
         没有远程那套"站定攻击 + 大滞回窗口"的逻辑。
         攻击距离与长手共用 config.attack_range。
+
+        攻击中(ATTACKING)带滞回窗口 MELEE_HYSTERESIS_X + 防抖帧数
+        MELEE_LEAVE_FRAMES：角色攻击位移/怪物被推开/转身小步会让
+        水平差瞬时变大 30~40px，滞回+防抖保证"打一下就退走、追来
+        追去贴不上去"的抖动不会发生。
         """
         if target is None:
             self._target_monster = None
@@ -418,14 +488,13 @@ class DecisionEngine:
             self._explore(ctx)
             return
 
-        foot = ctx.self_position
+        foot = self._effective_self_pos(ctx)
         if foot is None:
-            # 无法定位自身 → 无法判断贴脸，转探索避免盲打
-            self._target_monster = None
-            self._attack_stale_counter = 0
+            # 无法定位自身 → 无法判断贴脸。
+            # 只释放方向键原地等待下一帧定位，不切 IDLE 不转探索，
+            # 避免 OCR 定位"时有时无"导致的 idle↔chasing 高频抖动。
+            # 站定攻击中定位失败由 _effective_self_pos 用最后已知位置兜底。
             self._release_move()
-            self._fsm.transition(State.IDLE)
-            self._explore(ctx)
             return
 
         sx, sy = foot
@@ -445,13 +514,32 @@ class DecisionEngine:
             self._explore(ctx)
             return
 
-        # 未贴脸 → 追击（直接走向怪物，不转向不攻击）
-        if dx > melee_range:
+        # 贴脸判定（攻击中带滞回窗口 + 防抖帧数）：
+        # 已贴脸或攻击中轻微超出（≤ 滞回窗口）→ 保持攻击，不切追击
+        melee_hit = melee_range + (
+            MELEE_HYSTERESIS_X if self._fsm.current == State.ATTACKING else 0
+        )
+        if dx > melee_hit:
+            if self._fsm.current == State.ATTACKING:
+                # 攻击中超出滞回窗口：先用防抖帧数吸收瞬时抖动。
+                # 期间【原地继续攻击、绝不移动】——攻击动画期间按方向键
+                # 会边打边跑、追过头穿越怪物，表现为"贴着怪左右跑"。
+                # 连续超出 MELEE_LEAVE_FRAMES 帧才判定怪物真走远，转追击。
+                self._melee_leave_frames += 1
+                if self._melee_leave_frames < MELEE_LEAVE_FRAMES:
+                    self._melee_attack(ctx, target)
+                    return
+                self._melee_leave_frames = 0
             self._fsm.transition(State.CHASING)
             self._melee_chase(ctx, target)
             return
 
-        # 已贴脸 → 转向 + 攻击
+        # 已贴脸/在滞回窗口内 → 转向 + 攻击
+        # 只有真贴脸(≤攻击距离)才清零防抖计数：滞回窗口内(贴脸~窗口上界)
+        # 攻击时不计数也不清零，避免 dx 在窗口边界抖动导致计数反复清零、
+        # 攻击中怪物走远了却一直切不进追击、原地空打。
+        if dx <= melee_range:
+            self._melee_leave_frames = 0
         self._fsm.transition(State.ATTACKING)
         self._melee_attack(ctx, target)
 
@@ -481,25 +569,43 @@ class DecisionEngine:
             self._release_move()
 
     def _melee_attack(self, ctx: Context, target: Detection):
-        """近战攻击：贴脸时转向面向怪物并释放技能。"""
-        self._release_move()  # 攻击时站定
+        """近战攻击：站定转向面向怪物并释放技能。
 
-        # 转向：怪物在右→按右键，怪物在左→按左键
+        转向按方向键会让角色移动一小步，在贴脸距离内会造成角色
+        穿越怪物左右来回顶。因此【已贴脸(水平差≤攻击距离)时绝不转向】，
+        只在对准方向与怪物不一致且怪物还在攻击距离外时才按方向键。
+        """
+        self._release_move()  # 攻击时站定
+        self._stuck_counter = 0  # 站定攻击不算"卡住"（位置不变是正常的）
+
+        # 转向：怪物在右→按右键，怪物在左→按左键。
+        # 仅当 怪物还没贴脸(|dx| > 攻击距离) 且 朝向不符 才按，
+        # 避免贴脸状态下按方向键把角色推过怪物。
         if target is not None and ctx.self_position is not None:
             sx = ctx.self_position[0]
             dx = target.center[0] - sx
+            melee_range = self._get_attack_range()
             need = None
-            if dx > FACE_TURN_X:
+            if dx > FACE_TURN_X and dx > melee_range:
                 need = "right"
-            elif dx < -FACE_TURN_X:
+            elif dx < -FACE_TURN_X and dx < -melee_range:
                 need = "left"
             if need is not None and need != self._face_dir:
-                if self.executor.press_key(need, cooldown=0.3):
-                    self._face_dir = need
-                    self._log(
-                        f"[朝向] 怪物在{'右' if need == 'right' else '左'}"
-                        f"({dx:+d}px)，按{need}转向"
-                    )
+                # 方向粘滞：怪在左右两侧小幅往返（目标切换/击退/检测抖动）
+                # 时，只要怪还在滞回窗口内就维持当前朝向继续攻击，
+                # 避免贴脸处角色跟着怪左右来回转向乱跑。
+                if self._face_dir is not None:
+                    if need == "right" and dx < melee_range + MELEE_HYSTERESIS_X:
+                        need = None
+                    elif need == "left" and dx > -(melee_range + MELEE_HYSTERESIS_X):
+                        need = None
+                if need is not None and need != self._face_dir:
+                    if self.executor.press_key(need, cooldown=0.6):
+                        self._face_dir = need
+                        self._log(
+                            f"[朝向] 怪物在{'右' if need == 'right' else '左'}"
+                            f"({dx:+d}px)，按{need}转向"
+                        )
 
         self._cast_skill()
 
@@ -553,7 +659,14 @@ class DecisionEngine:
                     if ctx.self_position is not None and not self._same_platform(
                             ctx.self_position[1], m.y + m.h):
                         break
+                    # 目标重新可见（遮挡解除）→ 清除遮挡计数
+                    self._occluded_frames = 0
                     return m
+            # 锁定目标本帧不在画面：可能是被角色自身遮挡（贴脸攻击）
+            occluded = self._occluded_target(ctx)
+            if occluded is not None:
+                return occluded
+            self._occluded_frames = 0
             self._target_monster = None
         return self._pick_best_target(ctx)
 
@@ -568,6 +681,44 @@ class DecisionEngine:
         tolerance = max(int(a.w * 1.5), 40)
         d = abs(a.center[0] - b.center[0]) + abs(a.center[1] - b.center[1])
         return d <= tolerance
+
+    def _occluded_target(self, ctx: Context) -> Optional[Detection]:
+        """目标从画面消失时，判断是否被角色遮挡并返回可继续攻击的虚拟目标。
+
+        短手贴脸攻击时角色站在怪正前方，角色模型+攻击特效会遮住怪物，
+        YOLO 置信度骤降被 conf 阈值过滤 → 本帧"看不到"锁定目标。
+        此时怪其实还在原处（贴脸近战怪基本不动），用最后已知位置继续打，
+        避免目标消失引发：
+          - 重选别的怪 → dx 符号翻转 → 左右乱转
+          - 攻击中断 → 转探索 → 角色离开 → 怪重新可见 → 反复贴脸失败
+
+        判定条件（全部满足才视为"被遮挡"，否则按怪真消失处理）：
+          1. 短手模式且正处于攻击状态（角色站定，位置稳定）
+          2. 角色与目标最后位置在同一平台
+          3. 角色与目标最后位置水平距离很近（贴脸距离 + 宽度容差）
+          4. 连续遮挡未超上限（OCCLUSION_MAX_FRAMES，超时视为怪真消失）
+        """
+        if getattr(self.config, "attack_type", "long") != "short":
+            return None  # 长手站远程打，不会贴脸遮挡，保持原逻辑
+        if self._target_monster is None:
+            return None
+        if self._fsm.current != State.ATTACKING:
+            return None
+        if ctx.self_position is None:
+            return None
+        sx, sy = ctx.self_position
+        t = self._target_monster
+        if not self._same_platform(sy, t.y + t.h):
+            return None  # 已跨层 → 非遮挡
+        if abs(sx - t.center[0]) > self._get_attack_range() + OCCLUSION_HALF_WIDTH_X:
+            return None  # 角色不在目标跟前 → 非遮挡
+        self._occluded_frames += 1
+        if self._occluded_frames > OCCLUSION_MAX_FRAMES:
+            self._log("[目标] 目标被遮挡超时，判定已消失，放弃攻击")
+            return None
+        if self._occluded_frames == 1:
+            self._log("[目标] 目标被角色遮挡，沿用最后位置继续攻击")
+        return t
 
     def _pick_best_target(self, ctx: Context,
                           exclude: Optional[Detection] = None) -> Detection:
@@ -635,6 +786,25 @@ class DecisionEngine:
     # 攻击范围判定
     # =========================================================================
 
+    def _effective_self_pos(self, ctx: Context) -> Optional[Tuple[int, int]]:
+        """返回当前帧决策用的自身脚底坐标。
+
+        OCR 定位成功 → 实时坐标。
+        定位暂时失败（技能特效遮挡角色名字 / 怪物名与角色名重叠 /
+        OCR 抖动）但正处于【站定攻击】中 → 用最后已知位置兜底
+        （_last_self_pos，带 SELF_POS_STALE_FRAMES 时效）。
+        站定攻击中角色位置不变，短时用旧坐标准确且安全，避免
+        "特效挡名字 → 放弃目标 → 转探索乱走" 的反复空转。
+        其余状态（追击/探索/移动中）定位失败 → 返回 None，
+        由各调用方按原有逻辑处理（不盲打/不追错方向）。
+        """
+        if ctx.self_position is not None:
+            return ctx.self_position
+        if self._fsm.current == State.ATTACKING and self._last_self_pos is not None \
+                and self._self_pos_stale_frames <= SELF_POS_STALE_FRAMES:
+            return self._last_self_pos
+        return None
+
     def _get_attack_range(self) -> int:
         """返回当前生效的攻击距离（像素）。
 
@@ -671,7 +841,7 @@ class DecisionEngine:
         避免 OCR/YOLO 帧间几像素抖动导致"攻击刚触发就中断、来回跑"。
         目标已明显离开（超过滞回窗口）才判定不可攻击。
         """
-        foot = ctx.self_position
+        foot = self._effective_self_pos(ctx)
         if foot is None or target is None:
             return False
         sx, sy = foot
@@ -768,12 +938,13 @@ class DecisionEngine:
         # 攻击中带滞回（_can_attack）：轻微抖动/怪物中心波动不中断攻击，
         # 防止"打一下就跑"的横跳。
         if target is not None:
-            if ctx.self_position is None:
-                # OCR 无法定位自身 → 无法判断距离，放弃攻击
+            foot = self._effective_self_pos(ctx)
+            if foot is None:
+                # OCR 定位失败且不在站定攻击中 → 无法判断距离，放弃攻击
                 self._log("[攻击] 无法定位自身位置，放弃攻击")
                 return
             if not self._can_attack(ctx, target):
-                sx, sy = ctx.self_position
+                sx, sy = foot
                 mx = target.center[0]
                 self._log(
                     f"[攻击] 不同平台或怪物不在攻击范围内"
@@ -784,7 +955,7 @@ class DecisionEngine:
                 return
 
             # ---- 转向：怪物在右 → 按右键；怪物在左 → 按左键；正下方 → 不按 ----
-            sx = ctx.self_position[0]
+            sx = foot[0]
             dx = target.center[0] - sx
             need = None
             if dx > FACE_TURN_X:
@@ -815,11 +986,12 @@ class DecisionEngine:
         # ---- 距离守卫（规则1/2）：脚底判同平台 + 中心x判攻击距离 ----
         # 无法定位自身 → 放弃攻击（不盲打）
         if target is not None:
-            if ctx.self_position is None:
+            foot = self._effective_self_pos(ctx)
+            if foot is None:
                 self._log("[攻击] 无法定位自身位置，放弃攻击")
                 return
             if not self._can_attack(ctx, target):
-                sx, sy = ctx.self_position
+                sx, sy = foot
                 mx = target.center[0]
                 self._log(
                     f"[攻击] 不同平台或怪物不在攻击范围内"
