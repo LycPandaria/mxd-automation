@@ -306,6 +306,25 @@ class DecisionEngine:
         # ---- 优先级 3: 检测到怪物 ----
         if ctx.monsters:
             self._handle_monsters(ctx)
+        elif self._fsm.current == State.ATTACKING and self._target_monster is not None:
+            # 攻击中整帧看不到任何怪：短手贴脸时角色+攻击特效可能把怪
+            # 完全遮住 → YOLO 整帧漏检。先走遮挡判定维持虚拟目标继续攻击，
+            # 避免"怪消失 → 转探索乱走 → 怪露出 → 重选目标"的反复空转。
+            occluded = self._occluded_target(ctx)
+            if occluded is not None:
+                if getattr(self.config, "attack_type", "long") == "short":
+                    self._handle_melee(ctx, occluded)
+                else:
+                    self._attack(ctx, occluded)
+                return
+            self._fsm.transition(State.IDLE)
+            # 画面中已没有怪物：立即解除锁定并清理攀爬等残留状态，
+            # 防止"上帧还锁着怪/在爬绳"的状态影响后续探索与重新选怪
+            self._target_monster = None
+            self._attack_stale_counter = 0
+            self._climbing = False
+            self._climb_exit_frames = 0
+            self._explore(ctx)
         else:
             self._fsm.transition(State.IDLE)
             # 画面中已没有怪物：立即解除锁定并清理攀爬等残留状态，
@@ -581,8 +600,12 @@ class DecisionEngine:
         # 转向：怪物在右→按右键，怪物在左→按左键。
         # 仅当 怪物还没贴脸(|dx| > 攻击距离) 且 朝向不符 才按，
         # 避免贴脸状态下按方向键把角色推过怪物。
-        if target is not None and ctx.self_position is not None:
-            sx = ctx.self_position[0]
+        if target is not None:
+            foot = self._effective_self_pos(ctx)
+            if foot is None:
+                self._cast_skill()
+                return
+            sx = foot[0]
             dx = target.center[0] - sx
             melee_range = self._get_attack_range()
             need = None
@@ -704,9 +727,14 @@ class DecisionEngine:
             return None
         if self._fsm.current != State.ATTACKING:
             return None
-        if ctx.self_position is None:
+        # 用"有效位置"而非实时位置：贴脸时角色名字也可能被怪/攻击特效遮挡，
+        # OCR 定位失败 → ctx.self_position 为 None。攻击中角色位置不变，
+        # 用最后已知位置(_last_self_pos)兜底判遮挡，避免"怪被遮 + 名字被遮"
+        # 同时发生时遮挡判定失败 → 清空锁定 → 转探索乱走的死循环。
+        foot = self._effective_self_pos(ctx)
+        if foot is None:
             return None
-        sx, sy = ctx.self_position
+        sx, sy = foot
         t = self._target_monster
         if not self._same_platform(sy, t.y + t.h):
             return None  # 已跨层 → 非遮挡

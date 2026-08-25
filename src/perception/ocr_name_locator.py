@@ -267,11 +267,27 @@ class OCRNameLocator:
     # ---- 内部 ----
 
     def _match(self, target: str, text: str) -> bool:
-        """匹配名字。"""
+        """匹配名字。
+
+        OCR 对中文名常识别出空格/标点/单字误差（如"彤彤 是我"、
+        "彤彤是我。"、"彤彤是我a"），精确比较会漏 → 定位失败。
+        先归一化（去掉所有空白）再匹配，提高定位鲁棒性：
+        - exact_match: 归一化后完全相等；归一化后长度差 ≤ 2 时也接受
+          "包含"（OCR 在名字前后粘了 1~2 个杂字仍可命中），
+          长文本（如聊天框"彤彤是我 你在哪"）因长度差大被拒绝，防误配。
+        - 包含匹配: 归一化后 target in text。
+        """
         text = text.strip()
+        if not text or not target:
+            return False
+        norm = "".join(text.split())
         if self._exact_match:
-            return text == target
-        return target in text
+            if norm == target:
+                return True
+            if abs(len(norm) - len(target)) <= 2:
+                return target in norm
+            return False
+        return target in norm
 
     def _get_engine(self):
         """延迟初始化 RapidOCR 引擎。
