@@ -85,7 +85,7 @@ YOLO 检测到怪物 → 筛选同平台怪物（脚底 Y 差 ≤ attack_range_y
 | `confidence` | `0.5` | YOLO 检测置信度阈值 |
 | `model_path` | 模型路径 | YOLO 模型文件路径 |
 | `self_name` | `我是立立` | 角色名字（OCR 定位用） |
-| `attack_range` | `100` | 攻击范围（像素），进入此范围后开始攻击 |
+| `attack_range` | `200` | 攻击范围（像素），长手专用（exe 界面"攻击距离px"可修改）；短手固定 50px 不读此配置 |
 | `attack_range_y` | `80` | 同平台垂直容差（像素） |
 | `skills` | 技能列表 | `[{name, key, cooldown}, ...]` |
 

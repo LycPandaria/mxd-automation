@@ -406,9 +406,10 @@ class MainWindow(QMainWindow):
         atk_type = getattr(c, "attack_type", "long")
         idx = self.attack_type_combo.findData(atk_type)
         self.attack_type_combo.setCurrentIndex(idx if idx >= 0 else 0)
-        # 长手/短手共用同一个攻击距离 attack_range
+        # 攻击距离：长手读 config.attack_range，短手固定 50（_sync_distance_ui 内处理）
         self.distance_spin.setValue(int(getattr(c, "attack_range", 200)))
         self.attack_range_y_spin.setValue(int(getattr(c, "attack_range_y", 60)))
+        self._sync_distance_ui()
         # 拾取
         self.pickup_checkbox.setChecked(getattr(c, "pickup_enabled", True))
         self.pickup_key_edit.setText(getattr(c, "pickup_key", "z"))
@@ -444,7 +445,8 @@ class MainWindow(QMainWindow):
         c.mp_threshold = self.mp_thr_spin.value() / 100
         c.jump_key = self.jump_key_edit.text().strip() or "alt"
         c.attack_type = self.attack_type_combo.currentData()
-        c.attack_range = self.distance_spin.value()  # 长手/短手共用攻击距离
+        if c.attack_type == "long":
+            c.attack_range = self.distance_spin.value()  # 长手距离可在界面修改
         c.attack_range_y = self.attack_range_y_spin.value()
         # 拾取
         c.pickup_enabled = self.pickup_checkbox.isChecked()
@@ -494,15 +496,23 @@ class MainWindow(QMainWindow):
         save_user_config(self.config)
 
     def _sync_distance_ui(self):
-        """根据攻击类型切换距离提示文字（数值共用 attack_range，保持不变）。"""
+        """根据攻击类型同步距离输入框状态。
+
+        长手: 距离在界面可调（写入 config.attack_range，exe 可修改）。
+        短手: 贴脸距离固定 50px，禁用输入框，不读 config.attack_range。
+        """
         if self.config.attack_type == "short":
-            self.distance_label.setText("攻击距离px:")
+            self.distance_label.setText("近战距离px: (固定50)")
+            self.distance_spin.setEnabled(False)
+            self.distance_spin.setValue(50)
             self.distance_spin.setToolTip(
-                "短手(近战): 与怪物水平差≤此值判定为贴脸可攻击；"
-                "未贴脸径直追上，怪物走远立即追击"
+                "短手(近战): 贴脸距离固定 50px，不允许修改；"
+                "与长手攻击距离完全独立"
             )
         else:
             self.distance_label.setText("攻击距离px:")
+            self.distance_spin.setEnabled(True)
+            self.distance_spin.setValue(int(getattr(self.config, "attack_range", 200)))
             self.distance_spin.setToolTip(
                 "长手(远程): 与怪物水平差≤此值才触发攻击，攻击中轻微波动不中断"
             )

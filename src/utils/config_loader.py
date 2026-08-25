@@ -241,7 +241,7 @@ def _defaults() -> Dict[str, Any]:
         "target_key": "tab",  # 选目标键
         "jump_key": "alt",    # 跳跃键
         "attack_type": "long",  # 攻击类型: "long"(长手) / "short"(短手)
-        "attack_range": 200,  # 攻击距离（px）：长手/短手共用，水平差小于此值才触发攻击
+        "attack_range": 200,  # 攻击距离（px）：长手专用（exe 界面可修改）；短手固定 50px 不读此配置
         "attack_range_y": 60, # 攻击垂直容差（px）：垂直差小于此值时怪物就在身边，
                               # 即使路径被推算为 rope/jump 也直接攻击，不绕路
         "skills": [

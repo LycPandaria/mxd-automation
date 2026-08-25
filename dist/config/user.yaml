@@ -39,7 +39,6 @@ target_key: tab
 jump_key: c
 attack_type: short
 attack_range: 30
-melee_attack_range: 60
 attack_range_y: 60
 skills:
 - name: 技能1

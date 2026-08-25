@@ -39,10 +39,10 @@ target_key: tab
 jump_key: c
 attack_type: short
 attack_range: 50
-attack_range_y: 60
+attack_range_y: 55
 skills:
 - name: 技能1
-  key: s
+  key: a
   cooldown: 1.0
 - name: 技能2
   key: shift

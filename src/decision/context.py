@@ -76,9 +76,17 @@ from .distance import (
 ATTACK_RANGE_X = 200
 """攻击范围默认值：自身与怪物 X 坐标差小于此值才开始攻击（像素）。
 
-长手/短手共用 config.attack_range 这一个数值；
-实际生效值取 config.attack_range（用户可在配置/UI 调整），
-此常量仅作 __init__ 里的兜底默认值。
+仅长手(远程)使用：实际生效值取 config.attack_range
+（exe 界面"攻击距离px"可修改），此常量仅作 __init__ 里的兜底默认值。
+短手(近战)固定 MELEE_ATTACK_RANGE_X=50，不读此配置。
+"""
+
+MELEE_ATTACK_RANGE_X = 50
+"""短手(近战)固定贴脸距离（像素），【不允许配置修改】。
+
+短手与长手攻击距离完全独立：长手读 exe 配置(attack_range)，
+短手固定 50px。贴脸判定用"角色到怪近侧身体边缘"的距离，
+宽怪站旁边就能打，不穿越怪身体。
 """
 
 ROPE_SEARCH_RANGE_X = 200
@@ -127,6 +135,25 @@ MELEE_LEAVE_FRAMES = 6
 超过滞回窗口后不立即切追击：攻击位移/怪物被推开通常是 1~3 帧的
 瞬时抖动，连续超出该帧数才判定"怪物真走远了"转为追击，避免攻击
 状态 1 帧就断、攻击断断续续。防抖期间原地继续攻击（不移动）。
+"""
+
+MELEE_EDGE_MAX_HALF_W = 50
+"""短手贴脸判定中怪半宽的上限（像素）。
+
+近战攻击命中怪身体任意部位即可，贴脸判定用"角色到怪近侧身体边缘"
+的距离（= 怪中心距 - 怪半宽）。普通怪 bbox 半宽约 25~70px，直接减
+半宽会让超宽怪（boss/大怪）离老远就判定贴脸；封顶 50px 后最大有效
+贴脸距离 = 攻击距离 + 50，既消除大怪穿越、又不会离远就空打。
+"""
+
+MELEE_FACE_DEADZONE_X = 25
+"""短手攻击前转向的"重叠死区"（像素）。
+
+先扭头再攻击：攻击前判定怪在角色哪一侧，背对怪就按方向键转身再
+施法，避免朝反方向空打。但转身按方向键会让角色朝怪移动一小步，
+若角色已与怪身体重叠/极近（角色到怪近侧边缘 ≤ 死区），转身会穿过
+怪身体造成"左右来回顶"——此时保持当前朝向直接攻击（怪就在身前/
+身侧，攻击可命中），不转向。
 """
 
 OCCLUSION_HALF_WIDTH_X = 40
@@ -491,15 +518,16 @@ class DecisionEngine:
         """短手（近战）独立攻击判定。
 
         与长手（远程）完全不同，核心是【贴脸】:
-          - 未贴脸（水平差 > 攻击距离 attack_range）→ 不攻击，径直走向怪物贴身
-          - 贴脸（水平差 ≤ attack_range 且同平台）→ 停止移动，转向 + 攻击
+          - 未贴脸（到怪近侧身体边缘距离 > 攻击距离）→ 不攻击，径直走向怪物贴身
+          - 贴脸（边缘距离 ≤ 攻击距离 且同平台）→ 停止移动，转向 + 攻击
           - 攻击中怪物走远 → 下一帧判定未贴脸 → 立即转为追击，不停在原地空打
         没有远程那套"站定攻击 + 大滞回窗口"的逻辑。
-        攻击距离与长手共用 config.attack_range。
+        攻击距离固定 MELEE_ATTACK_RANGE_X(50px)，不随 exe 配置变化，
+        距离判定用"角色到怪近侧身体边缘"，宽怪站旁边就打、不穿越。
 
         攻击中(ATTACKING)带滞回窗口 MELEE_HYSTERESIS_X + 防抖帧数
         MELEE_LEAVE_FRAMES：角色攻击位移/怪物被推开/转身小步会让
-        水平差瞬时变大 30~40px，滞回+防抖保证"打一下就退走、追来
+        边缘距离瞬时变大 30~40px，滞回+防抖保证"打一下就退走、追来
         追去贴不上去"的抖动不会发生。
         """
         if target is None:
@@ -519,7 +547,8 @@ class DecisionEngine:
             # "怪已经连上(贴脸)但 OCR 恰好失败 → 角色干等不攻击"。
             if self._last_self_pos is not None \
                     and self._self_pos_stale_frames <= SELF_POS_STALE_FRAMES \
-                    and abs(self._last_self_pos[0] - target.center[0]) \
+                    and abs(self._last_self_pos[0]
+                            - self._melee_edge_x(self._last_self_pos[0], target)) \
                         <= self._get_attack_range():
                 foot = self._last_self_pos
             else:
@@ -527,10 +556,10 @@ class DecisionEngine:
                 return
 
         sx, sy = foot
-        mx = target.center[0]
-        mfoot_y = target.y + target.h
-        dx = abs(sx - mx)
-        dy = abs(sy - mfoot_y)
+        # 贴脸距离用"角色到怪近侧身体边缘"，不用怪中心：
+        # 宽怪站怪旁边（离怪身体 0~攻击距离）就能攻击，不穿越怪身体。
+        dx = abs(sx - self._melee_edge_x(sx, target))
+        dy = abs(sy - (target.y + target.h))
         melee_range = self._get_attack_range()
         ry = getattr(self.config, "attack_range_y", 60)
 
@@ -583,7 +612,8 @@ class DecisionEngine:
             self._release_move()
             return
         sx = ctx.self_position[0]
-        tx = target.center[0]
+        # 追击目标点 = 怪近侧身体边缘（走到离怪身体 攻击距离-5px 处停下）
+        tx = self._melee_edge_x(sx, target)
         melee_range = self._get_attack_range()
 
         if self._stuck_counter >= STUCK_FRAMES:
@@ -603,22 +633,24 @@ class DecisionEngine:
             self._release_move()
 
     def _melee_attack(self, ctx: Context, target: Detection):
-        """近战攻击：站定转向面向怪物并释放技能。
+        """近战攻击：先判定怪在哪边扭头面向它，再站定释放技能。
 
-        转向按方向键会让角色移动一小步，在贴脸距离内会造成角色
-        穿越怪物左右来回顶。因此【已贴脸(水平差≤攻击距离)时绝不转向】，
-        只在对准方向与怪物不一致且怪物还在攻击距离外时才按方向键。
+        核心：每次攻击前判定怪物相对角色的方位（看怪中心 x 的符号），
+        只要怪在角色背后就按方向键转身——先扭头再攻击，避免朝反方向
+        空打。转身会让角色朝怪移动一小步，因此两个例外【不转向】:
+          - 角色已与怪身体重叠/极近（edge_dx ≤ MELEE_FACE_DEADZONE_X）：
+            转身会穿过怪身体左右来回顶，保持原朝向直接攻击（怪就在
+            身前/身侧，攻击可命中）。
+          - 防抖窗口内(_melee_leave_frames>0)/遮挡虚拟目标期间
+            (_occluded_frames>0)：怪刚走远正在确认、或位置是最后的，
+            转向=边打边追穿越怪，表现为"贴着怪左右晃动"。
         """
         self._release_move()  # 攻击时站定
         self._stuck_counter = 0  # 站定攻击不算"卡住"（位置不变是正常的）
 
-        # 转向：怪物在右→按右键，怪物在左→按左键。
-        # 仅当 怪物还没贴脸(|dx| > 攻击距离) 且 朝向不符 才按，
-        # 避免贴脸状态下按方向键把角色推过怪物。
-        # 【防抖窗口内】(怪刚超出贴脸、正在确认是否真走远)和
-        # 【遮挡虚拟目标期间】(怪在角色身上/正前方，位置是最后的，
-        # 朝它走=穿越怪)【绝不转向移动】，否则角色会边打边追穿越
-        # 怪物、或朝旧位置左右来回跑，表现为"贴着怪左右晃动"。
+        # 先判定怪在哪边（怪中心 x 相对角色 x 的符号），背对怪就扭头。
+        # 方向看怪中心（符号决定面朝哪侧），距离看怪近侧身体边缘
+        # （决定能否安全转身）。转向带 0.6s 冷却，不会高频反复转。
         if target is not None and self._melee_leave_frames == 0 \
                 and self._occluded_frames == 0:
             foot = self._effective_self_pos(ctx)
@@ -626,29 +658,22 @@ class DecisionEngine:
                 self._cast_skill()
                 return
             sx = foot[0]
-            dx = target.center[0] - sx
-            melee_range = self._get_attack_range()
+            center_dx = target.center[0] - sx
+            edge_dx = abs(sx - self._melee_edge_x(sx, target))
             need = None
-            if dx > FACE_TURN_X and dx > melee_range:
+            if center_dx > FACE_TURN_X and edge_dx > MELEE_FACE_DEADZONE_X:
                 need = "right"
-            elif dx < -FACE_TURN_X and dx < -melee_range:
+            elif center_dx < -FACE_TURN_X and edge_dx > MELEE_FACE_DEADZONE_X:
                 need = "left"
             if need is not None and need != self._face_dir:
-                # 方向粘滞：怪在左右两侧小幅往返（目标切换/击退/检测抖动）
-                # 时，只要怪还在滞回窗口内就维持当前朝向继续攻击，
-                # 避免贴脸处角色跟着怪左右来回转向乱跑。
-                if self._face_dir is not None:
-                    if need == "right" and dx < melee_range + MELEE_HYSTERESIS_X:
-                        need = None
-                    elif need == "left" and dx > -(melee_range + MELEE_HYSTERESIS_X):
-                        need = None
-                if need is not None and need != self._face_dir:
-                    if self.executor.press_key(need, cooldown=0.6):
-                        self._face_dir = need
-                        self._log(
-                            f"[朝向] 怪物在{'右' if need == 'right' else '左'}"
-                            f"({dx:+d}px)，按{need}转向"
-                        )
+                # need != _face_dir 即"角色背对怪"→ 扭头。edge_dx ≤ 死区
+                # 时 need 已为 None（重叠极近不转），不会出现转身穿怪。
+                if self.executor.press_key(need, cooldown=0.6):
+                    self._face_dir = need
+                    self._log(
+                        f"[朝向] 怪物在{'右' if need == 'right' else '左'}"
+                        f"(中心{center_dx:+d}px/边缘{edge_dx}px)，按{need}转向"
+                    )
 
         self._cast_skill()
 
@@ -758,7 +783,11 @@ class DecisionEngine:
         t = self._target_monster
         if not self._same_platform(sy, t.y + t.h):
             return None  # 已跨层 → 非遮挡
-        if abs(sx - t.center[0]) > self._get_attack_range() + OCCLUSION_HALF_WIDTH_X:
+        # 遮挡判定同样用"到怪近侧边缘"的距离：贴脸打怪时角色就在怪
+        # 身体旁边（边缘距离≈0），中心距离可能超过攻击距离的怪（宽怪）
+        # 也能正确判定"角色在怪跟前"，不会误判非遮挡而清空锁定。
+        if abs(sx - self._melee_edge_x(sx, t)) \
+                > self._get_attack_range() + OCCLUSION_HALF_WIDTH_X:
             return None  # 角色不在目标跟前 → 非遮挡
         self._occluded_frames += 1
         if self._occluded_frames > OCCLUSION_MAX_FRAMES:
@@ -856,11 +885,32 @@ class DecisionEngine:
     def _get_attack_range(self) -> int:
         """返回当前生效的攻击距离（像素）。
 
-        长手/短手共用同一个 attack_range 数值，切换的是攻击判定代码：
+        - 短手(近战): 固定 MELEE_ATTACK_RANGE_X(50)，【不允许配置修改】，
+          与长手完全独立，不读 exe 的 attack_range。
+        - 长手(远程): 读 config.attack_range（exe 界面"攻击距离px"可改）。
+        切换的是攻击判定代码：
         - 长手: 远程站定攻击（_can_attack/_chase/_attack）
         - 短手: 近战贴脸攻击（_handle_melee/_melee_chase/_melee_attack）
         """
+        if getattr(self.config, "attack_type", "long") == "short":
+            return MELEE_ATTACK_RANGE_X
         return getattr(self.config, "attack_range", ATTACK_RANGE_X)
+
+    def _melee_edge_x(self, sx: int, target: Detection) -> int:
+        """短手贴脸判定用的"怪近侧身体边缘 x"。
+
+        近战攻击特效命中怪身体任意部位即可，角色不用走到怪中心。
+        贴脸/追击/转向的距离判定统一用"角色到怪近侧边缘"：
+        宽怪站在旁边就能打，避免为贴中心而穿进怪身体、穿到另一侧
+        又超距折返的"左右来回穿"抖动。
+        怪半宽取 min(bbox 半宽, MELEE_EDGE_MAX_HALF_W) 封顶，
+        防止超宽怪（boss）离老远就判定贴脸。
+        注：此函数只用于"距离"判定；"怪在哪边/面朝哪侧"仍看怪中心。
+        """
+        half_w = min(target.w / 2.0, MELEE_EDGE_MAX_HALF_W)
+        if target.center[0] > sx:
+            return target.center[0] - half_w
+        return target.center[0] + half_w
 
     def _in_attack_range(self, sx: int, tx: int) -> bool:
         """判断是否在攻击距离内（规则2：水平距离 ≤ 当前生效攻击距离）。
