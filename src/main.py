@@ -15,8 +15,8 @@
   │ detect_bar_ratio │──比─▶│ 同平台追击/爬绳  │     │ MouseController  │
   │  (HP/MP检测)     │       │ 下落/探索/技能   │     │  (鼠标注入)      │
   │                  │       │                  │     │                  │
-  │ OCRNameLocator   │──坐─▶│ self_position    │     │                  │
-  │  (名字定位)       │       │  (自身坐标)      │     │                  │
+  │ YoloDetector   │──坐─▶│ self_position    │     │                  │
+  │  (YOLO检测)       │       │  (自身坐标)      │     │                  │
   └──────────────────┘       └──────────────────┘     └──────────────────┘
 
 ================================================================================
@@ -24,10 +24,10 @@
 ================================================================================
 
   1. ScreenCapture.grab()          → frame (numpy BGR 数组)
-  2. YoloDetector.detect(frame)    → [Detection, ...]  (怪物/地板/绳索)
+  2. YoloDetector.detect(frame)    → [Detection, ...]  (玩家/怪物/地板/绳索)
   3. detect_bar_ratio(hp_region)   → hp_ratio (0.0~1.0)
   4. detect_bar_ratio(mp_region)   → mp_ratio (0.0~1.0)
-  5. OCRNameLocator.locate(frame)  → self_position (cx, cy) 或 None
+  5. 过滤 player 框 → self_position (脚底) / self_center (中心)
   6. Context(monsters, floors, ..., hp_ratio, mp_ratio, self_position)
   7. DecisionEngine.decide(ctx)    → 反应式决策（同平台追击/爬绳/下落/探索/技能）
   8. on_frame(frame, ...)          → 预览回调（UI 渲染检测框）
@@ -36,14 +36,13 @@
 自身定位策略
 ================================================================================
 
-  RapidOCR 文字识别（唯一方案，每帧实时执行）
-    原理: OCR 识别画面中的角色名字（如"我是立立"）→ 名字中心 ≈ 脚底；
-          角色中心点 = 名字中心向上延伸"人物高度一半"（character_height//2，约 30px）
-          名字在脚下 → 角色身体在名字上方 → 中心点在名字上方（y 更小）
-    条件: 已配置 self_name；每帧执行，与 YOLO 检测同节奏，无缓存兜底
-    说明: 早期"HP 条偏移推算"用的是 UI 底部固定血条（hp_region），
-          不随角色移动，算出的坐标恒定不变（定位 bug），已移除。
-          搜索区域为画面 10%~100%，以兼顾角色跳跃/高处时的定位。
+  YOLO player 框（唯一方案，不再用 OCR）
+    原理: YOLO 检测出画面中的 player（玩家）框；
+          脚底 = bbox 底部中点 (y+h)，角色中心 = bbox 中心点 (y+h//2)。
+          比 OCR 的"名字中心"更贴近真实站位。
+    多人同屏时区分"自己":
+          - 有历史位置 → 取离上一帧脚底最近的 player（位置连续性）
+          - 无历史位置（启动/换图）→ 取面积最大的 player（兜底启发式）
 
 ================================================================================
 运行方式
@@ -56,12 +55,9 @@ import time
 import threading
 from typing import Callable, Optional, Any, Tuple
 
-import numpy as np
-
 from .perception.screen_capture import ScreenCapture
 from .perception.yolo_detector import Detector, create_detector
 from .perception.hp_mp_detector import detect_bar_ratio
-from .perception.ocr_name_locator import OCRNameLocator
 from .execution.action_executor import ActionExecutor
 from .decision.context import Context, DecisionEngine
 from .utils.config_loader import Config, resolve_model_path
@@ -128,16 +124,10 @@ class Automation:
         self._thread = None    # 工作线程对象
         self._frame_count = 0  # 帧计数器（用于限频日志）
 
-        # ---- OCR 名字定位器（延迟初始化，首次使用时才加载模型）----
-        # ocr_interval=1: 每帧都执行 OCR（和 YOLO 一样），位置实时更新
-        # character_height=60: 人物高度约 60px，角色中心 = 名字中心 - 高度一半（向上）
-        self._ocr = OCRNameLocator(
-            character_height=60, ocr_interval=1,
-            exact_match=True,  # 精确匹配角色名，避免"包含匹配"误识别聊天框/UI文字
-            on_log=self.on_log,
-        )
-
-        # ---- 角色中心点缓存（由 OCR 定位时记录，供状态日志显示）----
+        # ---- 自身定位（YOLO player 框，不再用 OCR）----
+        # _last_self_foot: 上一帧自身脚底坐标，用于多 player 时的位置连续性选择
+        # _cached_center:  最近一次定位到的角色中心点（供状态日志显示）
+        self._last_self_foot: Optional[Tuple[int, int]] = None
         self._cached_center: Optional[Tuple[int, int]] = None
 
         # ---- HP/MP 变化追踪 ----
@@ -244,7 +234,7 @@ class Automation:
           1. 截图（grab）
           2. YOLO 检测（detect）→ 按类别过滤
           3. HP/MP 检测（颜色数像素）→ 比例
-          4. 自身定位（HP条偏移 / OCR 名字识别）→ 坐标
+          4. 自身定位（YOLO player 框）→ 坐标
           5. 组装 Context → DecisionEngine.decide()
           6. 预览回调 → UI 渲染
 
@@ -257,7 +247,7 @@ class Automation:
             self._frame_count += 1
 
             # ---- 全局异常兜底 ----
-            # 任何一步抛异常（截图/检测/OCR/决策）都不允许静默崩溃线程，
+            # 任何一步抛异常（截图/检测/定位/决策）都不允许静默崩溃线程，
             # 必须记录 traceback 到日志，便于定位问题。
             try:
                 self._loop_frame(interval)
@@ -301,14 +291,8 @@ class Automation:
             time.sleep(interval)
             return
 
-        # ---- 2. YOLO 检测 ----
-        # detect() 返回 [Detection, ...]，每个 Detection 包含:
-        #   cls_name, confidence, x, y, w, h, center
-        try:
-            detections = self.detector.detect(frame)
-        except Exception as e:
-            self.on_log(f"[错误] 检测失败: {e}")
-            detections = []
+        # ---- 2~5. 感知流水线：YOLO 检测 → HP/MP → 自身定位 ----
+        detections, hp_ratio, mp_ratio, self_pos = self._run_perception(frame)
 
         # 按类别名过滤（配置中可能用逗号分隔多个类别名）
         monster_classes = self._monster_classes()
@@ -330,33 +314,6 @@ class Automation:
                 parts.append(f"绳索{len(ropes)}条")
             if parts:
                 self.on_log("[地图] " + " | ".join(parts))
-
-        # ---- 3. HP 检测 ----
-        # scale_region(): 把参考分辨率下的坐标缩放到当前帧的实际像素
-        # 这样同一个配置文件兼容不同窗口大小
-        hp_region = self.config.scale_region(
-            self.config.hp_region, frame.shape[1], frame.shape[0]
-        )
-        # detect_bar_ratio(): 多方法融合检测（边缘→亮度→颜色）
-        hp_ratio = detect_bar_ratio(
-            frame, hp_region,
-            tuple(self.config.hp_color) if self.config.hp_color else None,
-            self.config.hp_tolerance,
-        )
-
-        # ---- 4. MP 检测 ----
-        mp_region = self.config.scale_region(
-            self.config.mp_region, frame.shape[1], frame.shape[0]
-        )
-        mp_ratio = detect_bar_ratio(
-            frame, mp_region,
-            tuple(self.config.mp_color) if self.config.mp_color else None,
-            self.config.mp_tolerance,
-            expand=3,  # MP 条下方是同色蓝色面板，减小扩展避免背景混入
-        )
-
-        # ---- 5. 自身定位 ----
-        self_pos = self._locate_self(frame)
 
         # ---- HP/MP 变化检测 ----
         if hp_ratio is not None:
@@ -418,6 +375,86 @@ class Automation:
             # 帧太快，sleep 补齐
             time.sleep(interval - elapsed)
 
+    def _run_perception(self, frame):
+        """感知流水线：YOLO 检测 → HP/MP 检测 → 自身定位（YOLO player 框）。
+
+        供主循环 _loop_frame 与单帧预览 preview_frame_once 共用，
+        返回 (detections, hp_ratio, mp_ratio, self_pos)。
+
+        Args:
+            frame: BGR 截图
+        """
+        # ---- YOLO 检测 ----
+        # detect() 返回 [Detection, ...]，每个 Detection 包含:
+        #   cls_name, confidence, x, y, w, h, center
+        try:
+            detections = self.detector.detect(frame)
+        except Exception as e:
+            self.on_log(f"[错误] 检测失败: {e}")
+            detections = []
+
+        # ---- HP 检测 ----
+        # scale_region(): 把参考分辨率下的坐标缩放到当前帧的实际像素
+        hp_region = self.config.scale_region(
+            self.config.hp_region, frame.shape[1], frame.shape[0]
+        )
+        # detect_bar_ratio(): 多方法融合检测（边缘→亮度→颜色）
+        hp_ratio = detect_bar_ratio(
+            frame, hp_region,
+            tuple(self.config.hp_color) if self.config.hp_color else None,
+            self.config.hp_tolerance,
+        )
+
+        # ---- MP 检测 ----
+        mp_region = self.config.scale_region(
+            self.config.mp_region, frame.shape[1], frame.shape[0]
+        )
+        mp_ratio = detect_bar_ratio(
+            frame, mp_region,
+            tuple(self.config.mp_color) if self.config.mp_color else None,
+            self.config.mp_tolerance,
+            expand=3,  # MP 条下方是同色蓝色面板，减小扩展避免背景混入
+        )
+
+        # ---- 自身定位（YOLO player 框）----
+        players = [d for d in detections if d.cls_name in self._player_classes()]
+        self_pos, _ = self._locate_self_from_players(players)
+
+        return detections, hp_ratio, mp_ratio, self_pos
+
+    def preview_frame_once(self) -> float:
+        """单次『截图 + 分析 + 预览』，供 UI“当前帧预览”按钮调试使用。
+
+        只走感知 + 预览，不触发决策与按键注入，避免调试时误动角色。
+        返回本次总耗时（秒）。
+        """
+        t0 = time.perf_counter()
+        try:
+            frame = self.capture.grab()
+        except Exception as e:
+            self.on_log(f"[预览] 截图失败: {e}")
+            return time.perf_counter() - t0
+
+        detections, hp_ratio, mp_ratio, self_pos = self._run_perception(frame)
+        self.on_frame(frame, detections, hp_ratio, mp_ratio)
+
+        # 输出自身坐标（脚底 + 角色中心）到日志，供调试
+        center = self._get_last_center()
+        if self_pos:
+            if center:
+                self.on_log(
+                    f"[预览] 自身坐标 脚底=({self_pos[0]},{self_pos[1]}) "
+                    f"中心=({center[0]},{center[1]})"
+                )
+            else:
+                self.on_log(f"[预览] 自身坐标 脚底=({self_pos[0]},{self_pos[1]})")
+        else:
+            self.on_log("[预览] 自身未定位（未检测到 player）")
+
+        elapsed = time.perf_counter() - t0
+        self.on_log(f"[预览] 单帧分析+预览完成，总耗时 {elapsed * 1000:.1f}ms")
+        return elapsed
+
     # =========================================================================
     # 类别名解析（从配置的逗号分隔字符串 → 列表）
     # 例如: "monster" → ["monster"]
@@ -451,50 +488,47 @@ class Automation:
     def _rope_classes(self):
         return [c.strip() for c in self.config.rope_classes.split(",") if c.strip()]
 
+    def _player_classes(self):
+        return [c.strip() for c in self.config.player_classes.split(",") if c.strip()]
+
     # =========================================================================
-    # 自身定位
+    # 自身定位（YOLO player 框）
     # =========================================================================
 
-    def set_self_name(self, name: str):
-        """运行时更新自身名字（UI 输入框改动时调用）。"""
-        self.config.self_name = name
+    def _locate_self_from_players(self, players):
+        """从 YOLO player 检测框定位自身，返回 (脚底, 角色中心)。
 
-    def _locate_self(self, frame: np.ndarray) -> Optional[Tuple[int, int]]:
-        """定位自身脚底在画面中的坐标。
+        脚底 = player bbox 底部中点 (y+h)；角色中心 = bbox 中心点 (y+h//2)。
+        比 OCR 的"名字中心"更贴近真实站位。
 
-        策略:
-          RapidOCR 文字识别 - 每帧实时执行，识别到即返回（与 YOLO 同节奏）
-
-        说明:
-          早期版本优先用"HP 条偏移推算"（hp_region + self_offset），
-          但 hp_region 是 UI 底部固定的血条，不随角色移动，
-          算出的坐标恒定不变，导致定位失效（bug），已移除该方案。
-          不做缓存兜底：本帧未识别到名字即返回 None，
-          由决策层按"未定位"处理，避免使用过期位置。
+        多人同屏时的选择策略（区分"自己"和"其他玩家"）：
+          - 无历史位置（启动/换图）：取面积最大的 player（兜底启发式）；
+          - 有历史位置：取离上一帧脚底最近的 player（位置连续性）。
 
         Returns:
-            (cx, cy) 脚底坐标，None 表示本帧未识别到角色名字
+            (foot, center) 两个 (x, y) 元组；未检测到 player 时返回 (None, None)
         """
-        # 搜索区域：画面 10%~92%
-        # 底部 8% 是 UI 面板（HP/MP/角色名固定显示），排除掉，
-        # 否则 OCR 会匹配到 UI 里的角色名（固定位置永不变化），
-        # 导致定位锁死在 (385,760) 这种错误坐标
-        h, w = frame.shape[:2]
-        search_region = (0, int(h * 0.10), w, int(h * 0.82))
+        if not players:
+            return None, None
 
-        result = self._ocr.locate(frame, self.config.self_name,
-                                  search_region=search_region)
-        if result is not None:
-            center_x, center_y, foot_x, foot_y = result
-            # 记录中心点（用于日志）
-            self._cached_center = (center_x, center_y)
-            return (foot_x, foot_y)
+        if self._last_self_foot is None or len(players) == 1:
+            # 启动兜底 / 单玩家：取面积最大的（单玩家时即唯一那个）
+            p = max(players, key=lambda d: d.w * d.h)
+        else:
+            # 位置连续性：取离上一帧脚底最近的 player
+            lx, ly = self._last_self_foot
+            p = min(players, key=lambda d:
+                    (d.center[0] - lx) ** 2 + (d.center[1] - ly) ** 2)
 
-        # 本帧未识别到 → 不返回缓存，直接视为未定位
-        return None
+        foot = (p.center[0], p.y + p.h)
+        center = (p.center[0], p.y + p.h // 2)
+
+        self._last_self_foot = foot
+        self._cached_center = center
+        return foot, center
 
     def _get_last_center(self) -> Optional[Tuple[int, int]]:
-        """获取最近一次定位到的角色中心点（供日志用）。"""
+        """获取最近一次定位到的角色中心点（供日志/预览用）。"""
         return self._cached_center
 
 

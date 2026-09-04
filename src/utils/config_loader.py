@@ -52,7 +52,8 @@ YAML 配置字段说明
   monster_classes:  怪物类别名（逗号分隔）
   floor_classes:    地板类别名
   rope_classes:    绳索类别名
-  self_name:        自身角色名字（用于 OCR 定位）
+  player_classes:  玩家类别名（用于自身定位）
+  self_name:        自身角色名字（已废弃，改用 YOLO player 定位）
   self_offset:      自身 HP 条底部到脚底的偏移像素数
   hp_region:        HP 条参考区域 [x, y, w, h] 或百分比
   hp_color:         HP 条颜色 [R, G, B]
@@ -222,8 +223,9 @@ def _defaults() -> Dict[str, Any]:
         "monster_classes": "monster",
         "floor_classes": "floor",
         "rope_classes": "rope",
+        "player_classes": "player",
         # ---- 自身定位 ----
-        "self_name": "",  # 角色脚底名字，用于 OCR 定位
+        "self_name": "",  # 已废弃，改用 YOLO player 定位
         "self_offset": 85,  # HP 条底部 → 脚底的偏移像素
         # ---- HP 检测 ----
         "hp_region": None,  # [x, y, w, h] 参考分辨率下的 HP 条区域

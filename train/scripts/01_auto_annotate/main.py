@@ -28,7 +28,7 @@ from typing import Dict, List, Tuple, Set
 
 # 类别映射（与 data.yaml 保持一致）
 # 数字 → 类别名，用于训练时指定 YOLO 类别 ID
-CLASSES = {0: "floor", 1: "monster", 2: "rope"}
+CLASSES = {0: "floor", 1: "monster", 2: "rope", 3: "player"}
 
 # 类别名 → 数字，用于解析 XML 时把类别名转为 ID
 NAME_TO_ID = {v: k for k, v in CLASSES.items()}

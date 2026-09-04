@@ -1,4 +1,4 @@
-path: D:/pythonProjects/mxd-automation/train/data
+path: D:/GAME/mxd-automation/train/data
 train: images/train
 val: images/val
 
@@ -6,4 +6,5 @@ names:
   0: floor
   1: monster
   2: rope
-nc: 3
+  3: player
+nc: 4

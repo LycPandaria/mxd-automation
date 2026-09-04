@@ -14,6 +14,7 @@
 import os
 import sys
 import time
+from datetime import datetime
 
 # 确保项目根目录在 sys.path 中，使得 `src` / `ui` 可作为顶层包导入
 _PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -38,6 +39,7 @@ from src.utils.config_loader import (
 from src.perception.yolo_detector import create_detector
 from src.perception.hp_mp_detector import detect_region_color
 from src.main import Automation
+from src.utils.logger import get_logger
 
 from ui.preview_label import PreviewLabel
 
@@ -68,6 +70,11 @@ class MainWindow(QMainWindow):
         self._fps_counter = [0, time.time()]
         self._preview_timer = QTimer(self)
         self._preview_timer.timeout.connect(self._update_fps)
+
+        # 自动截图定时器：每 5 秒截一张游戏画面保存到 train/data/raw/
+        self._screenshot_timer = QTimer(self)
+        self._screenshot_timer.setInterval(5000)
+        self._screenshot_timer.timeout.connect(self._on_auto_screenshot_tick)
 
         self._init_ui()
         self._load_config_to_ui()
@@ -154,6 +161,13 @@ class MainWindow(QMainWindow):
             lambda: self.preview.set_select_mode(True, "mp")
         )
         ctl.addWidget(self.mp_pick_btn)
+        self.preview_once_btn = QPushButton("当前帧预览")
+        self.preview_once_btn.clicked.connect(self._on_preview_frame)
+        ctl.addWidget(self.preview_once_btn)
+        self.auto_shot_check = QCheckBox("自动截图(5s)")
+        self.auto_shot_check.setToolTip("开启后每 5 秒截一张游戏画面，保存到 train/data/raw/")
+        self.auto_shot_check.toggled.connect(self._on_toggle_auto_shot)
+        ctl.addWidget(self.auto_shot_check)
         v.addLayout(ctl)
 
         # 日志
@@ -629,6 +643,56 @@ class MainWindow(QMainWindow):
         except Exception:
             return None
 
+    def _on_preview_frame(self):
+        """单帧预览：截图 + 分析 + 预览，并在日志输出总耗时（供调试）。"""
+        if self.automation.running:
+            QMessageBox.information(self, "提示", "自动打怪运行中已持续预览，请先停止后再单帧预览。")
+            return
+        if not self.automation.window_locked:
+            QMessageBox.warning(self, "提示", "请先锁定游戏窗口")
+            return
+        self._on_log("[预览] 触发单帧分析预览 ...")
+        self.automation.preview_frame_once()
+
+    def _on_toggle_auto_shot(self, checked):
+        """自动截图开关：开启后每 5 秒保存一张游戏画面到 train/data/raw/。"""
+        if checked:
+            if not self.automation.window_locked:
+                QMessageBox.warning(self, "提示", "请先锁定游戏窗口")
+                self.auto_shot_check.blockSignals(True)
+                self.auto_shot_check.setChecked(False)
+                self.auto_shot_check.blockSignals(False)
+                return
+            self._screenshot_timer.start(5000)
+            self._log("[截图] 自动截图已开启（每5秒），保存到 train/data/raw/")
+        else:
+            self._screenshot_timer.stop()
+            self._log("[截图] 自动截图已关闭")
+
+    def _on_auto_screenshot_tick(self):
+        """截取当前锁定窗口画面，保存为 PNG 到 train/data/raw/。"""
+        try:
+            frame = self.automation.capture.grab()
+        except Exception as e:
+            self._log(f"[截图] 截取失败: {e}")
+            return
+
+        raw_dir = os.path.join(_PROJECT_ROOT, "train", "data", "raw")
+        try:
+            os.makedirs(raw_dir, exist_ok=True)
+        except Exception as e:
+            self._log(f"[截图] 创建目录失败: {e}")
+            return
+
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+        path = os.path.join(raw_dir, f"mxd_{timestamp}.png")
+        try:
+            cv2.imwrite(path, frame)
+        except Exception as e:
+            self._log(f"[截图] 保存失败: {e}")
+            return
+        self._log(f"[截图] 已保存: {path}")
+
     def _toggle_run(self):
         if self.automation.running:
             self.automation.stop()
@@ -637,6 +701,7 @@ class MainWindow(QMainWindow):
                 "padding:10px;font-size:14px;font-weight:bold;"
                 "background-color:#27ae60;color:white;"
             )
+            self.preview_once_btn.setEnabled(True)
             return
 
         # 启动前: 读 UI → 存配置 → (必要时)重建检测器 → 锁窗口 → 启动
@@ -681,12 +746,15 @@ class MainWindow(QMainWindow):
             "background-color:#c0392b;color:white;"
         )
         self._preview_timer.start(1000)
+        self.preview_once_btn.setEnabled(False)
 
     def _on_log(self, msg):
         ts = time.strftime("%H:%M:%S")
         self.log_box.appendPlainText(f"[{ts}] {msg}")
         sb = self.log_box.verticalScrollBar()
         sb.setValue(sb.maximum())
+        # 同时持久化到 logs/mxd.log
+        get_logger().info(msg)
 
     def _on_frame(self, frame, detections, hp_ratio, mp_ratio):
         if frame is None:

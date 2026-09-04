@@ -85,8 +85,8 @@ class OnnxDetector(Detector):
     后处理:  sigmoid scores → NMS → scale back to original frame
 
     模型输出格式 (YOLOv8, end2end=False):
-      shape (1, 7, 8400)
-      7 = 4 (cx, cy, w, h in 640×640 pixel coords) + 3 (class logits: floor, monster, rope)
+      shape (1, 8, 8400)
+      8 = 4 (cx, cy, w, h in 640×640 pixel coords) + 4 (class logits: floor, monster, rope, player)
     """
 
     def __init__(self, model_path: str, conf: float = 0.5, iou: float = 0.45):
@@ -97,7 +97,7 @@ class OnnxDetector(Detector):
         self._path = model_path
 
         meta = self.session.get_modelmeta()
-        self._names = {0: "floor", 1: "monster", 2: "rope"}
+        self._names = {0: "floor", 1: "monster", 2: "rope", 3: "player"}
         if meta.custom_metadata_map:
             import json
             try:

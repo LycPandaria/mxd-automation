@@ -2,51 +2,52 @@ window_title: 冒险岛怀旧服
 start_stop_hotkey: F6
 reference_width: 1368
 reference_height: 800
-fps: 30
+fps: 10
 keyboard_mode: sendinput
-confidence: 0.2
-model_path: E:/pythonProjects/mxd-automation/train/scripts/02_train_yolo/model/best.pt
+confidence: 0.5
+model_path: D:/GAME/mxd-automation/train/scripts/02_train_yolo/model/best.onnx
 monster_classes: monster
 floor_classes: floor
 rope_classes: rope
-self_name: 我是立立
+player_classes: player
+self_name: 东乡一二三
 self_offset: 85
 hp_region:
-- 0.3675
-- 0.974
-- 0.0791
-- 0.0234
+- 0.36603221083455345
+- 0.9713541666666666
+- 0.08052708638360176
+- 0.02734375
 hp_color:
-- 201
-- 88
-- 88
+- 235
+- 11
+- 11
 hp_tolerance: 20
-hp_threshold: 0.6
+hp_threshold: 0.5
 hp_key: end
 mp_region:
-- 0.4458
-- 0.9753
-- 0.0783
-- 0.0195
+- 0.4458272327964861
+- 0.9778645833333334
+- 0.08199121522693997
+- 0.015625
 mp_color:
-- 3
-- 130
-- 231
+- 7
+- 120
+- 211
 mp_tolerance: 20
-mp_threshold: 0.5
+mp_threshold: 0.3
 mp_key: pdn
 target_key: tab
-jump_key: c
+jump_key: alt
 attack_type: long
 attack_range: 300
 attack_range_y: 55
 skills:
-- name: 技能1
+- name: 连击
   key: a
-  cooldown: 1.0
-- name: 技能2
-  key: shift
-  cooldown: 300.0
-pickup_enabled: true
+  cooldown: 0.5
+- name: 爆炸箭
+  key: space
+  cooldown: 0.5
+pickup_enabled: false
 pickup_key: z
 pickup_interval: 0.333

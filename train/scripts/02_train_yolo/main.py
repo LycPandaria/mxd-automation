@@ -24,7 +24,7 @@ import xml.etree.ElementTree as ET
 from pathlib import Path
 
 # 类别映射（与 data.yaml 保持一致）
-CLASSES = {0: "floor", 1: "monster", 2: "rope"}
+CLASSES = {0: "floor", 1: "monster", 2: "rope", 3: "player"}
 NAME_TO_ID = {v: k for k, v in CLASSES.items()}
 
 # 训练轮数
