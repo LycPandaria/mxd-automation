@@ -1,10 +1,11 @@
-﻿build/
+build/
 __pycache__/
 *.pyc
 *.pyo
 .idea/
 .vscode/
 *.log
+logs/
 train/data/raw/
 train/scripts/02_train_yolo/runs/
 train/scripts/02_train_yolo/model/
@@ -12,3 +13,13 @@ _tmp_wheel/
 *.spec
 _*.txt
 _*.bat
+.codegraph/
+.venv/
+backup/
+test/
+bugs/
+
+# 生成的标注/训练数据、模型权重、临时文件
+**/auto_work/
+weights/
+.tmp/
