@@ -71,7 +71,7 @@ class MainWindow(QMainWindow):
         self._preview_timer = QTimer(self)
         self._preview_timer.timeout.connect(self._update_fps)
 
-        # 自动截图定时器：每 5 秒截一张游戏画面保存到 train/data/raw/
+        # 自动截图定时器：按配置间隔截取游戏画面保存到 train/data/raw/
         self._screenshot_timer = QTimer(self)
         self._screenshot_timer.setInterval(5000)
         self._screenshot_timer.timeout.connect(self._on_auto_screenshot_tick)
@@ -164,10 +164,17 @@ class MainWindow(QMainWindow):
         self.preview_once_btn = QPushButton("当前帧预览")
         self.preview_once_btn.clicked.connect(self._on_preview_frame)
         ctl.addWidget(self.preview_once_btn)
-        self.auto_shot_check = QCheckBox("自动截图(5s)")
-        self.auto_shot_check.setToolTip("开启后每 5 秒截一张游戏画面，保存到 train/data/raw/")
+        self.auto_shot_check = QCheckBox("自动截图")
+        self.auto_shot_check.setToolTip("开启后按右侧间隔截取游戏画面，保存到 train/data/raw/")
         self.auto_shot_check.toggled.connect(self._on_toggle_auto_shot)
         ctl.addWidget(self.auto_shot_check)
+        self.screenshot_interval_spin = QSpinBox()
+        self.screenshot_interval_spin.setRange(1, 3600)
+        self.screenshot_interval_spin.setValue(5)
+        self.screenshot_interval_spin.setSuffix(" s")
+        self.screenshot_interval_spin.setToolTip("自动截图间隔（秒）")
+        self.screenshot_interval_spin.setFixedWidth(80)
+        ctl.addWidget(self.screenshot_interval_spin)
         v.addLayout(ctl)
 
         # 日志
@@ -428,6 +435,8 @@ class MainWindow(QMainWindow):
         self.pickup_checkbox.setChecked(getattr(c, "pickup_enabled", True))
         self.pickup_key_edit.setText(getattr(c, "pickup_key", "z"))
         self.pickup_interval_spin.setValue(int(getattr(c, "pickup_interval", 0.333) * 1000))
+        # 自动截图间隔（秒）
+        self.screenshot_interval_spin.setValue(int(getattr(c, "screenshot_interval", 5)))
         # 技能表
         self.skill_table.setRowCount(0)
         for s in c.skills:
@@ -466,6 +475,7 @@ class MainWindow(QMainWindow):
         c.pickup_enabled = self.pickup_checkbox.isChecked()
         c.pickup_key = self.pickup_key_edit.text().strip() or "z"
         c.pickup_interval = self.pickup_interval_spin.value() / 1000.0
+        c.screenshot_interval = self.screenshot_interval_spin.value()
         # 技能
         skills = []
         for r in range(self.skill_table.rowCount()):
@@ -655,7 +665,7 @@ class MainWindow(QMainWindow):
         self.automation.preview_frame_once()
 
     def _on_toggle_auto_shot(self, checked):
-        """自动截图开关：开启后每 5 秒保存一张游戏画面到 train/data/raw/。"""
+        """自动截图开关：开启后按配置间隔保存游戏画面到 train/data/raw/。"""
         if checked:
             if not self.automation.window_locked:
                 QMessageBox.warning(self, "提示", "请先锁定游戏窗口")
@@ -663,8 +673,9 @@ class MainWindow(QMainWindow):
                 self.auto_shot_check.setChecked(False)
                 self.auto_shot_check.blockSignals(False)
                 return
-            self._screenshot_timer.start(5000)
-            self._log("[截图] 自动截图已开启（每5秒），保存到 train/data/raw/")
+            secs = self.screenshot_interval_spin.value()
+            self._screenshot_timer.start(secs * 1000)
+            self._log(f"[截图] 自动截图已开启（每{secs}秒），保存到 train/data/raw/")
         else:
             self._screenshot_timer.stop()
             self._log("[截图] 自动截图已关闭")

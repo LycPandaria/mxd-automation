@@ -4,7 +4,7 @@ reference_width: 1368
 reference_height: 800
 fps: 10
 keyboard_mode: sendinput
-confidence: 0.5
+confidence: 0.61
 model_path: D:/GAME/mxd-automation/train/scripts/02_train_yolo/model/best.onnx
 monster_classes: monster
 floor_classes: floor
@@ -48,7 +48,8 @@ skills:
   cooldown: 0.3
 - name: 爆炸箭
   key: space
-  cooldown: 0.3
-pickup_enabled: false
+  cooldown: 0.2
+pickup_enabled: true
 pickup_key: z
 pickup_interval: 0.333
+screenshot_interval: 60

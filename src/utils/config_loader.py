@@ -258,6 +258,8 @@ def _defaults() -> Dict[str, Any]:
         "pickup_enabled": True,   # 是否启用自动拾取
         "pickup_key": "z",        # 拾取键
         "pickup_interval": 0.333, # 拾取间隔（秒），默认每秒3次
+        # ---- 自动截图 ----
+        "screenshot_interval": 5,  # 自动截图间隔（秒）
     }
 
 
