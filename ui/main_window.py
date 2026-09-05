@@ -52,7 +52,7 @@ class MainWindow(QMainWindow):
 
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("MXD 游戏辅助控制台")
+        self.setWindowTitle("LYC WORKSPACE")
         self.resize(1180, 760)
 
         self.config = load_config()
