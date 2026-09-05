@@ -246,6 +246,9 @@ def _defaults() -> Dict[str, Any]:
         "attack_range": 200,  # 攻击距离（px）：长手专用（exe 界面可修改）；短手固定 50px 不读此配置
         "attack_range_y": 60, # 攻击垂直容差（px）：垂直差小于此值时怪物就在身边，
                               # 即使路径被推算为 rope/jump 也直接攻击，不绕路
+        "attack_min_range": 0,  # 长手最小有效射程（px）：角色与怪中心水平距离小于此值时
+                               # 弓箭手会"挥弓"而非射箭（伤害大减）→ 后撤拉开距离；
+                               # 0=关闭后撤（行为与旧版一致）。只对 attack_type=="long" 生效。
         "skills": [
             {"name": "技能1", "key": "1", "cooldown": 1.0},
             {"name": "技能2", "key": "2", "cooldown": 3.0},

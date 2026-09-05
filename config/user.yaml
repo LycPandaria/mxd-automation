@@ -41,13 +41,14 @@ jump_key: alt
 attack_type: long
 attack_range: 300
 attack_range_y: 55
+attack_min_range: 35
 skills:
 - name: 连击
   key: a
-  cooldown: 0.5
+  cooldown: 0.3
 - name: 爆炸箭
   key: space
-  cooldown: 0.5
+  cooldown: 0.3
 pickup_enabled: false
 pickup_key: z
 pickup_interval: 0.333

@@ -89,6 +89,28 @@ MELEE_ATTACK_RANGE_X = 50
 宽怪站旁边就能打，不穿越怪身体。
 """
 
+ATTACK_MIN_RANGE_X = 70
+"""长手(远程)最小有效射程（像素）：角色与怪中心水平距离小于此值时
+弓箭手会"挥弓"而非射箭，伤害大幅下降 → 触发后撤拉开距离。
+
+实际生效值取 config.attack_min_range（0 = 关闭后撤），此常量仅作
+getattr 兜底；只对 attack_type=="long" 生效，短手(近战)贴脸打怪
+不受影响。"""
+
+RETREAT_HYSTERESIS_X = 30
+"""后撤退出滞回（像素）：进入后撤后，直到 dx ≥ min_range+此值才停止，
+避免在最小射程边界来回抖。"""
+
+RETREAT_DEAD_ZONE = 10
+"""后撤方向死区（像素）：|角色x-怪中心x| 小于此值视为水平重叠，沿用上一帧方向。"""
+
+RETREAT_EDGE_LOOKAHEAD_X = 45
+"""后撤前检查后退方向前方此距离处脚下是否有地板（防落崖）。"""
+
+AOE_MONSTER_COUNT_THRESHOLD = 2
+"""范围攻击(AOE)触发阈值：攻击方向（朝向正前方）同平台怪物数 ≥ 此值时
+改放第二个技能(技能2, AOE)；否则放第一个技能(技能1)。仅长手(远程)生效。"""
+
 ROPE_SEARCH_RANGE_X = 200
 """搜索绳索的水平范围（像素）"""
 
@@ -264,6 +286,7 @@ class DecisionEngine:
         self._melee_leave_frames = 0              # 短手攻击中连续超限帧数（防抖计数）
         self._occluded_frames = 0                 # 目标被角色遮挡的连续帧数（虚拟目标维持）
         self._self_pos_stale_frames = 0           # 自身定位连续失败的帧数（最后已知位置时效）
+        self._retreating = False                  # 长手是否正在后撤拉开距离（保持最小射程）
 
     def update_config(self, config: Config):
         self.config = config
@@ -291,6 +314,7 @@ class DecisionEngine:
         self._climbing = False
         self._climb_exit_frames = 0
         self._climb_log_count = 0
+        self._retreating = False
 
     @property
     def state_name(self) -> str:
@@ -367,6 +391,7 @@ class DecisionEngine:
             self._attack_stale_counter = 0
             self._climbing = False
             self._climb_exit_frames = 0
+            self._retreating = False
             self._explore(ctx)
         else:
             self._fsm.transition(State.IDLE)
@@ -376,6 +401,7 @@ class DecisionEngine:
             self._attack_stale_counter = 0
             self._climbing = False
             self._climb_exit_frames = 0
+            self._retreating = False
             self._explore(ctx)
 
     # =========================================================================
@@ -502,13 +528,21 @@ class DecisionEngine:
             )
 
         # 同一平台（脚底垂直差 ≤ 容差）：
-        #   · 水平差 ≤ 攻击距离 → 站定攻击（不移动、不乱跑）
+        #   · 水平差 < 最小射程 → 后撤拉开距离（防弓箭手贴脸挥弓，仅长手）
+        #   · 最小射程 ≤ 水平差 ≤ 攻击距离 → 站定攻击（不移动、不乱跑）
         #   · 否则 → 朝怪物直线移动逼近，进入攻击距离后再打
         if self._same_platform(py, monster_foot[1]):
-            if self._can_attack(ctx, target):
+            dx = abs(px - mx)
+            min_range = self._get_min_attack_range()
+            if min_range > 0 and self._should_retreat(dx, min_range):
+                self._fsm.transition(State.CHASING)
+                self._retreat(ctx, target)
+            elif self._can_attack(ctx, target):
+                self._retreating = False
                 self._fsm.transition(State.ATTACKING)
                 self._attack(ctx, target)
             else:
+                self._retreating = False
                 self._fsm.transition(State.CHASING)
                 self._chase(ctx, target)
             return
@@ -910,6 +944,16 @@ class DecisionEngine:
             return MELEE_ATTACK_RANGE_X
         return getattr(self.config, "attack_range", ATTACK_RANGE_X)
 
+    def _get_min_attack_range(self) -> int:
+        """返回当前生效的最小有效射程（像素），仅长手(远程)使用。
+
+        - 短手(近战): 返回 0（近战贴脸打，无最小射程概念）。
+        - 长手(远程): 读 config.attack_min_range（0 = 关闭后撤，行为与旧版一致）。
+        """
+        if getattr(self.config, "attack_type", "long") == "short":
+            return 0
+        return max(0, int(getattr(self.config, "attack_min_range", 0) or 0))
+
     def _melee_edge_x(self, sx: int, target: Detection) -> int:
         """短手贴脸判定用的"怪近侧身体边缘 x"。
 
@@ -1024,8 +1068,118 @@ class DecisionEngine:
                 self._hold_move(self._face_dir or "right")
 
     # =========================================================================
+    # 后撤（长手保持最小射程）
+    # =========================================================================
+
+    def _should_retreat(self, dx: int, min_range: int) -> bool:
+        """是否应后撤拉开距离（带滞回防抖）。
+
+        首次触发: 水平距离 < 最小射程 → 后撤。
+        后撤中:   后撤多退一点（≤ min_range + RETREAT_HYSTERESIS_X）才停，
+                 避免在最小射程边界来回抖。
+        """
+        if self._retreating and self._fsm.current == State.CHASING:
+            return dx < min_range + RETREAT_HYSTERESIS_X
+        return dx < min_range
+
+    def _retreat(self, ctx: Context, target: Detection):
+        """长手(远程)后撤：朝怪物反方向移动，拉开最小射程距离。
+
+        解决"弓箭手贴脸挥弓"问题：贴脸时先退到最小射程之外再射箭，
+        后撤期间不放技能（避免边退边挥弓）。
+        边缘安全：后退方向前方没地板时不后退，原地攻击兜底（宁可变
+        挥弓也不跳崖）。
+        """
+        foot = self._effective_self_pos(ctx)
+        if foot is None:
+            self._release_move()
+            return
+        sx, sy = foot
+        tx = target.center[0]
+
+        # 卡住 → 跳（与 _chase 一致）
+        if self._stuck_counter >= STUCK_FRAMES:
+            self._log("[后撤] 卡住了，尝试跳跃")
+            self._release_move()
+            self.executor.press_key(self.config.jump_key, cooldown=1.0)
+            self._stuck_counter = 0
+            return
+
+        # 后退方向 = 怪物反方向；与怪水平重叠时沿用当前方向/朝向反方向
+        if tx > sx + RETREAT_DEAD_ZONE:
+            direction = "left"
+        elif tx < sx - RETREAT_DEAD_ZONE:
+            direction = "right"
+        else:
+            if self._held_key in ("left", "right"):
+                direction = self._held_key
+            else:
+                direction = "right" if self._face_dir == "left" else "left"
+
+        # 边缘安全：前方没地板 → 不后退，原地攻击兜底
+        if not self._floor_ahead(ctx, sx, sy, direction):
+            self._retreating = False
+            self._fsm.transition(State.ATTACKING)
+            self._attack(ctx, target)
+            return
+
+        if not self._retreating:
+            self._log(f"[后撤] 目标过近(dx={abs(sx - tx)}px)，后退拉开距离")
+        self._hold_move(direction)
+        self._retreating = True
+
+    def _floor_ahead(self, ctx: Context, sx: int, sy: int, direction: str) -> bool:
+        """检查后退方向前方 RETREAT_EDGE_LOOKAHEAD_X 像素处脚下是否有地板。
+
+        有地板数据(ctx.floors 非空)时，前方无地板 → 返回 False（禁止后退，
+        防止落崖）；无地板数据时返回 True（不额外限制，交给卡住检测兜底）。
+        """
+        if not ctx.floors:
+            return True
+        px = sx - RETREAT_EDGE_LOOKAHEAD_X if direction == "left" \
+            else sx + RETREAT_EDGE_LOOKAHEAD_X
+        for f in ctx.floors:
+            if f.x <= px <= f.x + f.w and f.y - 30 <= sy <= f.y + f.h + 30:
+                return True
+        return False
+
+    # =========================================================================
     # 攻击
     # =========================================================================
+
+    def _count_attack_dir_monsters(self, ctx: Context,
+                                   target: Optional[Detection]) -> int:
+        """统计"攻击方向"内的同平台怪物数（用于 AOE 技能选择）。
+
+        "攻击方向" = 角色朝向正前方（_face_dir 一侧）。计入条件（全部满足）：
+          1. 与角色同平台（脚底垂直差 ≤ attack_range_y）
+          2. 在角色朝向正前方（怪中心x 在 _face_dir 一侧）
+        朝向未知时回退为"朝锁定目标"方向；仍无法确定则默认向右。
+        """
+        foot = self._effective_self_pos(ctx)
+        if foot is None:
+            return 0
+        sx, sy = foot
+
+        if self._face_dir in ("left", "right"):
+            direction = self._face_dir
+        elif target is not None:
+            direction = "right" if target.center[0] >= sx else "left"
+        else:
+            direction = "right"
+
+        ry = getattr(self.config, "attack_range_y", 60)
+        count = 0
+        for m in ctx.monsters:
+            mx = m.center[0]
+            if abs(sy - (m.y + m.h)) > ry:          # 跨层不计
+                continue
+            if direction == "right" and mx <= sx:   # 不在正前方
+                continue
+            if direction == "left" and mx >= sx:
+                continue
+            count += 1
+        return count
 
     def _attack(self, ctx: Context, target: Detection):
         """在攻击范围内原地释放技能（攻击时不移动）。
@@ -1084,7 +1238,13 @@ class DecisionEngine:
                         f"({dx:+d}px)，按{need}转向"
                     )
 
-        self._cast_skill()
+        # ---- 技能选择：攻击方向怪数 ≥ 阈值 → 技能2(AOE)优先，冷却空档技能1兜底；
+        #      否则只放技能1 ----
+        if self._count_attack_dir_monsters(ctx, target) >= AOE_MONSTER_COUNT_THRESHOLD:
+            if not self._cast_skill(force_index=1):
+                self._cast_skill(force_index=0)
+        else:
+            self._cast_skill(force_index=0)
 
     def _tab_attack(self, ctx: Context, target: Detection = None):
         """Tab 选怪 + 原地攻击（兜底方案，不移动）。
@@ -1496,14 +1656,30 @@ class DecisionEngine:
     # 技能释放
     # =========================================================================
 
-    def _cast_skill(self):
-        """轮转释放技能。"""
+    def _cast_skill(self, force_index: Optional[int] = None) -> bool:
+        """释放技能：可指定技能下标，或按轮转顺序释放。
+
+        force_index 给定且有效 → 直接释放该技能（受冷却约束，冷却中则本帧不释放）。
+        force_index 为 None → 按原轮转顺序释放（跳过冷却中的技能）。
+
+        Returns:
+            True 表示本帧实际释放了技能，False 表示未释放（冷却中/无技能）。
+        """
         skills = self.config.skills
         if not skills:
-            return
+            return False
+
+        if force_index is not None and 0 <= force_index < len(skills):
+            skill = skills[force_index]
+            if self.executor.press_key(skill["key"], skill["cooldown"]):
+                self._log(f"[技能] 释放 {skill['name']} ({skill['key']})")
+                return True
+            return False
+
         for _ in range(len(skills)):
             skill = skills[self._skill_index % len(skills)]
             self._skill_index += 1
             if self.executor.press_key(skill["key"], skill["cooldown"]):
                 self._log(f"[技能] 释放 {skill['name']} ({skill['key']})")
-                break
+                return True
+        return False
