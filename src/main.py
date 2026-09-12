@@ -365,6 +365,9 @@ class Automation:
         # ---- 6.5. 自动拾取（定时按拾取键，每秒N次）----
         self._auto_pickup()
 
+        # ---- 6.6. 自动加 buff（定期释放，冷却到就放）----
+        self._auto_buff()
+
         # ---- 7. 预览回调 ----
         # 把 frame 和检测结果推给 UI 线程渲染
         self.on_frame(frame, detections, hp_ratio, mp_ratio)
@@ -478,6 +481,28 @@ class Automation:
             pickup_key = getattr(self.config, "pickup_key", "z")
             self.executor.press_key(pickup_key, cooldown=0.0)
             self._last_pickup_time = now
+
+    def _auto_buff(self):
+        """自动加 buff：每帧尝试按 buff 键（定期释放）。
+
+        press_key(key, cooldown) 自带"冷却内不重复按"，因此每个 buff 会在
+        首帧立即释放一次，之后每 cooldown 秒释放一次（定期、不看战斗状态）。
+        cooldown = 重新释放间隔(秒)，建议略小于 buff 游戏内持续时间。
+        仅已锁定窗口时生效；按键为空或 cooldown<=0 的条目直接跳过（防每帧狂按）。
+        """
+        if not self.capture.locked:
+            return
+        buffs = getattr(self.config, "buff_skills", None) or []
+        for b in buffs:
+            key = str(b.get("key", "") or "").strip()
+            try:
+                cd = float(b.get("cooldown", 0) or 0)
+            except (TypeError, ValueError):
+                cd = 0.0
+            if not key or cd <= 0:
+                continue
+            if self.executor.press_key(key, cooldown=cd):
+                self.on_log(f"[BUFF] 释放 {b.get('name', key)} ({key})")
 
     def _monster_classes(self):
         return [c.strip() for c in self.config.monster_classes.split(",") if c.strip()]

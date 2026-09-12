@@ -83,6 +83,8 @@ class MainWindow(QMainWindow):
         self.distance_spin.valueChanged.connect(self._on_distance_changed)
         self.attack_range_y_spin.valueChanged.connect(self._on_attack_range_y_changed)
         self.attack_type_combo.currentIndexChanged.connect(self._on_attack_type_changed)
+        self.stand_mode_checkbox.toggled.connect(self._on_stand_mode_changed)
+        self.stand_facing_combo.currentIndexChanged.connect(self._on_stand_facing_changed)
 
         self.log_signal.connect(self._on_log)
         self.frame_signal.connect(self._on_frame)
@@ -345,6 +347,27 @@ class MainWindow(QMainWindow):
         row.addStretch()
         v.addLayout(row)
 
+        # 站桩模式：角色完全不动，只打朝向正前方射程内的怪
+        stand_row = QHBoxLayout()
+        self.stand_mode_checkbox = QCheckBox("站桩模式")
+        self.stand_mode_checkbox.setToolTip(
+            "勾选后角色完全不动（不移动/不转向/不后撤/不探索），\n"
+            "只攻击朝向正前方、射程内的怪；攻击逻辑与普通模式一致"
+        )
+        stand_row.addWidget(self.stand_mode_checkbox)
+        stand_row.addWidget(QLabel("站桩朝向:"))
+        self.stand_facing_combo = QComboBox()
+        self.stand_facing_combo.addItem("朝右 (right)", "right")
+        self.stand_facing_combo.addItem("朝左 (left)", "left")
+        self.stand_facing_combo.setToolTip(
+            "站桩时角色的固定朝向（需与游戏内实际朝向一致）：\n"
+            "只会攻击这一侧、射程内的怪"
+        )
+        self.stand_facing_combo.setFixedWidth(120)
+        stand_row.addWidget(self.stand_facing_combo)
+        stand_row.addStretch()
+        v.addLayout(stand_row)
+
         # 拾取设置
         pickup_row = QHBoxLayout()
         self.pickup_checkbox = QCheckBox("自动拾取")
@@ -383,6 +406,30 @@ class MainWindow(QMainWindow):
         skill_btns.addWidget(del_btn)
         skill_btns.addStretch()
         v.addLayout(skill_btns)
+
+        # Buff 表（定期释放，不看战斗状态）
+        v.addWidget(QLabel("自动加Buff (定期释放):"))
+        self.buff_table = QTableWidget(0, 3)
+        self.buff_table.setHorizontalHeaderLabels(["名称", "按键", "间隔(秒)"])
+        self.buff_table.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
+        self.buff_table.setSelectionBehavior(QAbstractItemView.SelectRows)
+        self.buff_table.setToolTip(
+            "开启自动打怪后定期按这些键（不移动、不看战斗状态）。\n"
+            "间隔(秒) = 重新释放间隔，建议填略小于 buff 游戏内持续时间\n"
+            "（如 180s 的 buff 填 170）。\n"
+            "注意：按键不要与技能/加血/加蓝/拾取键重复。"
+        )
+        v.addWidget(self.buff_table)
+
+        buff_btns = QHBoxLayout()
+        b_add_btn = QPushButton("+ 添加")
+        b_add_btn.clicked.connect(lambda: self._add_buff_row())
+        b_del_btn = QPushButton("- 删除选中")
+        b_del_btn.clicked.connect(self._del_buff_row)
+        buff_btns.addWidget(b_add_btn)
+        buff_btns.addWidget(b_del_btn)
+        buff_btns.addStretch()
+        v.addLayout(buff_btns)
         return box
 
     @staticmethod
@@ -430,6 +477,11 @@ class MainWindow(QMainWindow):
         # 攻击距离：长手读 config.attack_range，短手固定 50（_sync_distance_ui 内处理）
         self.distance_spin.setValue(int(getattr(c, "attack_range", 200)))
         self.attack_range_y_spin.setValue(int(getattr(c, "attack_range_y", 60)))
+        # 站桩模式
+        self.stand_mode_checkbox.setChecked(bool(getattr(c, "stand_mode", False)))
+        _sf = getattr(c, "stand_facing", "right")
+        _sidx = self.stand_facing_combo.findData(_sf)
+        self.stand_facing_combo.setCurrentIndex(_sidx if _sidx >= 0 else 0)
         self._sync_distance_ui()
         # 拾取
         self.pickup_checkbox.setChecked(getattr(c, "pickup_enabled", True))
@@ -441,6 +493,10 @@ class MainWindow(QMainWindow):
         self.skill_table.setRowCount(0)
         for s in c.skills:
             self._add_skill_row(s.get("name", ""), s.get("key", ""), s.get("cooldown", 1.0))
+        # Buff 表
+        self.buff_table.setRowCount(0)
+        for b in (getattr(c, "buff_skills", None) or []):
+            self._add_buff_row(b.get("name", ""), b.get("key", ""), b.get("cooldown", 60.0))
 
     def _read_ui_to_config(self):
         c = self.config
@@ -471,6 +527,9 @@ class MainWindow(QMainWindow):
         if c.attack_type == "long":
             c.attack_range = self.distance_spin.value()  # 长手距离可在界面修改
         c.attack_range_y = self.attack_range_y_spin.value()
+        # 站桩模式
+        c.stand_mode = self.stand_mode_checkbox.isChecked()
+        c.stand_facing = self.stand_facing_combo.currentData()
         # 拾取
         c.pickup_enabled = self.pickup_checkbox.isChecked()
         c.pickup_key = self.pickup_key_edit.text().strip() or "z"
@@ -490,6 +549,20 @@ class MainWindow(QMainWindow):
                 skills.append({"name": name, "key": key, "cooldown": cd})
         c.skills = skills
 
+        # Buff
+        buffs = []
+        for r in range(self.buff_table.rowCount()):
+            name = self.buff_table.item(r, 0).text() if self.buff_table.item(r, 0) else ""
+            key = self.buff_table.item(r, 1).text() if self.buff_table.item(r, 1) else ""
+            cd_text = self.buff_table.item(r, 2).text() if self.buff_table.item(r, 2) else "60"
+            try:
+                cd = float(cd_text)
+            except ValueError:
+                cd = 60.0
+            if name or key:
+                buffs.append({"name": name, "key": key, "cooldown": cd})
+        c.buff_skills = buffs
+
     def _add_skill_row(self, name="", key="", cd=1.0):
         r = self.skill_table.rowCount()
         self.skill_table.insertRow(r)
@@ -502,6 +575,18 @@ class MainWindow(QMainWindow):
         for r in sorted(rows, reverse=True):
             self.skill_table.removeRow(r)
 
+    def _add_buff_row(self, name="", key="", cd=60.0):
+        r = self.buff_table.rowCount()
+        self.buff_table.insertRow(r)
+        self.buff_table.setItem(r, 0, QTableWidgetItem(str(name)))
+        self.buff_table.setItem(r, 1, QTableWidgetItem(str(key)))
+        self.buff_table.setItem(r, 2, QTableWidgetItem(str(cd)))
+
+    def _del_buff_row(self):
+        rows = {i.row() for i in self.buff_table.selectedIndexes()}
+        for r in sorted(rows, reverse=True):
+            self.buff_table.removeRow(r)
+
     def _save_config(self):
         self._read_ui_to_config()
         save_user_config(self.config)
@@ -511,6 +596,16 @@ class MainWindow(QMainWindow):
     def _on_attack_range_y_changed(self, value):
         """垂直容差微调框变化时，实时同步到 config 并保存到 YAML。"""
         self.config.attack_range_y = value
+        save_user_config(self.config)
+
+    def _on_stand_mode_changed(self, checked):
+        """站桩模式勾选变化时，实时同步到 config 并保存到 YAML。"""
+        self.config.stand_mode = bool(checked)
+        save_user_config(self.config)
+
+    def _on_stand_facing_changed(self, index):
+        """站桩朝向变化时，实时同步到 config 并保存到 YAML。"""
+        self.config.stand_facing = self.stand_facing_combo.currentData()
         save_user_config(self.config)
 
     def _on_attack_type_changed(self, index):

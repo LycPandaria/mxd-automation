@@ -115,24 +115,28 @@ AOE_BURST_COUNT = 2
 """AOE 连发次数：每次判定放技能2(爆炸箭)时，连发此数量的爆炸箭
 （隔冷却逐发补满，成功放出一发才递减）。"""
 
-OCCLUSION_RETREAT_X = 100
+OCCLUSION_RETREAT_X = 50
 """长手(远程)遮挡判定阈值（像素）：攻击中锁定目标消失且最后已知水平距离
 < 此值时，判定为"被角色/特效遮挡"(怪贴脸)而非死亡 → 用最后位置后撤。"""
 
-OCCLUSION_RETREAT_MAX_FRAMES = 45
-"""长手(远程)遮挡后撤的最大连续帧数（约 2 秒 @20fps）。超过仍未重新看到
-目标 → 判定目标真消失（已死/离开），放弃后撤、清锁转探索。"""
+OCCLUSION_RETREAT_MAX_SECONDS = 2.0
+"""长手(远程)遮挡后撤的最大持续秒数。超过仍未重新看到目标 → 判定目标
+真消失（已死/离开），放弃后撤、清锁转探索。（按 fps 换算成帧）"""
 
 HP_DROP_THRESHOLD = 0.01
 """掉血触发后撤的阈值：本帧 hp_ratio 比上一帧下降 ≥ 此值（1%）视为"被怪打到"，
 作为"怪被遮挡但仍在打你"的兜底信号（仅长手）。"""
 
-HP_DROP_ACTIVE_FRAMES = 30
-"""掉血信号有效帧数（约 1.5 秒 @20fps）：掉血后此帧数内允许触发一次后撤。"""
+HP_DROP_ACTIVE_SECONDS = 1.5
+"""掉血信号有效秒数：掉血后此时间内允许触发一次后撤。（按 fps 换算成帧）"""
 
-HP_RETREAT_HOLD_FRAMES = 20
-"""掉血触发后撤的持续帧数（约 1 秒 @20fps）：触发后持续后撤此帧数，
-避免只退一帧就停、又被打。"""
+HP_RETREAT_HOLD_SECONDS = 1.0
+"""掉血触发后撤的持续秒数：触发后持续后撤此时间，避免只退一帧就停、又被打。
+（按 fps 换算成帧）"""
+
+TARGET_MISS_RETAIN_SECONDS = 0.3
+"""长手(远程)目标漏检保持秒数：攻击中锁定目标因技能特效被遮挡而短时漏检时，
+沿用最后位置继续攻击此时间，避免"换目标/乱跑"；超过才重选。（按 fps 换算成帧）"""
 
 ROPE_SEARCH_RANGE_X = 200
 """搜索绳索的水平范围（像素）"""
@@ -315,6 +319,7 @@ class DecisionEngine:
         self._hp_drop_active_frames = 0           # 掉血信号剩余有效帧数
         self._hp_retreat_hold_frames = 0          # 掉血触发后撤的剩余持续帧数
         self._aoe_burst_left = 0                  # AOE连发剩余次数（爆炸箭二连发）
+        self._target_miss_frames = 0              # 锁定目标连续漏检帧数（特效遮挡保持）
 
     def update_config(self, config: Config):
         self.config = config
@@ -337,6 +342,7 @@ class DecisionEngine:
         self._hp_drop_active_frames = 0
         self._hp_retreat_hold_frames = 0
         self._aoe_burst_left = 0
+        self._target_miss_frames = 0
         self.release_keys()
         self._fsm.reset()
         self.executor.reset()
@@ -378,11 +384,15 @@ class DecisionEngine:
             # 定位失败帧计数：站定攻击中用最后已知位置兜底的时效依据
             self._self_pos_stale_frames += 1
 
+        # 站桩模式：位置恒定是预期，不判"卡住"（否则会触发卡住跳跃）
+        if self._is_stand_mode():
+            self._stuck_counter = 0
+
         # ---- 掉血检测（长手遮挡兜底信号）：本帧血比上帧显著下降 → 记最近掉血 ----
         if ctx.hp_ratio is not None:
             if self._prev_hp_ratio is not None \
                     and ctx.hp_ratio < self._prev_hp_ratio - HP_DROP_THRESHOLD:
-                self._hp_drop_active_frames = HP_DROP_ACTIVE_FRAMES
+                self._hp_drop_active_frames = self._frames(HP_DROP_ACTIVE_SECONDS)
             self._prev_hp_ratio = ctx.hp_ratio
         if self._hp_drop_active_frames > 0:
             self._hp_drop_active_frames -= 1
@@ -427,6 +437,11 @@ class DecisionEngine:
                 else:
                     self._attack(ctx, occluded)
                 return
+            # 长手：远程技能特效遮挡 → 保持锁定继续攻击（不后撤、不探索）
+            retained = self._retain_missed_target(ctx)
+            if retained is not None:
+                self._attack(ctx, retained)
+                return
             # 长手：目标消失但最后位置很近 → 被遮挡 → 后撤；或掉血兜底后撤
             if self._handle_no_monster_retreat(ctx):
                 return
@@ -437,6 +452,7 @@ class DecisionEngine:
             self._attack_stale_counter = 0
             self._occluded_retreat_frames = 0
             self._aoe_burst_left = 0
+            self._target_miss_frames = 0
             self._climbing = False
             self._climb_exit_frames = 0
             self._retreating = False
@@ -452,6 +468,7 @@ class DecisionEngine:
             self._attack_stale_counter = 0
             self._occluded_retreat_frames = 0
             self._aoe_burst_left = 0
+            self._target_miss_frames = 0
             self._climbing = False
             self._climb_exit_frames = 0
             self._retreating = False
@@ -587,9 +604,10 @@ class DecisionEngine:
         if self._same_platform(py, monster_foot[1]):
             dx = abs(px - mx)
             min_range = self._get_min_attack_range()
-            if min_range > 0 and self._should_retreat(dx, min_range):
+            if min_range > 0 and not self._is_stand_mode() \
+                    and self._should_retreat(dx, min_range):
                 self._fsm.transition(State.CHASING)
-                self._retreat(ctx, target)
+                self._retreat(ctx, target, reason="贴脸挥弓")
             elif self._can_attack(ctx, target):
                 self._retreating = False
                 self._fsm.transition(State.ATTACKING)
@@ -753,7 +771,7 @@ class DecisionEngine:
         # 方向看怪中心（符号决定面朝哪侧），距离看怪近侧身体边缘
         # （决定能否安全转身）。转向带 0.6s 冷却，不会高频反复转。
         if target is not None and self._melee_leave_frames == 0 \
-                and self._occluded_frames == 0:
+                and self._occluded_frames == 0 and not self._is_stand_mode():
             foot = self._effective_self_pos(ctx)
             if foot is None:
                 self._cast_skill()
@@ -787,7 +805,10 @@ class DecisionEngine:
 
         切换方向时先释放旧键再按住新键，避免两个方向键同时按下。
         移动期间不松手，直到调用 _release_move() 停止。
+        站桩模式：直接 return（不做任何位移，也不更新朝向）。
         """
+        if self._is_stand_mode():
+            return
         if direction not in ("left", "right", "up", "down"):
             return
         if direction in ("left", "right"):
@@ -809,6 +830,38 @@ class DecisionEngine:
     # 目标选择
     # =========================================================================
 
+    def _retain_missed_target(self, ctx: Context) -> Optional[Detection]:
+        """长手(远程)目标漏检保持：攻击中锁定目标因技能特效被遮挡而短时漏检时，
+        沿用最后已知位置继续攻击，避免误判"目标没了"而换目标/乱跑。
+
+        保持条件（全部满足）：
+          1. 长手且处于攻击状态（ATTACKING）
+          2. 最后已知位置与角色同平台、水平距离 ≥ OCCLUSION_RETREAT_X（远程，非贴脸）
+          3. 连续漏检未超 TARGET_MISS_RETAIN_SECONDS（按 fps 换算）
+        贴脸漏检(dx < OCCLUSION_RETREAT_X)由 _handle_long_range_occlusion 后撤处理。
+        """
+        if getattr(self.config, "attack_type", "long") == "short":
+            return None
+        if self._target_monster is None:
+            return None
+        if self._fsm.current != State.ATTACKING:
+            return None
+        if self._target_miss_frames >= self._frames(TARGET_MISS_RETAIN_SECONDS):
+            return None
+        foot = self._effective_self_pos(ctx)
+        if foot is None:
+            return None
+        sx, sy = foot
+        t = self._target_monster
+        if abs(sy - (t.y + t.h)) > getattr(self.config, "attack_range_y", 60):
+            return None  # 跨层 → 非特效遮挡
+        if abs(sx - t.center[0]) < OCCLUSION_RETREAT_X:
+            return None  # 贴脸 → 交给后撤逻辑
+        self._target_miss_frames += 1
+        # 打印日志，追踪是否因为这个原因导致无效攻击
+        # self._log(f"[长手(远程)目标漏检] MISSING_FRAMES={self._target_miss_frames}")
+        return t
+
     def _resolve_locked_target(self, ctx: Context) -> Detection:
         """解析当前应攻击的目标怪物（就近原则 + 攻击期保持锁定）。
 
@@ -828,15 +881,25 @@ class DecisionEngine:
                     if ctx.self_position is not None and not self._same_platform(
                             ctx.self_position[1], m.y + m.h):
                         break
-                    # 目标重新可见（遮挡解除）→ 清除遮挡计数
+                    # 站桩模式：目标跑到身后 → 放弃锁定（不转向，打不到）
+                    if ctx.self_position is not None \
+                            and not self._in_front(m, ctx.self_position[0]):
+                        break
+                    # 目标重新可见（遮挡解除）→ 清除遮挡/漏检计数
                     self._occluded_frames = 0
                     self._occluded_retreat_frames = 0
+                    self._target_miss_frames = 0
                     return m
             # 锁定目标本帧不在画面：可能是被角色自身遮挡（贴脸攻击）
             occluded = self._occluded_target(ctx)
             if occluded is not None:
                 return occluded
+            # 长手：远程技能特效遮挡 → 保持锁定继续打（沿用最后位置）
+            retained = self._retain_missed_target(ctx)
+            if retained is not None:
+                return retained
             self._occluded_frames = 0
+            self._target_miss_frames = 0
             self._target_monster = None
         return self._pick_best_target(ctx)
 
@@ -939,6 +1002,8 @@ class DecisionEngine:
             mfoot = m.y + m.h  # 怪物脚底（bbox 底部）
             if not self._same_platform(player[1], mfoot):
                 continue
+            if not self._in_front(m, player[0]):
+                continue  # 站桩模式：只考虑朝向正前方的怪
             dx = abs(player[0] - m.center[0])
             if dx < best_dist:
                 best = m
@@ -1007,6 +1072,27 @@ class DecisionEngine:
         if getattr(self.config, "attack_type", "long") == "short":
             return 0
         return max(0, int(getattr(self.config, "attack_min_range", 0) or 0))
+
+    def _frames(self, seconds: float) -> int:
+        """把"秒"换算成帧数（按配置 fps），避免帧数阈值随 fps 漂移。"""
+        return max(1, int(round(seconds * max(1, self.config.fps))))
+
+    def _is_stand_mode(self) -> bool:
+        """站桩模式：不对角色做任何移动（不移动、不转向、不后撤、不探索）。"""
+        return bool(getattr(self.config, "stand_mode", False))
+
+    def _stand_facing(self) -> str:
+        """站桩模式下的固定朝向（right/left）—— 用于判断"正前方"。"""
+        d = getattr(self.config, "stand_facing", "right")
+        return d if d in ("left", "right") else "right"
+
+    def _in_front(self, m: Detection, sx: int) -> bool:
+        """怪物是否在朝向正前方；非站桩模式恒 True（不做前方过滤）。"""
+        if not self._is_stand_mode():
+            return True
+        if self._stand_facing() == "right":
+            return m.center[0] > sx
+        return m.center[0] < sx
 
     def _melee_edge_x(self, sx: int, target: Detection) -> int:
         """短手贴脸判定用的"怪近侧身体边缘 x"。
@@ -1137,10 +1223,11 @@ class DecisionEngine:
         return dx < min_range
 
     def _retreat(self, ctx: Context, target: Optional[Detection] = None,
-                 direction: Optional[str] = None):
+                 direction: Optional[str] = None, reason: str = "后撤"):
         """长手(远程)后撤：朝怪物反方向或指定方向移动，拉开最小射程距离。
 
         direction 明确给出时直接朝该方向退（掉血兜底用）；否则按 target 反方向。
+        reason 为后撤原因（贴脸挥弓/目标被遮挡/掉血兜底），触发首帧打印一次日志。
         解决"弓箭手贴脸挥弓"问题：贴脸时先退到最小射程之外再射箭，
         后撤期间不放技能（避免边退边挥弓）。
         边缘安全：后退方向前方没地板时不后退；有目标时原地攻击兜底。
@@ -1183,10 +1270,8 @@ class DecisionEngine:
             return
 
         if not self._retreating:
-            if target is not None:
-                self._log(f"[后撤] 目标过近(dx={abs(sx - target.center[0])}px)，后退拉开距离")
-            else:
-                self._log(f"[后撤] 后撤拉开距离(方向={direction})")
+            dx_str = f", dx={abs(sx - target.center[0])}px" if target is not None else ""
+            self._log(f"[后撤] 触发后撤({reason}){dx_str}，方向={direction}")
         self._hold_move(direction)
         self._retreating = True
 
@@ -1223,13 +1308,11 @@ class DecisionEngine:
         if abs(sx - t.center[0]) >= OCCLUSION_RETREAT_X:
             return False  # 最后位置太远 → 已死/离开，非遮挡
         self._occluded_retreat_frames += 1
-        if self._occluded_retreat_frames > OCCLUSION_RETREAT_MAX_FRAMES:
+        if self._occluded_retreat_frames > self._frames(OCCLUSION_RETREAT_MAX_SECONDS):
             self._log("[后撤] 目标被遮挡后撤超时，判定已消失")
             return False
-        if self._occluded_retreat_frames == 1:
-            self._log("[后撤] 目标被遮挡(贴脸)，用最后位置后撤")
         self._fsm.transition(State.CHASING)
-        self._retreat(ctx, t)
+        self._retreat(ctx, t, reason="目标被遮挡")
         return True
 
     def _handle_no_monster_retreat(self, ctx: Context) -> bool:
@@ -1240,6 +1323,8 @@ class DecisionEngine:
         """
         if getattr(self.config, "attack_type", "long") == "short":
             return False
+        if self._is_stand_mode():
+            return False  # 站桩模式：不做任何后撤
 
         # 1) 掉血后撤持续中：继续按当前方向退，限时后停止
         if self._retreating and self._hp_retreat_hold_frames > 0:
@@ -1262,14 +1347,13 @@ class DecisionEngine:
         # 3) 掉血兜底：最近掉血且未在后撤中 → 触发一次后撤
         if self._hp_drop_active_frames > 0 and not self._retreating:
             self._hp_drop_active_frames = 0
-            self._hp_retreat_hold_frames = HP_RETREAT_HOLD_FRAMES
+            self._hp_retreat_hold_frames = self._frames(HP_RETREAT_HOLD_SECONDS)
             self._fsm.transition(State.CHASING)
             if self._target_monster is not None:
-                self._retreat(ctx, self._target_monster)
+                self._retreat(ctx, self._target_monster, reason="掉血兜底")
             else:
                 direction = "right" if self._face_dir == "left" else "left"
-                self._retreat(ctx, direction=direction)
-            self._log("[后撤] 掉血触发(疑怪贴脸)，后撤拉开")
+                self._retreat(ctx, direction=direction, reason="掉血兜底")
             return True
 
         return False
@@ -1352,22 +1436,24 @@ class DecisionEngine:
                 return
 
             # ---- 转向：怪物在右 → 按右键；怪物在左 → 按左键；正下方 → 不按 ----
-            sx = foot[0]
-            dx = target.center[0] - sx
-            need = None
-            if dx > FACE_TURN_X:
-                need = "right"
-            elif dx < -FACE_TURN_X:
-                need = "left"
-            if need is not None and need != self._face_dir:
-                # 朝向不对 → 先转向，然后继续释放技能。
-                # 冒险岛转向和攻击可在同一帧完成，不需要等下一帧。
-                if self.executor.press_key(need, cooldown=0.3):
-                    self._face_dir = need
-                    self._log(
-                        f"[朝向] 怪物在{'右' if need == 'right' else '左'}"
-                        f"({dx:+d}px)，按{need}转向"
-                    )
+            # 站桩模式：不转向（角色完全不动），只打朝向正前方的怪
+            if not self._is_stand_mode():
+                sx = foot[0]
+                dx = target.center[0] - sx
+                need = None
+                if dx > FACE_TURN_X:
+                    need = "right"
+                elif dx < -FACE_TURN_X:
+                    need = "left"
+                if need is not None and need != self._face_dir:
+                    # 朝向不对 → 先转向，然后继续释放技能。
+                    # 冒险岛转向和攻击可在同一帧完成，不需要等下一帧。
+                    if self.executor.press_key(need, cooldown=0.3):
+                        self._face_dir = need
+                        self._log(
+                            f"[朝向] 怪物在{'右' if need == 'right' else '左'}"
+                            f"({dx:+d}px)，按{need}转向"
+                        )
 
         # ---- 技能选择：攻击方向怪数 ≥ 阈值 → 连发 AOE_BURST_COUNT 发技能2(爆炸箭)，
         #      爆炸箭冷却空档用技能1兜底；否则只放技能1 ----
@@ -1765,7 +1851,11 @@ class DecisionEngine:
           - 遇到平台边缘（脚下没地板）就跳
           - 卡住时反向走
           - 长时间没遇到怪就换方向
+        站桩模式：无怪就站着不动（不探索、不跳跃）。
         """
+        if self._is_stand_mode():
+            self._release_move()
+            return
         self._explore_frame_count += 1
 
         if self._stuck_counter >= STUCK_FRAMES:

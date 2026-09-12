@@ -249,11 +249,20 @@ def _defaults() -> Dict[str, Any]:
         "attack_min_range": 0,  # 长手最小有效射程（px）：角色与怪中心水平距离小于此值时
                                # 弓箭手会"挥弓"而非射箭（伤害大减）→ 后撤拉开距离；
                                # 0=关闭后撤（行为与旧版一致）。只对 attack_type=="long" 生效。
+        # ---- 站桩模式 ----
+        "stand_mode": False,     # 站桩模式：不对角色做任何移动（不移动/不转向/不后撤/不探索），
+                                 # 只打朝向正前方射程内的怪；攻击逻辑与普通模式完全一致
+        "stand_facing": "right", # 站桩模式下的固定朝向（right/left），用于判断"正前方"
         "skills": [
             {"name": "技能1", "key": "1", "cooldown": 1.0},
             {"name": "技能2", "key": "2", "cooldown": 3.0},
             {"name": "技能3", "key": "3", "cooldown": 8.0},
         ],
+        # ---- 自动加 buff ----
+        # [{name, key, cooldown}, ...]；cooldown = 重新释放间隔(秒)，
+        # 建议填略小于 buff 游戏内持续时间（如 180s 的 buff 填 170）。
+        # 开启自动打怪后每帧尝试按，冷却到就放（首帧立即全部释放一次）。
+        "buff_skills": [],
         # ---- 拾取 ----
         "pickup_enabled": True,   # 是否启用自动拾取
         "pickup_key": "z",        # 拾取键
