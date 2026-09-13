@@ -215,8 +215,8 @@ def train():
         exist_ok=True,
         verbose=True,
         seed=SEED,
-        workers=4,
-        patience=20,
+        workers=4,  # 4 进程喂数据；调大页面文件后可再升到 8
+        patience=300,
     )
 
     best_pt = Path(RUNS_DIR) / "train" / "weights" / "best.pt"

@@ -195,6 +195,7 @@ def train_model(work_dir: str, model_path: str, epochs: int = 50):
         name="auto_annotate",
         exist_ok=True,       # 覆盖已有的同名训练结果
         verbose=True,
+        workers=4,           # 4 进程喂数据；调大页面文件后可再升到 8
     )
 
     best_pt = Path(work_dir) / "runs" / "auto_annotate" / "weights" / "best.pt"

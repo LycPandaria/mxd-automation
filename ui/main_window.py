@@ -85,6 +85,7 @@ class MainWindow(QMainWindow):
         self.attack_type_combo.currentIndexChanged.connect(self._on_attack_type_changed)
         self.stand_mode_checkbox.toggled.connect(self._on_stand_mode_changed)
         self.stand_facing_combo.currentIndexChanged.connect(self._on_stand_facing_changed)
+        self.stand_default_attack_checkbox.toggled.connect(self._on_stand_default_attack_changed)
 
         self.log_signal.connect(self._on_log)
         self.frame_signal.connect(self._on_frame)
@@ -365,6 +366,12 @@ class MainWindow(QMainWindow):
         )
         self.stand_facing_combo.setFixedWidth(120)
         stand_row.addWidget(self.stand_facing_combo)
+        self.stand_default_attack_checkbox = QCheckBox("无怪也攻击")
+        self.stand_default_attack_checkbox.setToolTip(
+            "站桩模式下没有识别到怪物时也按技能键盲打（两个技能交替），\n"
+            "用于应对模型漏检；不移动、不转向"
+        )
+        stand_row.addWidget(self.stand_default_attack_checkbox)
         stand_row.addStretch()
         v.addLayout(stand_row)
 
@@ -482,6 +489,9 @@ class MainWindow(QMainWindow):
         _sf = getattr(c, "stand_facing", "right")
         _sidx = self.stand_facing_combo.findData(_sf)
         self.stand_facing_combo.setCurrentIndex(_sidx if _sidx >= 0 else 0)
+        self.stand_default_attack_checkbox.setChecked(
+            bool(getattr(c, "stand_default_attack", True))
+        )
         self._sync_distance_ui()
         # 拾取
         self.pickup_checkbox.setChecked(getattr(c, "pickup_enabled", True))
@@ -530,6 +540,7 @@ class MainWindow(QMainWindow):
         # 站桩模式
         c.stand_mode = self.stand_mode_checkbox.isChecked()
         c.stand_facing = self.stand_facing_combo.currentData()
+        c.stand_default_attack = self.stand_default_attack_checkbox.isChecked()
         # 拾取
         c.pickup_enabled = self.pickup_checkbox.isChecked()
         c.pickup_key = self.pickup_key_edit.text().strip() or "z"
@@ -606,6 +617,11 @@ class MainWindow(QMainWindow):
     def _on_stand_facing_changed(self, index):
         """站桩朝向变化时，实时同步到 config 并保存到 YAML。"""
         self.config.stand_facing = self.stand_facing_combo.currentData()
+        save_user_config(self.config)
+
+    def _on_stand_default_attack_changed(self, checked):
+        """站桩默认攻击(无怪也攻击)勾选变化时，实时同步到 config 并保存到 YAML。"""
+        self.config.stand_default_attack = bool(checked)
         save_user_config(self.config)
 
     def _on_attack_type_changed(self, index):

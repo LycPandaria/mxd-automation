@@ -253,6 +253,8 @@ def _defaults() -> Dict[str, Any]:
         "stand_mode": False,     # 站桩模式：不对角色做任何移动（不移动/不转向/不后撤/不探索），
                                  # 只打朝向正前方射程内的怪；攻击逻辑与普通模式完全一致
         "stand_facing": "right", # 站桩模式下的固定朝向（right/left），用于判断"正前方"
+        "stand_default_attack": True,  # 站桩模式：没有有效目标(模型漏检)时也按技能键盲打
+                                       # （两个技能交替，各自受冷却约束；不移动不转向）
         "skills": [
             {"name": "技能1", "key": "1", "cooldown": 1.0},
             {"name": "技能2", "key": "2", "cooldown": 3.0},

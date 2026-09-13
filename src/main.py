@@ -63,6 +63,20 @@ from .decision.context import Context, DecisionEngine
 from .utils.config_loader import Config, resolve_model_path
 
 
+# =============================================================================
+# 自动加 buff 的"施法窗口"参数
+# =============================================================================
+# 为什么需要窗口：按 buff 键时若角色正在攻击动画中，游戏会忽略该按键，
+# 而 press_key 仍记为"已按下" → 整个 cooldown 内不再重试 → buff 加不上。
+# 因此 buff 到期时先让决策层暂停攻击，等攻击动画收尾后再按键。
+#
+# 窗口长度 = BUFF_PRESS_DELAY + (buff 个数 × BUFF_MULTI_GAP) + BUFF_CAST_TAIL
+
+BUFF_PRESS_DELAY_SECONDS = 0.4   # 开窗后等这么久再按（让上一次攻击动画收尾）
+BUFF_MULTI_GAP_SECONDS = 0.25    # 多个 buff 依次释放之间的间隔
+BUFF_CAST_TAIL_SECONDS = 0.6     # 按完最后一个 buff 后，留给它施法动画的余量
+
+
 class Automation:
     """自动打怪主循环控制器。
 
@@ -137,6 +151,12 @@ class Automation:
         # ---- 自动拾取 ----
         self._last_pickup_time = 0.0  # 上次拾取按键的时间戳
 
+        # ---- 自动加 buff（施法窗口状态机）----
+        self._buff_next_time = {}     # key -> 下次到期时间戳
+        self._buff_queue = []         # 本轮待释放的 buff [{name,key,cd}]
+        self._buff_open_time = 0.0    # 本轮窗口打开的时间戳
+        self._buff_last_press = 0.0   # 本轮上次按键的时间戳
+
     # =========================================================================
     # 窗口管理
     # =========================================================================
@@ -209,6 +229,12 @@ class Automation:
         self.engine.update_config(self.config)
         self.engine.reset()  # 清空技能轮转索引、冷却记录
 
+        # 清空 buff 状态：启动时所有 buff 立即到期（先加满一轮）
+        self._buff_next_time.clear()
+        self._buff_queue = []
+        self._buff_open_time = 0.0
+        self._buff_last_press = 0.0
+
         self._running = True
         # daemon=True: 主线程退出时自动结束，不会卡住进程
         self._thread = threading.Thread(target=self._loop, daemon=True)
@@ -224,6 +250,7 @@ class Automation:
         if not self._running:
             return
         self._running = False
+        self._buff_queue = []       # 丢弃未处理完的 buff 队列
         self.engine.release_keys()  # 释放按住的方向键/上键
         self.on_log("[停止] 自动打怪已停止")
 
@@ -483,26 +510,59 @@ class Automation:
             self._last_pickup_time = now
 
     def _auto_buff(self):
-        """自动加 buff：每帧尝试按 buff 键（定期释放）。
+        """自动加 buff：到期时先让决策层暂停攻击（施法窗口），再按 buff 键。
 
-        press_key(key, cooldown) 自带"冷却内不重复按"，因此每个 buff 会在
-        首帧立即释放一次，之后每 cooldown 秒释放一次（定期、不看战斗状态）。
+        流程：到期 → 请求施法窗口(暂停攻击) → 等攻击动画收尾 → 逐个按键 → 恢复。
+        这样按下去时角色不在攻击动画中，游戏才能接收 buff 按键。
+        多个 buff 同时到期时共用一个窗口，之间留 BUFF_MULTI_GAP 秒间隔。
+
         cooldown = 重新释放间隔(秒)，建议略小于 buff 游戏内持续时间。
-        仅已锁定窗口时生效；按键为空或 cooldown<=0 的条目直接跳过（防每帧狂按）。
+        仅已锁定窗口时生效；按键为空或 cooldown<=0 的条目直接跳过。
         """
         if not self.capture.locked:
             return
         buffs = getattr(self.config, "buff_skills", None) or []
-        for b in buffs:
-            key = str(b.get("key", "") or "").strip()
-            try:
-                cd = float(b.get("cooldown", 0) or 0)
-            except (TypeError, ValueError):
-                cd = 0.0
-            if not key or cd <= 0:
-                continue
-            if self.executor.press_key(key, cooldown=cd):
-                self.on_log(f"[BUFF] 释放 {b.get('name', key)} ({key})")
+        if not buffs:
+            return
+        now = time.time()
+        fps = max(1, int(getattr(self.config, "fps", 10) or 10))
+
+        # ---- 1) 队列为空：检查到期 buff，有就开窗口（本帧先不按）----
+        if not self._buff_queue:
+            due = []
+            for b in buffs:
+                key = str(b.get("key", "") or "").strip()
+                try:
+                    cd = float(b.get("cooldown", 0) or 0)
+                except (TypeError, ValueError):
+                    cd = 0.0
+                if not key or cd <= 0:
+                    continue
+                if now >= self._buff_next_time.get(key, 0.0):
+                    due.append({"name": b.get("name", key), "key": key, "cd": cd})
+            if not due:
+                return
+            self._buff_queue = due
+            self._buff_open_time = now
+            self._buff_last_press = 0.0
+            window_s = (BUFF_PRESS_DELAY_SECONDS
+                        + len(due) * BUFF_MULTI_GAP_SECONDS
+                        + BUFF_CAST_TAIL_SECONDS)
+            self.engine.request_buff_window(int(round(window_s * fps)))
+            names = "、".join(d["name"] for d in due)
+            self.on_log(f"[BUFF] {names} 到期 → 暂停攻击 {window_s:.1f}s 腾出施法窗口")
+            return
+
+        # ---- 2) 队列非空：等攻击动画收尾后逐个按键（此时攻击已被暂停）----
+        if now - self._buff_open_time < BUFF_PRESS_DELAY_SECONDS:
+            return
+        if self._buff_last_press and now - self._buff_last_press < BUFF_MULTI_GAP_SECONDS:
+            return
+        b = self._buff_queue.pop(0)
+        self.executor.press_key(b["key"], cooldown=0.0)
+        self._buff_next_time[b["key"]] = now + b["cd"]
+        self._buff_last_press = now
+        self.on_log(f"[BUFF] 释放 {b['name']} ({b['key']})")
 
     def _monster_classes(self):
         return [c.strip() for c in self.config.monster_classes.split(",") if c.strip()]

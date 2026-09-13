@@ -320,6 +320,7 @@ class DecisionEngine:
         self._hp_retreat_hold_frames = 0          # 掉血触发后撤的剩余持续帧数
         self._aoe_burst_left = 0                  # AOE连发剩余次数（爆炸箭二连发）
         self._target_miss_frames = 0              # 锁定目标连续漏检帧数（特效遮挡保持）
+        self._buff_hold_frames = 0                # >0 时暂停攻击/移动，给 buff 让路（主循环请求）
 
     def update_config(self, config: Config):
         self.config = config
@@ -343,6 +344,7 @@ class DecisionEngine:
         self._hp_retreat_hold_frames = 0
         self._aoe_burst_left = 0
         self._target_miss_frames = 0
+        self._buff_hold_frames = 0
         self.release_keys()
         self._fsm.reset()
         self.executor.reset()
@@ -421,6 +423,14 @@ class DecisionEngine:
                         f"按下 {self.config.mp_key}"
                     )
                     return
+
+        # ---- buff 施法窗口：暂停攻击/移动，给 buff 让路（加血/加蓝不受影响）----
+        # 主循环检测到 buff 到期时，通过 request_buff_window() 打开此窗口，
+        # 避免按 buff 键的瞬间角色正在攻击动画中 → 游戏忽略该按键 → buff 加不上。
+        if self._buff_hold_frames > 0:
+            self._buff_hold_frames -= 1
+            self._release_move()
+            return
 
         # ---- 优先级 3: 检测到怪物 ----
         if ctx.monsters:
@@ -1093,6 +1103,15 @@ class DecisionEngine:
         if self._stand_facing() == "right":
             return m.center[0] > sx
         return m.center[0] < sx
+
+    def request_buff_window(self, frames: int):
+        """请求 buff 施法窗口：接下来 frames 帧内决策层不放技能、不移动。
+
+        主循环在 buff 到期时调用，让角色先停手，等攻击动画收尾后再按 buff，
+        避免攻击动画吞掉 buff 按键导致"buff 加不上"。
+        可重复调用，取较大值（多 buff 连放时用来续窗）。加血/加蓝不受影响。
+        """
+        self._buff_hold_frames = max(self._buff_hold_frames, int(frames))
 
     def _melee_edge_x(self, sx: int, target: Detection) -> int:
         """短手贴脸判定用的"怪近侧身体边缘 x"。
@@ -1843,6 +1862,15 @@ class DecisionEngine:
     # 探索
     # =========================================================================
 
+    def _default_attack(self, ctx: Context):
+        """站桩默认攻击：没有有效目标（模型漏检）时也按技能键盲打。
+
+        两个技能交替释放（走 _cast_skill 轮转，各自受冷却约束）；
+        不移动、不转向、不触发 AOE 连发逻辑。
+        """
+        self._release_move()
+        self._cast_skill()
+
     def _explore(self, ctx: Context):
         """画面里没怪时，往一个方向走探索。
 
@@ -1851,10 +1879,12 @@ class DecisionEngine:
           - 遇到平台边缘（脚下没地板）就跳
           - 卡住时反向走
           - 长时间没遇到怪就换方向
-        站桩模式：无怪就站着不动（不探索、不跳跃）。
+        站桩模式：无怪就站着不动（不探索、不跳跃）；开启默认攻击时改为盲打。
         """
         if self._is_stand_mode():
             self._release_move()
+            if getattr(self.config, "stand_default_attack", True):
+                self._default_attack(ctx)
             return
         self._explore_frame_count += 1
 
