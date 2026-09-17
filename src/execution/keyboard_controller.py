@@ -37,6 +37,7 @@
   例如: cooldown=1.5 表示按键后 1.5 秒内不会再次触发。
 """
 import time
+import random
 import ctypes
 from ctypes import wintypes
 
@@ -51,6 +52,11 @@ KEYEVENTF_KEYUP = 0x0002         # 键抬起标志
 KEYEVENTF_SCANCODE = 0x0008      # 使用硬件扫描码（更接近真实硬件按键）
 
 SW_RESTORE = 9                   # ShowWindow: 恢复窗口
+
+# ---- 按键按压时长（随机化，避免所有按键时长完全一致）----
+# 人类每次按键的按压时长都不同（约 30~90ms）；固定 30ms 是明显的机器特征。
+PRESS_MIN_SECONDS = 0.03
+PRESS_MAX_SECONDS = 0.09
 
 # ---- SendInput 结构体 ----
 class _KEYBDINPUT(ctypes.Structure):
@@ -312,7 +318,8 @@ class KeyboardController:
 
         if not self._si_send_key(key, vk_code, keyup=False):
             return False
-        time.sleep(0.03)  # 让游戏有时间处理按下事件
+        # 按压时长随机化（人类每次按键时长都不同），避免所有按键时长完全一致
+        time.sleep(random.uniform(PRESS_MIN_SECONDS, PRESS_MAX_SECONDS))
         return self._si_send_key(key, vk_code, keyup=True)
 
     def key_down(self, key: str) -> bool:

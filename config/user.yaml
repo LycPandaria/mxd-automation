@@ -25,21 +25,21 @@ hp_tolerance: 20
 hp_threshold: 0.5
 hp_key: end
 mp_region:
-- 0.465592972181552
-- 0.96875
+- 0.46266471449487556
+- 0.9635416666666666
 - 0.12298682284040996
-- 0.02734375
+- 0.03515625
 mp_color:
-- 143
-- 164
-- 175
+- 117
+- 169
+- 199
 mp_tolerance: 20
 mp_threshold: 0.5
 mp_key: pdn
 target_key: tab
 jump_key: alt
 attack_type: long
-attack_range: 450
+attack_range: 400
 attack_range_y: 80
 attack_min_range: 10
 stand_mode: false
@@ -63,3 +63,6 @@ pickup_enabled: false
 pickup_key: z
 pickup_interval: 0.333
 screenshot_interval: 30
+lie_detect_enabled: true
+lie_detect_template: assets/templates/lie_detector.png
+lie_detect_threshold: 0.78

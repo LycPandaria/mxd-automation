@@ -13,6 +13,7 @@
 """
 import os
 import sys
+import threading
 import time
 from datetime import datetime
 
@@ -29,7 +30,7 @@ from PyQt5.QtWidgets import (
     QPlainTextEdit, QCheckBox, QFileDialog, QMessageBox, QSplitter,
     QAbstractItemView, QSpinBox,
 )
-from PyQt5.QtCore import Qt, QTimer, pyqtSignal
+from PyQt5.QtCore import Qt, QTimer, pyqtSignal, pyqtSlot, QMetaObject
 from PyQt5.QtGui import QImage, QPixmap
 
 from src.utils.config_loader import (
@@ -42,6 +43,7 @@ from src.main import Automation
 from src.utils.logger import get_logger
 
 from ui.preview_label import PreviewLabel
+from ui.alarm_overlay import AlarmOverlay, flash_taskbar
 
 
 class MainWindow(QMainWindow):
@@ -49,6 +51,7 @@ class MainWindow(QMainWindow):
     log_signal = pyqtSignal(str)
     frame_signal = pyqtSignal(object, object, object, object)  # frame, detections, hp, mp
     hotkey_signal = pyqtSignal()  # F12 触发
+    lie_signal = pyqtSignal(float)  # 测谎弹窗命中（匹配得分）
 
     def __init__(self):
         super().__init__()
@@ -65,7 +68,14 @@ class MainWindow(QMainWindow):
             self.config, self.detector,
             on_log=self.log_signal.emit,
             on_frame=self.frame_signal.emit,
+            on_lie_detected=self.lie_signal.emit,
         )
+
+        # ---- 测谎报警状态 ----
+        self._alarm_on = False          # 报警音循环开关（确认后置 False）
+        self._alarm_blink_on = False    # 横幅闪烁相位
+        self._alarm_thread = None
+        self._overlay = None            # 游戏窗口上的红框浮层（惰性创建）
 
         self._fps_counter = [0, time.time()]
         self._preview_timer = QTimer(self)
@@ -90,6 +100,12 @@ class MainWindow(QMainWindow):
         self.log_signal.connect(self._on_log)
         self.frame_signal.connect(self._on_frame)
         self.hotkey_signal.connect(self._toggle_run)
+        self.lie_signal.connect(self._on_lie_detected)
+
+        # 报警横幅闪烁定时器（400ms 一次相位翻转）
+        self._alarm_blink_timer = QTimer(self)
+        self._alarm_blink_timer.setInterval(400)
+        self._alarm_blink_timer.timeout.connect(self._blink_alarm)
 
         self._register_hotkey()
 
@@ -144,6 +160,22 @@ class MainWindow(QMainWindow):
         self.fps_label = QLabel("FPS: -")
         self.fps_label.setStyleSheet("color: #27ae60; font-weight:bold;")
         v.addWidget(self.fps_label)
+
+        # 测谎报警横幅（默认隐藏，命中弹窗时闪烁显示）
+        self.alarm_bar = QWidget()
+        ab = QHBoxLayout(self.alarm_bar)
+        ab.setContentsMargins(10, 8, 10, 8)
+        self.alarm_label = QLabel("")
+        self.alarm_label.setStyleSheet(
+            "color:white; font-weight:bold; font-size:15px;"
+        )
+        ab.addWidget(self.alarm_label, 1)
+        self.alarm_ack_btn = QPushButton("我已接管（静音）")
+        self.alarm_ack_btn.clicked.connect(self._ack_lie_alarm)
+        ab.addWidget(self.alarm_ack_btn)
+        self.alarm_bar.setStyleSheet("background-color:#c0392b; border-radius:4px;")
+        self.alarm_bar.setVisible(False)
+        v.addWidget(self.alarm_bar)
 
         # 控制按钮
         ctl = QHBoxLayout()
@@ -815,16 +847,25 @@ class MainWindow(QMainWindow):
             return
         self._log(f"[截图] 已保存: {path}")
 
+    @pyqtSlot()
+    def _stop_run(self):
+        """停止自动打怪并复位按钮状态（供手动停止 / 测谎报警共用）。"""
+        self.automation.stop()
+        self.run_btn.setText("▶ 开始自动打怪")
+        self.run_btn.setStyleSheet(
+            "padding:10px;font-size:14px;font-weight:bold;"
+            "background-color:#27ae60;color:white;"
+        )
+        self.preview_once_btn.setEnabled(True)
+
+    @pyqtSlot()
     def _toggle_run(self):
         if self.automation.running:
-            self.automation.stop()
-            self.run_btn.setText("▶ 开始自动打怪")
-            self.run_btn.setStyleSheet(
-                "padding:10px;font-size:14px;font-weight:bold;"
-                "background-color:#27ae60;color:white;"
-            )
-            self.preview_once_btn.setEnabled(True)
+            self._stop_run()
             return
+
+        # 手动重新开始时解除报警（说明玩家已经处理完测谎）
+        self._ack_lie_alarm()
 
         # 启动前: 读 UI → 存配置 → (必要时)重建检测器 → 锁窗口 → 启动
         self._read_ui_to_config()
@@ -869,6 +910,106 @@ class MainWindow(QMainWindow):
         )
         self._preview_timer.start(1000)
         self.preview_once_btn.setEnabled(False)
+
+    # ---------------- 测谎报警 ----------------
+    #
+    # 测谎弹窗命中后由工作线程发 lie_signal 到这里（GUI 线程），做三件事：
+    #   1. 停止自动打怪（工作线程那边已 stop()，这里只复位按钮状态）
+    #   2. 循环报警音，直到玩家点「我已接管（静音）」或按启停热键
+    #   3. 视觉提醒：主窗口红横幅闪烁 + 任务栏闪烁 + 游戏窗口上的红框浮层
+    #
+    # 刻意不把主窗口拉到前台：游戏窗口需要保持前台，抢焦点可能让小游戏
+    # 收不到输入甚至暂停。提示靠"声音 + 闪烁 + 浮层"。
+
+    @pyqtSlot(float)
+    def _on_lie_detected(self, score: float):
+        self._log(f"[测谎] 收到报警信号（score={score:.3f}）→ 已停机，请接管鼠标")
+        self._stop_run()
+
+        # 1) 主窗口横幅（闪烁 + 确认按钮）
+        self.alarm_label.setText(
+            f"⚠ 测谎弹窗！已停机 —— 请立即切到游戏，用鼠标作答（score={score:.2f}）"
+        )
+        self.alarm_bar.setVisible(True)
+        self._alarm_blink_on = False
+        self._blink_alarm()
+        self._alarm_blink_timer.start()
+
+        # 2) 游戏窗口上的置顶红框浮层（看得见、点得穿、不抢焦点）
+        self._show_alarm_overlay()
+
+        # 3) 声音 + 任务栏闪烁
+        self._start_alarm_sound()
+        flash_taskbar(self)
+
+    def _ack_lie_alarm(self):
+        """确认已接管：静音、停闪烁、隐藏浮层与横幅。"""
+        self._alarm_on = False
+        self._alarm_blink_timer.stop()
+        self.alarm_bar.setVisible(False)
+        self._hide_alarm_overlay()
+
+    def _blink_alarm(self):
+        """横幅闪烁（红 / 亮红交替）。"""
+        self._alarm_blink_on = not self._alarm_blink_on
+        color = "#ff6b6b" if self._alarm_blink_on else "#c0392b"
+        self.alarm_bar.setStyleSheet(f"background-color:{color}; border-radius:4px;")
+
+    def _start_alarm_sound(self):
+        """启动循环报警音线程（已在响则不重复启动）。"""
+        if self._alarm_on:
+            return
+        self._alarm_on = True
+        self._alarm_thread = threading.Thread(
+            target=self._alarm_sound_loop, daemon=True
+        )
+        self._alarm_thread.start()
+
+    def _alarm_sound_loop(self):
+        """循环播放报警音，直到 _alarm_on 被置 False。
+
+        winsound.Beep 是阻塞调用，所以放在独立线程里；
+        某些环境 Beep 不可用（抛异常）→ 降级为系统提示音。
+        """
+        import winsound
+
+        fallback = False
+        while self._alarm_on:
+            try:
+                if fallback:
+                    winsound.MessageBeep(winsound.MB_ICONHAND)
+                    time.sleep(0.5)
+                else:
+                    winsound.Beep(1568, 180)     # G6
+                    if not self._alarm_on:
+                        break
+                    winsound.Beep(1046, 260)     # C6
+            except Exception:
+                if not fallback:
+                    fallback = True          # 换系统提示音再试
+                    continue
+                time.sleep(0.5)              # 连提示音都不行 → 静默重试
+
+    def _show_alarm_overlay(self):
+        """在游戏窗口上显示红框浮层（失败不影响声音/横幅提醒）。"""
+        try:
+            rect = self.automation.get_window_rect()
+            if not rect:
+                return
+            if self._overlay is None:
+                self._overlay = AlarmOverlay()
+            self._overlay.show_alarm(
+                rect, "⚠ 测谎弹窗！请立即用鼠标作答"
+            )
+        except Exception as e:
+            self._log(f"[测谎] 报警浮层显示失败（声音与横幅不受影响）: {e}")
+
+    def _hide_alarm_overlay(self):
+        if self._overlay is not None:
+            try:
+                self._overlay.stop_alarm()
+            except Exception:
+                pass
 
     def _on_log(self, msg):
         ts = time.strftime("%H:%M:%S")
@@ -951,13 +1092,27 @@ class MainWindow(QMainWindow):
     def _register_hotkey(self):
         try:
             import keyboard
-            keyboard.add_hotkey(self.config.start_stop_hotkey,
-                                self.hotkey_signal.emit)
+            keyboard.add_hotkey(self.config.start_stop_hotkey, self._on_hotkey)
+            self._log(f"[热键] 已注册 {self.config.start_stop_hotkey}（启动/停止）")
         except Exception as e:
             self._log(f"[热键] 注册 {self.config.start_stop_hotkey} 失败: {e}")
 
+    def _on_hotkey(self):
+        """keyboard 钩子线程回调：显式排队到 GUI 线程执行 _toggle_run。
+
+        keyboard 库的 add_hotkey 回调运行在它自建的后台线程里，直接
+        emit Qt 信号跨线程可能静默丢失；改用 QMetaObject.invokeMethod
+        显式 QueuedConnection 排队到 GUI 线程，确保热键可靠触发。
+        """
+        QMetaObject.invokeMethod(self, "_toggle_run", Qt.QueuedConnection)
+
     # ---------------- 关闭 ----------------
     def closeEvent(self, event):
+        # 先静音：报警音跑在独立线程里，不关会一直响到进程退出
+        try:
+            self._ack_lie_alarm()
+        except Exception:
+            pass
         try:
             self.automation.stop()
         except Exception:

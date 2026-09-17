@@ -51,6 +51,7 @@
   GUI 模式:  python main.py
   CLI 模式:  python -m src.main
 """
+import os
 import time
 import threading
 from typing import Callable, Optional, Any, Tuple
@@ -58,9 +59,12 @@ from typing import Callable, Optional, Any, Tuple
 from .perception.screen_capture import ScreenCapture
 from .perception.yolo_detector import Detector, create_detector
 from .perception.hp_mp_detector import detect_bar_ratio
+from .perception.lie_detector import LieDetector
 from .execution.action_executor import ActionExecutor
 from .decision.context import Context, DecisionEngine
-from .utils.config_loader import Config, resolve_model_path
+from .utils.config_loader import (
+    Config, resolve_model_path, resolve_asset_path, APP_DIR,
+)
 
 
 # =============================================================================
@@ -104,7 +108,8 @@ class Automation:
 
     def __init__(self, config: Config, detector: Optional[Detector] = None,
                  on_log: Optional[Callable[[str], None]] = None,
-                 on_frame: Optional[Callable[..., None]] = None):
+                 on_frame: Optional[Callable[..., None]] = None,
+                 on_lie_detected: Optional[Callable[[float], None]] = None):
         # ---- 感知层 ----
         self.config = config
         self.capture = ScreenCapture()  # 窗口截图（客户区 BitBlt）
@@ -132,6 +137,29 @@ class Automation:
         # ---- 回调 ----
         self.on_log = on_log or (lambda m: None)
         self.on_frame = on_frame or (lambda f, d, h, m: None)
+        # 测谎弹窗命中回调（参数为匹配得分）。UI 侧据此弹报警。
+        self.on_lie_detected = on_lie_detected or (lambda score: None)
+
+        # ---- 测谎弹窗检测（反外挂）----
+        # 弹窗出现 → 3 秒后开始"鼠标跟随图形"小游戏 → 必须马上停手让玩家接管。
+        # 检测放在每帧最前面（YOLO 之前）：命中当帧就 return，反而更省。
+        # 实测约 2.6ms/帧，相对 YOLO 的 ~30ms 可忽略。
+        self._lie_detector: Optional[LieDetector] = None
+        self._lie_latched = False      # 一次弹窗只报警一次（重启时复位）
+        if getattr(config, "lie_detect_enabled", False):
+            try:
+                tpl = resolve_asset_path(
+                    getattr(config, "lie_detect_template", "") or ""
+                )
+                self._lie_detector = LieDetector(
+                    tpl,
+                    threshold=float(
+                        getattr(config, "lie_detect_threshold", 0.78) or 0.78
+                    ),
+                    on_log=self.on_log,
+                )
+            except Exception as e:
+                self.on_log(f"[测谎] 初始化失败，测谎检测已禁用: {e}")
 
         # ---- 线程控制 ----
         self._running = False  # 控制循环是否继续
@@ -235,6 +263,9 @@ class Automation:
         self._buff_open_time = 0.0
         self._buff_last_press = 0.0
 
+        # 测谎锁存复位：若弹窗还挂着就重启，允许再报一次警（然后立刻被再次拦下）
+        self._lie_latched = False
+
         self._running = True
         # daemon=True: 主线程退出时自动结束，不会卡住进程
         self._thread = threading.Thread(target=self._loop, daemon=True)
@@ -253,6 +284,62 @@ class Automation:
         self._buff_queue = []       # 丢弃未处理完的 buff 队列
         self.engine.release_keys()  # 释放按住的方向键/上键
         self.on_log("[停止] 自动打怪已停止")
+
+    # =========================================================================
+    # 测谎弹窗（反外挂）
+    # =========================================================================
+
+    def _handle_lie_detected(self, frame, score: float):
+        """测谎弹窗命中：立即停机 + 报警（同一次弹窗只报警一次）。
+
+        为什么必须先停机：
+          1. 弹窗盖住画面正中，此刻 YOLO 的输出全是垃圾，决策层会乱走乱放技能；
+          2. 小游戏要求玩家用真实鼠标把光标压在移动图形上，机器人必须让出控制权。
+
+        停机后不自动恢复：误恢复（在小游戏中途继续打怪）的代价远大于少打一分钟怪。
+        玩家按启停热键即可重新开始（会自动解除报警）。
+        """
+        if self._lie_latched:
+            # 弹窗仍在（例如玩家重启后又立刻被拦下）→ 只保持停机
+            self.stop()
+            return
+
+        self._lie_latched = True
+        self.on_log(
+            f"[测谎] ⚠ 检测到测谎弹窗！score={score:.3f} → 立即停机，请接管鼠标作答"
+        )
+        self.stop()
+
+        try:
+            path = self._save_lie_evidence(frame)
+            if path:
+                self.on_log(f"[测谎] 现场截图已保存: {path}")
+        except Exception as e:
+            self.on_log(f"[测谎] 现场截图保存失败: {e}")
+
+        try:
+            self.on_lie_detected(score)
+        except Exception as e:
+            self.on_log(f"[测谎] 报警回调异常: {e}")
+
+        # 推一帧预览，让 UI 显示命中画面（无检测框/无血蓝值）
+        try:
+            self.on_frame(frame, [], None, None)
+        except Exception:
+            pass
+
+    def _save_lie_evidence(self, frame) -> str:
+        """保存命中现场截图（留证 + 便于日后复核/重裁模板）。返回路径或空串。"""
+        import cv2
+        from datetime import datetime
+
+        out_dir = os.path.join(APP_DIR, "logs", "lie_detected")
+        os.makedirs(out_dir, exist_ok=True)
+        ts = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+        path = os.path.join(out_dir, f"lie_{ts}.png")
+        if not cv2.imwrite(path, frame):
+            return ""
+        return path
 
     def _loop(self):
         """主循环（在独立线程中运行）。
@@ -286,7 +373,7 @@ class Automation:
                 time.sleep(interval)
 
     def _loop_frame(self, interval: float):
-        """单帧执行：截图→检测→HP/MP→定位→决策→预览。"""
+        """单帧执行：截图→测谎弹窗检测→检测→HP/MP→定位→决策→预览。"""
         t0 = time.time()  # 帧开始时间
         try:
             frame = self.capture.grab()
@@ -317,6 +404,15 @@ class Automation:
             self.on_log(f"[错误] 截图失败: {e}")
             time.sleep(interval)
             return
+
+        # ---- 1.5 测谎弹窗检测（反外挂）----
+        # 放在 YOLO/决策之前：命中当帧直接 return，不浪费后面的推理，
+        # 也保证不会在弹窗上继续按键（弹窗盖屏时 YOLO 输出全是垃圾）。
+        if self._lie_detector is not None and self._lie_detector.available:
+            lie_hit, lie_score = self._lie_detector.detect(frame)
+            if lie_hit:
+                self._handle_lie_detected(frame, lie_score)
+                return
 
         # ---- 2~5. 感知流水线：YOLO 检测 → HP/MP → 自身定位 ----
         detections, hp_ratio, mp_ratio, self_pos = self._run_perception(frame)

@@ -52,6 +52,7 @@ Context 字段说明
   mp_ratio:       蓝量比例 0.0~1.0
   detections:     全部 YOLO 检测结果（含所有类别）
 """
+import random
 from dataclasses import dataclass, field
 from typing import List, Optional, Tuple, Callable
 
@@ -134,9 +135,12 @@ HP_RETREAT_HOLD_SECONDS = 1.0
 """掉血触发后撤的持续秒数：触发后持续后撤此时间，避免只退一帧就停、又被打。
 （按 fps 换算成帧）"""
 
-TARGET_MISS_RETAIN_SECONDS = 0.3
+TARGET_MISS_RETAIN_SECONDS = 0.5
 """长手(远程)目标漏检保持秒数：攻击中锁定目标因技能特效被遮挡而短时漏检时，
-沿用最后位置继续攻击此时间，避免"换目标/乱跑"；超过才重选。（按 fps 换算成帧）"""
+沿用最后位置继续攻击此时间，避免"换目标/乱跑"；超过才重选。（按 fps 换算成帧）
+
+fps=10 时仅 5 帧，取值不能太小——YOLO 对同一只怪的检测本身会逐帧波动，
+窗口太短（如 0.3s=3 帧）会让正常战斗被误判成"目标消失"，掉锁转探索。"""
 
 ROPE_SEARCH_RANGE_X = 200
 """搜索绳索的水平范围（像素）"""
@@ -168,6 +172,28 @@ DISTANCE_LOG_FRAMES = 60
 FACE_TURN_X = 20
 """攻击转向判定：怪物中心 x 与角色 x 差超过此值才调整朝向（像素）。
 小于此值视为怪物在正下方/重叠，保持当前朝向即可。"""
+
+# =============================================================================
+# 拟人化抖动（降低"输入完全规律"的机器特征，减少被反外挂盯上的概率）
+# =============================================================================
+
+HEAL_REACT_SECONDS = 0.5
+"""加血/加蓝的"反应延迟"（秒）：血量/蓝量跌破阈值后不立即按键，先延迟此时间。
+人类反应时间本就比程序慢且每次不固定，跌破阈值同一帧就按是明显的机器特征。"""
+
+REACT_RESET_SECONDS = 0.3
+"""加血/加蓝反应延迟的"复位门槛"（秒）：血/蓝量要连续恢复正常这么多时间，
+延迟计数才清零复位。
+
+血/蓝条读数会跳（日志实测：血量 24% 的中途突然读成 99%，一秒内来回 5 次）。
+若单帧"正常"就立刻复位，刚装载的 0.5s 反应延迟会被反复重置，
+真低血时反而一直等不到按键。"""
+
+SKILL_COOLDOWN_JITTER_MIN = 0.9
+"""技能冷却抖动下限倍数：实际冷却 = 技能冷却 × U(此值, 上限)。"""
+
+SKILL_COOLDOWN_JITTER_MAX = 1.15
+"""技能冷却抖动上限倍数：避免技能释放间隔恒定（如精确每 0.3s）。"""
 
 MELEE_HIT_TOL_X = 10
 """短手贴脸"命中容差"（像素）。
@@ -321,6 +347,10 @@ class DecisionEngine:
         self._aoe_burst_left = 0                  # AOE连发剩余次数（爆炸箭二连发）
         self._target_miss_frames = 0              # 锁定目标连续漏检帧数（特效遮挡保持）
         self._buff_hold_frames = 0                # >0 时暂停攻击/移动，给 buff 让路（主循环请求）
+        self._hp_react_frames = -1                # 加血反应延迟剩余帧数（-1=未触发）
+        self._mp_react_frames = -1                # 加蓝反应延迟剩余帧数（-1=未触发）
+        self._hp_react_ok = 0                     # 血量连续正常帧数（抗单帧读数毛刺）
+        self._mp_react_ok = 0                     # 蓝量连续正常帧数（抗单帧读数毛刺）
 
     def update_config(self, config: Config):
         self.config = config
@@ -345,6 +375,10 @@ class DecisionEngine:
         self._aoe_burst_left = 0
         self._target_miss_frames = 0
         self._buff_hold_frames = 0
+        self._hp_react_frames = -1
+        self._mp_react_frames = -1
+        self._hp_react_ok = 0
+        self._mp_react_ok = 0
         self.release_keys()
         self._fsm.reset()
         self.executor.reset()
@@ -399,30 +433,46 @@ class DecisionEngine:
         if self._hp_drop_active_frames > 0:
             self._hp_drop_active_frames -= 1
 
-        # ---- 优先级 1: 没血加血 ----
-        if ctx.hp_ratio is not None and ctx.hp_ratio < self.config.hp_threshold:
-            # 满状态（>=95%）不触发，防止刚加完又按
-            if ctx.hp_ratio < 0.95:
-                self._fsm.transition(State.HEALING)
-                self._release_move()  # 加血时站住不动
-                if self.executor.press_key(self.config.hp_key, cooldown=1.5):
-                    self._log(
-                        f"[加血] HP={ctx.hp_ratio:.0%} < {self.config.hp_threshold:.0%}，"
-                        f"按下 {self.config.hp_key}"
-                    )
-                    return
+        # ---- 优先级 1: 没血加血（跌破阈值后延迟 ~0.5s 再按，模拟人类反应时间）----
+        hp_low = (ctx.hp_ratio is not None
+                  and ctx.hp_ratio < self.config.hp_threshold
+                  and ctx.hp_ratio < 0.95)   # 满状态(>=95%)不触发，防止刚加完又按
+        self._hp_react_frames, self._hp_react_ok = self._tick_react_delay(
+            self._hp_react_frames, self._hp_react_ok, hp_low)
+        # 只在"血瓶真能按下"时才切 HEALING 并收手：press_key 带 1.5s 冷却，
+        # 冷却期内它返回 False。若此时仍然切状态，就会每帧 HEALING↔ATTACKING
+        # 翻一次（血低时冷却一直在，等于每帧翻）；而直接 return 又会让角色在
+        # 等冷却的 1.5s 里完全停手、不输出。冷却期内不切状态也不 return
+        # → 继续正常战斗，血瓶一好立刻按。
+        if hp_low and self._hp_react_frames == 0 \
+                and self.executor.can_press(self.config.hp_key, cooldown=1.5):
+            self._release_move()  # 加血时站住不动
+            self._fsm.transition(State.HEALING)
+            if self.executor.press_key(self.config.hp_key, cooldown=1.5):
+                self._log(
+                    f"[加血] HP={ctx.hp_ratio:.0%} < {self.config.hp_threshold:.0%}，"
+                    f"按下 {self.config.hp_key}"
+                )
+            return
 
-        # ---- 优先级 2: 没蓝加蓝 ----
-        if ctx.mp_ratio is not None and ctx.mp_ratio < self.config.mp_threshold:
-            if ctx.mp_ratio < 0.95:
-                self._fsm.transition(State.RECOVERING)
-                self._release_move()  # 加蓝时站住不动
-                if self.executor.press_key(self.config.mp_key, cooldown=1.5):
-                    self._log(
-                        f"[加蓝] MP={ctx.mp_ratio:.0%} < {self.config.mp_threshold:.0%}，"
-                        f"按下 {self.config.mp_key}"
-                    )
-                    return
+        # ---- 优先级 2: 没蓝加蓝（同样带 0.5s 反应延迟）----
+        mp_low = (ctx.mp_ratio is not None
+                  and ctx.mp_ratio < self.config.mp_threshold
+                  and ctx.mp_ratio < 0.95)
+        self._mp_react_frames, self._mp_react_ok = self._tick_react_delay(
+            self._mp_react_frames, self._mp_react_ok, mp_low)
+        # 与加血同理：只在蓝瓶真能按下时才切 RECOVERING 并收手，
+        # 冷却期内继续正常战斗（否则同样会每帧 RECOVERING↔ATTACKING 翻转）。
+        if mp_low and self._mp_react_frames == 0 \
+                and self.executor.can_press(self.config.mp_key, cooldown=1.5):
+            self._release_move()  # 加蓝时站住不动
+            self._fsm.transition(State.RECOVERING)
+            if self.executor.press_key(self.config.mp_key, cooldown=1.5):
+                self._log(
+                    f"[加蓝] MP={ctx.mp_ratio:.0%} < {self.config.mp_threshold:.0%}，"
+                    f"按下 {self.config.mp_key}"
+                )
+            return
 
         # ---- buff 施法窗口：暂停攻击/移动，给 buff 让路（加血/加蓝不受影响）----
         # 主循环检测到 buff 到期时，通过 request_buff_window() 打开此窗口，
@@ -435,8 +485,7 @@ class DecisionEngine:
         # ---- 优先级 3: 检测到怪物 ----
         if ctx.monsters:
             self._handle_monsters(ctx)
-        elif self._fsm.current in (State.ATTACKING, State.CHASING) \
-                and self._target_monster is not None:
+        elif self._in_combat() and self._target_monster is not None:
             # 战斗中整帧看不到任何怪：短手贴脸时角色+攻击特效可能把怪
             # 完全遮住 → YOLO 整帧漏检。先走遮挡判定维持虚拟目标继续攻击，
             # 避免"怪消失 → 转探索乱走 → 怪露出 → 重选目标"的反复空转。
@@ -450,7 +499,7 @@ class DecisionEngine:
             # 长手：远程技能特效遮挡 → 保持锁定继续攻击（不后撤、不探索）
             retained = self._retain_missed_target(ctx)
             if retained is not None:
-                self._attack(ctx, retained)
+                self._dispatch_retained(ctx, retained)
                 return
             # 长手：目标消失但最后位置很近 → 被遮挡 → 后撤；或掉血兜底后撤
             if self._handle_no_monster_retreat(ctx):
@@ -845,7 +894,7 @@ class DecisionEngine:
         沿用最后已知位置继续攻击，避免误判"目标没了"而换目标/乱跑。
 
         保持条件（全部满足）：
-          1. 长手且处于攻击状态（ATTACKING）
+          1. 长手且处于战斗中（ATTACKING/CHASING/HEALING/RECOVERING）
           2. 最后已知位置与角色同平台、水平距离 ≥ OCCLUSION_RETREAT_X（远程，非贴脸）
           3. 连续漏检未超 TARGET_MISS_RETAIN_SECONDS（按 fps 换算）
         贴脸漏检(dx < OCCLUSION_RETREAT_X)由 _handle_long_range_occlusion 后撤处理。
@@ -854,7 +903,7 @@ class DecisionEngine:
             return None
         if self._target_monster is None:
             return None
-        if self._fsm.current != State.ATTACKING:
+        if not self._in_combat():
             return None
         if self._target_miss_frames >= self._frames(TARGET_MISS_RETAIN_SECONDS):
             return None
@@ -871,6 +920,20 @@ class DecisionEngine:
         # 打印日志，追踪是否因为这个原因导致无效攻击
         # self._log(f"[长手(远程)目标漏检] MISSING_FRAMES={self._target_miss_frames}")
         return t
+
+    def _dispatch_retained(self, ctx: Context, target: Detection):
+        """把"漏检但被保住"的目标按当前距离分发给攻击或追击。
+
+        不能无条件走 _attack：_retain_missed_target 现在对 CHASING 也生效，
+        目标可能已经超出攻击距离，而 _attack 的距离守卫在这种情况下会直接
+        return——既不攻击也不追赶，角色会原地站住不动。
+        """
+        if self._can_attack(ctx, target):
+            self._fsm.transition(State.ATTACKING)
+            self._attack(ctx, target)
+        else:
+            self._fsm.transition(State.CHASING)
+            self._chase(ctx, target)
 
     def _resolve_locked_target(self, ctx: Context) -> Detection:
         """解析当前应攻击的目标怪物（就近原则 + 攻击期保持锁定）。
@@ -936,7 +999,7 @@ class DecisionEngine:
           - 攻击中断 → 转探索 → 角色离开 → 怪重新可见 → 反复贴脸失败
 
         判定条件（全部满足才视为"被遮挡"，否则按怪真消失处理）：
-          1. 短手模式且正处于攻击状态（角色站定，位置稳定）
+          1. 短手模式且处于战斗中（角色站位稳定，见 _in_combat）
           2. 角色与目标最后位置在同一平台
           3. 角色与目标最后位置水平距离很近（贴脸距离 + 宽度容差）
           4. 连续遮挡未超上限（OCCLUSION_MAX_FRAMES，超时视为怪真消失）
@@ -945,7 +1008,7 @@ class DecisionEngine:
             return None  # 长手站远程打，不会贴脸遮挡，保持原逻辑
         if self._target_monster is None:
             return None
-        if self._fsm.current != State.ATTACKING:
+        if not self._in_combat():
             return None
         # 用"有效位置"而非实时位置：贴脸时角色名字也可能被怪/攻击特效遮挡，
         # OCR 定位失败 → ctx.self_position 为 None。攻击中角色位置不变，
@@ -1040,21 +1103,36 @@ class DecisionEngine:
     # 攻击范围判定
     # =========================================================================
 
+    def _in_combat(self) -> bool:
+        """是否处于"战斗中"（含加血/加蓝这类瞬态状态）。
+
+        战斗连续性判定（用最后已知位置兜底、保持锁定目标、遮挡虚拟目标）
+        若只认 State.ATTACKING，加血的那一帧就会集体失效：自身定位恰好失败
+        → 判定"无法判断距离" → 清锁 → 转探索（_explore 还会真的按住方向键
+        走起来，可能越走离怪越远）→ 定位恢复后又重新锁怪。表现为每秒十几次
+        状态翻转、每次攻击只放一两发技能。
+
+        加血/加蓝会让 FSM 短暂离开 ATTACKING，但那仍是"正在打仗"，
+        所以这里看"是否在打仗"，而不是看某一个具体状态。
+        """
+        return self._fsm.current in (State.ATTACKING, State.CHASING,
+                                     State.HEALING, State.RECOVERING)
+
     def _effective_self_pos(self, ctx: Context) -> Optional[Tuple[int, int]]:
         """返回当前帧决策用的自身脚底坐标。
 
         OCR 定位成功 → 实时坐标。
         定位暂时失败（技能特效遮挡角色名字 / 怪物名与角色名重叠 /
-        OCR 抖动）但正处于【站定攻击】中 → 用最后已知位置兜底
+        OCR 抖动）但正处于【战斗中】(_in_combat) → 用最后已知位置兜底
         （_last_self_pos，带 SELF_POS_STALE_FRAMES 时效）。
-        站定攻击中角色位置不变，短时用旧坐标准确且安全，避免
-        "特效挡名字 → 放弃目标 → 转探索乱走" 的反复空转。
-        其余状态（追击/探索/移动中）定位失败 → 返回 None，
+        战斗中用旧坐标基本准确且安全，避免"特效挡名字 → 放弃目标 →
+        转探索乱走" 的反复空转。
+        其余状态（探索/待命）定位失败 → 返回 None，
         由各调用方按原有逻辑处理（不盲打/不追错方向）。
         """
         if ctx.self_position is not None:
             return ctx.self_position
-        if self._fsm.current == State.ATTACKING and self._last_self_pos is not None \
+        if self._in_combat() and self._last_self_pos is not None \
                 and self._self_pos_stale_frames <= SELF_POS_STALE_FRAMES:
             return self._last_self_pos
         return None
@@ -1086,6 +1164,50 @@ class DecisionEngine:
     def _frames(self, seconds: float) -> int:
         """把"秒"换算成帧数（按配置 fps），避免帧数阈值随 fps 漂移。"""
         return max(1, int(round(seconds * max(1, self.config.fps))))
+
+    def _tick_react_delay(self, frames: int, ok_frames: int,
+                          low: bool) -> Tuple[int, int]:
+        """加血/加蓝的"反应延迟"计数（模拟人类反应时间，降低机器特征）。
+
+        - low 成立 → 连续正常帧数清零；未装载则装载 HEAL_REACT_SECONDS 秒延迟，
+          装载后每帧递减，减到 0 表示"可以按键了"（保持 0，每帧重试按键，
+          由按键自身的冷却决定何时真正按下）
+        - low 不成立 → 连续正常帧数累加，连续正常够 REACT_RESET_SECONDS 才复位
+
+        复位要求"连续正常够久"是防读数毛刺：血/蓝条会跳（实测血量 24% 中途
+        读成 99%），单帧正常就清零会把刚装载的延迟反复重置，真低血时反而一直
+        等不到按键。
+
+        Args:
+            frames:    当前剩余帧数（-1=未触发）
+            ok_frames: 当前连续正常帧数
+            low:       本帧血/蓝量是否低于阈值
+
+        Returns:
+            (更新后的剩余帧数, 更新后的连续正常帧数)
+        """
+        if low:
+            ok_frames = 0
+            if frames < 0:
+                frames = self._frames(HEAL_REACT_SECONDS)
+            elif frames > 0:
+                frames -= 1
+        else:
+            ok_frames += 1
+            if ok_frames >= self._frames(REACT_RESET_SECONDS):
+                frames = -1
+        return frames, ok_frames
+
+    def _jitter_cooldown(self, cooldown) -> float:
+        """给技能冷却加随机抖动（×U(0.9, 1.15)），避免释放节奏完全恒定。"""
+        try:
+            cd = float(cooldown)
+        except (TypeError, ValueError):
+            return 0.0
+        if cd <= 0:
+            return cd
+        return cd * random.uniform(SKILL_COOLDOWN_JITTER_MIN,
+                                   SKILL_COOLDOWN_JITTER_MAX)
 
     def _is_stand_mode(self) -> bool:
         """站桩模式：不对角色做任何移动（不移动、不转向、不后撤、不探索）。"""
@@ -1357,9 +1479,8 @@ class DecisionEngine:
             self._release_move()
             return False
 
-        # 2) 遮挡后撤：有锁定目标、处于战斗状态、最后位置很近
-        if self._target_monster is not None \
-                and self._fsm.current in (State.ATTACKING, State.CHASING):
+        # 2) 遮挡后撤：有锁定目标、处于战斗中、最后位置很近
+        if self._target_monster is not None and self._in_combat():
             if self._handle_long_range_occlusion(ctx):
                 return True
 
@@ -1919,6 +2040,7 @@ class DecisionEngine:
 
         force_index 给定且有效 → 直接释放该技能（受冷却约束，冷却中则本帧不释放）。
         force_index 为 None → 按原轮转顺序释放（跳过冷却中的技能）。
+        实际使用的冷却带 ±随机抖动（见 _jitter_cooldown），避免释放节奏恒定。
 
         Returns:
             True 表示本帧实际释放了技能，False 表示未释放（冷却中/无技能）。
@@ -1929,7 +2051,8 @@ class DecisionEngine:
 
         if force_index is not None and 0 <= force_index < len(skills):
             skill = skills[force_index]
-            if self.executor.press_key(skill["key"], skill["cooldown"]):
+            if self.executor.press_key(skill["key"],
+                                       self._jitter_cooldown(skill["cooldown"])):
                 self._log(f"[技能] 释放 {skill['name']} ({skill['key']})")
                 return True
             return False
@@ -1937,7 +2060,8 @@ class DecisionEngine:
         for _ in range(len(skills)):
             skill = skills[self._skill_index % len(skills)]
             self._skill_index += 1
-            if self.executor.press_key(skill["key"], skill["cooldown"]):
+            if self.executor.press_key(skill["key"],
+                                       self._jitter_cooldown(skill["cooldown"])):
                 self._log(f"[技能] 释放 {skill['name']} ({skill['key']})")
                 return True
         return False

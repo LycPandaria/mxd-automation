@@ -114,12 +114,12 @@ DEFAULT_YAML_PATH = os.path.join(CONFIG_DIR, "user.yaml")
 DEFAULT_JSON_PATH = os.path.join(CONFIG_DIR, "user.json")
 
 
-def resolve_model_path(raw_path: str) -> str:
-    """解析模型路径。
+def _resolve_relative_file(raw_path: str) -> str:
+    """把相对路径解析成"exe 旁边优先、打包内兜底"的绝对路径。
 
     - 绝对路径: 直接返回
-    - 相对路径: 优先在 APP_DIR（exe 旁边，外置模型）查找；
-      不存在时回退 BUNDLE_DIR（打包内，兼容旧版把模型打进包的情况）。
+    - 相对路径: 优先在 APP_DIR（exe 旁边，外置资源）查找；
+      不存在时回退 BUNDLE_DIR（打包内，兼容资源被打进包的情况）。
     """
     if not raw_path:
         return raw_path
@@ -130,6 +130,16 @@ def resolve_model_path(raw_path: str) -> str:
         if os.path.isfile(cand):
             return cand
     return os.path.normpath(os.path.join(APP_DIR, raw_path))
+
+
+def resolve_model_path(raw_path: str) -> str:
+    """解析模型路径（规则见 _resolve_relative_file）。"""
+    return _resolve_relative_file(raw_path)
+
+
+def resolve_asset_path(raw_path: str) -> str:
+    """解析资源路径（模板图片等，规则同 resolve_model_path）。"""
+    return _resolve_relative_file(raw_path)
 
 
 def config_path() -> str:
@@ -271,6 +281,14 @@ def _defaults() -> Dict[str, Any]:
         "pickup_interval": 0.333, # 拾取间隔（秒），默认每秒3次
         # ---- 自动截图 ----
         "screenshot_interval": 5,  # 自动截图间隔（秒）
+        # ---- 测谎弹窗检测（反外挂）----
+        # 游戏弹出"测谎探测仪"时（3 秒后开始"鼠标跟随图形"小游戏，失败会被处罚），
+        # 检测到就【立即停机 + 报警】，把真实鼠标交给玩家。
+        # 实现见 src/perception/lie_detector.py（模板匹配），模板图片默认
+        # assets/templates/lie_detector.png，阈值 0.78 有充足的抗误报余量。
+        "lie_detect_enabled": True,
+        "lie_detect_template": "assets/templates/lie_detector.png",
+        "lie_detect_threshold": 0.78,  # 匹配得分阈值（实测正样本 0.96 / 普通帧最高 0.39）
     }
 
 
