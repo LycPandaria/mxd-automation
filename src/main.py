@@ -266,6 +266,11 @@ class Automation:
         # 测谎锁存复位：若弹窗还挂着就重启，允许再报一次警（然后立刻被再次拦下）
         self._lie_latched = False
 
+        # 测谎检测状态：模板加载日志发生在 __init__，那时 UI 还没接上日志信号会被丢掉，
+        # 所以这里补一条 —— 阈值调错（比如测试时改成 0.2 忘了改回）必须一眼能看见。
+        if self._lie_detector is not None:
+            self.on_log(f"[测谎] 检测状态：{self._lie_detector.describe()}")
+
         self._running = True
         # daemon=True: 主线程退出时自动结束，不会卡住进程
         self._thread = threading.Thread(target=self._loop, daemon=True)
@@ -283,6 +288,10 @@ class Automation:
         self._running = False
         self._buff_queue = []       # 丢弃未处理完的 buff 队列
         self.engine.release_keys()  # 释放按住的方向键/上键
+        # 物理兜底：把键盘/鼠标控制器认为"还按着"的键全部释放。
+        # 只靠 engine.release_keys() 时，若引擎的 _held_key 与控制器的 _held_keys
+        # 不一致（换键/异常路径），停机会漏掉那个键 → 角色停止后仍一直走、一直打。
+        self.executor.reset()
         self.on_log("[停止] 自动打怪已停止")
 
     # =========================================================================
@@ -454,6 +463,12 @@ class Automation:
             hp_str = f"{hp_ratio:.0%}" if hp_ratio is not None else "N/A"
             mp_str = f"{mp_ratio:.0%}" if mp_ratio is not None else "N/A"
 
+            # 测谎匹配分：贴在这条固定日志上，方便一眼看出阈值是否调错
+            # （阈值 0.78 时正常画面应长期在 0.2~0.4；长期贴到 0.7+ 说明模板不匹配）
+            lie_str = ""
+            if self._lie_detector is not None and self._lie_detector.available:
+                lie_str = f" 测谎分={self._lie_detector.last_score:.2f}"
+
             # 自身坐标
             center = self._get_last_center()
             if self_pos:
@@ -461,15 +476,15 @@ class Automation:
                     self.on_log(
                         f"[状态] HP={hp_str} MP={mp_str} "
                         f"中心:({center[0]},{center[1]}) "
-                        f"脚底:({self_pos[0]},{self_pos[1]})"
+                        f"脚底:({self_pos[0]},{self_pos[1]}){lie_str}"
                     )
                 else:
                     self.on_log(
                         f"[状态] HP={hp_str} MP={mp_str} "
-                        f"脚底:({self_pos[0]},{self_pos[1]})"
+                        f"脚底:({self_pos[0]},{self_pos[1]}){lie_str}"
                     )
             else:
-                self.on_log(f"[状态] HP={hp_str} MP={mp_str} 自身未定位")
+                self.on_log(f"[状态] HP={hp_str} MP={mp_str} 自身未定位{lie_str}")
 
         # ---- 6. 决策与执行 ----
         # Context 是感知层 → 决策层的数据载体

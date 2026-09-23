@@ -11,6 +11,7 @@
   - ``src.perception``：检测器与区域颜色识别
   - ``ui.preview_label.PreviewLabel``：预览与框选
 """
+import ctypes
 import os
 import sys
 import threading
@@ -28,7 +29,7 @@ from PyQt5.QtWidgets import (
     QPushButton, QLabel, QLineEdit, QComboBox, QSlider, QGroupBox,
     QGridLayout, QTableWidget, QTableWidgetItem, QHeaderView,
     QPlainTextEdit, QCheckBox, QFileDialog, QMessageBox, QSplitter,
-    QAbstractItemView, QSpinBox,
+    QAbstractItemView, QSpinBox, QDoubleSpinBox,
 )
 from PyQt5.QtCore import Qt, QTimer, pyqtSignal, pyqtSlot, QMetaObject
 from PyQt5.QtGui import QImage, QPixmap
@@ -77,6 +78,15 @@ class MainWindow(QMainWindow):
         self._alarm_thread = None
         self._overlay = None            # 游戏窗口上的红框浮层（惰性创建）
 
+        # ---- 启停热键轮询备份 ----
+        # 见 _register_hotkey 的注释：光靠键盘钩子会出现"注册成功但按了没反应"。
+        self._poll_vk = None            # 热键的虚拟键码（None=不走轮询）
+        self._poll_key_down = False     # 上一轮检测到的按下状态（做按下沿判定）
+        self._last_toggle_time = 0.0    # 上次 toggle 时间（双通道去重用）
+        self._poll_timer = QTimer(self)
+        self._poll_timer.setInterval(50)
+        self._poll_timer.timeout.connect(self._poll_stop_key)
+
         self._fps_counter = [0, time.time()]
         self._preview_timer = QTimer(self)
         self._preview_timer.timeout.connect(self._update_fps)
@@ -92,10 +102,16 @@ class MainWindow(QMainWindow):
         # 攻击距离/近战距离（统一）修改时实时同步到 YAML
         self.distance_spin.valueChanged.connect(self._on_distance_changed)
         self.attack_range_y_spin.valueChanged.connect(self._on_attack_range_y_changed)
+        # 近身击退参数：改动即写入配置并落盘（运行中也即时生效）
+        self.knockback_key_edit.textChanged.connect(self._on_knockback_changed)
+        self.knockback_name_edit.textChanged.connect(self._on_knockback_changed)
+        self.knockback_cd_spin.valueChanged.connect(self._on_knockback_changed)
+        self.knockback_range_spin.valueChanged.connect(self._on_knockback_changed)
         self.attack_type_combo.currentIndexChanged.connect(self._on_attack_type_changed)
         self.stand_mode_checkbox.toggled.connect(self._on_stand_mode_changed)
         self.stand_facing_combo.currentIndexChanged.connect(self._on_stand_facing_changed)
         self.stand_default_attack_checkbox.toggled.connect(self._on_stand_default_attack_changed)
+        self.stand_skill2_checkbox.toggled.connect(self._on_stand_skill2_changed)
 
         self.log_signal.connect(self._on_log)
         self.frame_signal.connect(self._on_frame)
@@ -380,6 +396,44 @@ class MainWindow(QMainWindow):
         row.addStretch()
         v.addLayout(row)
 
+        # 近身击退：怪贴到触发距离内时改放击退技能把它推开（原地，不移动）
+        kb_row = QHBoxLayout()
+        kb_row.addWidget(QLabel("近身击退:"))
+        self.knockback_name_edit = QLineEdit("")
+        self.knockback_name_edit.setPlaceholderText("名称(退魔箭)")
+        self.knockback_name_edit.setFixedWidth(90)
+        kb_row.addWidget(self.knockback_name_edit)
+        self.knockback_key_edit = QLineEdit("")
+        self.knockback_key_edit.setPlaceholderText("按键")
+        self.knockback_key_edit.setFixedWidth(50)
+        kb_row.addWidget(self.knockback_key_edit)
+        kb_row.addWidget(QLabel("冷却s:"))
+        self.knockback_cd_spin = QDoubleSpinBox()
+        self.knockback_cd_spin.setRange(0.05, 60.0)
+        self.knockback_cd_spin.setSingleStep(0.05)
+        self.knockback_cd_spin.setDecimals(2)
+        self.knockback_cd_spin.setValue(0.3)
+        self.knockback_cd_spin.setFixedWidth(70)
+        kb_row.addWidget(self.knockback_cd_spin)
+        kb_row.addWidget(QLabel("触发距离px:"))
+        self.knockback_range_spin = QSpinBox()
+        self.knockback_range_spin.setRange(10, 800)
+        self.knockback_range_spin.setValue(240)
+        self.knockback_range_spin.setFixedWidth(70)
+        kb_row.addWidget(self.knockback_range_spin)
+        kb_row.addStretch()
+        v.addLayout(kb_row)
+        _kb_tip = (
+            "怪贴到触发距离（双方中心x差）以内时改放击退技能，把它推开后继续站定输出，\n"
+            "替代“贴脸就往后走”的移动型后撤（不移动=不落崖、不打断输出，还带伤害）。\n"
+            "按键留空 = 不启用。冷却期内会照常放普通技能，所以击退没生效也不会卡住输出。\n"
+            "只对长手(远程)生效；按键不要与技能/buff/加血/加蓝/拾取键重复。\n"
+            "触发距离参考：实测参考帧为 224/232px（精灵框间隙约 115~120px），默认 240。"
+        )
+        for _w in (self.knockback_name_edit, self.knockback_key_edit,
+                   self.knockback_cd_spin, self.knockback_range_spin):
+            _w.setToolTip(_kb_tip)
+
         # 站桩模式：角色完全不动，只打朝向正前方射程内的怪
         stand_row = QHBoxLayout()
         self.stand_mode_checkbox = QCheckBox("站桩模式")
@@ -404,8 +458,45 @@ class MainWindow(QMainWindow):
             "用于应对模型漏检；不移动、不转向"
         )
         stand_row.addWidget(self.stand_default_attack_checkbox)
+        self.stand_skill2_checkbox = QCheckBox("只用技能2")
+        self.stand_skill2_checkbox.setToolTip(
+            "站桩模式下攻击只放技能2（爆炸箭这类群攻）：\n"
+            "技能2 冷却中就等下一帧，不退回技能1\n"
+            "（普通模式的 AOE 连发会用技能1兜底，站桩按需求去掉）"
+        )
+        stand_row.addWidget(self.stand_skill2_checkbox)
         stand_row.addStretch()
         v.addLayout(stand_row)
+
+        # 站桩定时微动：每过 N 秒"反方向点一下 + 朝向点一下"（反"定点一动不动"特征）
+        micro_row = QHBoxLayout()
+        self.micro_move_checkbox = QCheckBox("定时微动")
+        self.micro_move_checkbox.setToolTip(
+            "站桩模式下每过一段时间，朝背离朝向的方向极短点一下，\n"
+            "再朝朝向极短点一下（两次等长、方向相反 ≈ 原地晃一下）。\n"
+            "不关心挪了几像素；最后一下朝朝向，所以朝向保持不变。"
+        )
+        micro_row.addWidget(self.micro_move_checkbox)
+        micro_row.addWidget(QLabel("间隔:"))
+        self.micro_interval_spin = QSpinBox()
+        self.micro_interval_spin.setRange(10, 3600)
+        self.micro_interval_spin.setValue(300)
+        self.micro_interval_spin.setSuffix(" s")
+        self.micro_interval_spin.setToolTip("微动间隔（秒），默认 300s=5分钟")
+        self.micro_interval_spin.setFixedWidth(80)
+        micro_row.addWidget(self.micro_interval_spin)
+        micro_row.addWidget(QLabel("点按:"))
+        self.micro_tap_spin = QSpinBox()
+        self.micro_tap_spin.setRange(20, 300)
+        self.micro_tap_spin.setValue(40)
+        self.micro_tap_spin.setSuffix(" ms")
+        self.micro_tap_spin.setToolTip(
+            "每次方向键点按的时长（毫秒）。越小动作越轻，默认 40ms"
+        )
+        self.micro_tap_spin.setFixedWidth(80)
+        micro_row.addWidget(self.micro_tap_spin)
+        micro_row.addStretch()
+        v.addLayout(micro_row)
 
         # 拾取设置
         pickup_row = QHBoxLayout()
@@ -516,6 +607,18 @@ class MainWindow(QMainWindow):
         # 攻击距离：长手读 config.attack_range，短手固定 50（_sync_distance_ui 内处理）
         self.distance_spin.setValue(int(getattr(c, "attack_range", 200)))
         self.attack_range_y_spin.setValue(int(getattr(c, "attack_range_y", 60)))
+        # 近身击退
+        _kb = getattr(c, "knockback_skill", None) or {}
+        self.knockback_name_edit.setText(str(_kb.get("name", "") or ""))
+        self.knockback_key_edit.setText(str(_kb.get("key", "") or ""))
+        try:
+            self.knockback_cd_spin.setValue(float(_kb.get("cooldown", 0.3) or 0.3))
+        except (TypeError, ValueError):
+            self.knockback_cd_spin.setValue(0.3)
+        try:
+            self.knockback_range_spin.setValue(int(_kb.get("range", 240) or 240))
+        except (TypeError, ValueError):
+            self.knockback_range_spin.setValue(240)
         # 站桩模式
         self.stand_mode_checkbox.setChecked(bool(getattr(c, "stand_mode", False)))
         _sf = getattr(c, "stand_facing", "right")
@@ -523,6 +626,19 @@ class MainWindow(QMainWindow):
         self.stand_facing_combo.setCurrentIndex(_sidx if _sidx >= 0 else 0)
         self.stand_default_attack_checkbox.setChecked(
             bool(getattr(c, "stand_default_attack", True))
+        )
+        self.stand_skill2_checkbox.setChecked(
+            bool(getattr(c, "stand_skill2_only", True))
+        )
+        # 站桩定时微动
+        self.micro_move_checkbox.setChecked(
+            bool(getattr(c, "stand_micro_move_enabled", True))
+        )
+        self.micro_interval_spin.setValue(
+            int(float(getattr(c, "stand_micro_move_interval", 300.0) or 300.0))
+        )
+        self.micro_tap_spin.setValue(
+            int(getattr(c, "stand_micro_move_tap_ms", 40) or 40)
         )
         self._sync_distance_ui()
         # 拾取
@@ -569,10 +685,22 @@ class MainWindow(QMainWindow):
         if c.attack_type == "long":
             c.attack_range = self.distance_spin.value()  # 长手距离可在界面修改
         c.attack_range_y = self.attack_range_y_spin.value()
+        # 近身击退（按键留空 = 不启用）
+        c.knockback_skill = {
+            "name": self.knockback_name_edit.text().strip() or "击退技能",
+            "key": self.knockback_key_edit.text().strip(),
+            "cooldown": float(self.knockback_cd_spin.value()),
+            "range": int(self.knockback_range_spin.value()),
+        }
         # 站桩模式
         c.stand_mode = self.stand_mode_checkbox.isChecked()
         c.stand_facing = self.stand_facing_combo.currentData()
         c.stand_default_attack = self.stand_default_attack_checkbox.isChecked()
+        c.stand_skill2_only = self.stand_skill2_checkbox.isChecked()
+        # 站桩定时微动
+        c.stand_micro_move_enabled = self.micro_move_checkbox.isChecked()
+        c.stand_micro_move_interval = float(self.micro_interval_spin.value())
+        c.stand_micro_move_tap_ms = self.micro_tap_spin.value()
         # 拾取
         c.pickup_enabled = self.pickup_checkbox.isChecked()
         c.pickup_key = self.pickup_key_edit.text().strip() or "z"
@@ -641,6 +769,19 @@ class MainWindow(QMainWindow):
         self.config.attack_range_y = value
         save_user_config(self.config)
 
+    def _on_knockback_changed(self, *_):
+        """近身击退参数变化时，实时同步到 config 并保存到 YAML。
+
+        在打怪运行中改也能立刻生效（决策层每帧从 config 读）。
+        """
+        self.config.knockback_skill = {
+            "name": self.knockback_name_edit.text().strip() or "击退技能",
+            "key": self.knockback_key_edit.text().strip(),
+            "cooldown": float(self.knockback_cd_spin.value()),
+            "range": int(self.knockback_range_spin.value()),
+        }
+        save_user_config(self.config)
+
     def _on_stand_mode_changed(self, checked):
         """站桩模式勾选变化时，实时同步到 config 并保存到 YAML。"""
         self.config.stand_mode = bool(checked)
@@ -654,6 +795,11 @@ class MainWindow(QMainWindow):
     def _on_stand_default_attack_changed(self, checked):
         """站桩默认攻击(无怪也攻击)勾选变化时，实时同步到 config 并保存到 YAML。"""
         self.config.stand_default_attack = bool(checked)
+        save_user_config(self.config)
+
+    def _on_stand_skill2_changed(self, checked):
+        """站桩"只用技能2"勾选变化时，实时同步到 config 并保存到 YAML。"""
+        self.config.stand_skill2_only = bool(checked)
         save_user_config(self.config)
 
     def _on_attack_type_changed(self, index):
@@ -860,12 +1006,23 @@ class MainWindow(QMainWindow):
 
     @pyqtSlot()
     def _toggle_run(self):
+        # ---- 去重：同一次按键可能被钩子和轮询各触发一次 ----
+        # 不去重的话，一次 F6 会 toggle 两次（停止+立刻开始）＝看起来"按 F6 没反应"。
+        now = time.time()
+        if now - self._last_toggle_time < self._TOGGLE_DEBOUNCE:
+            return
+        self._last_toggle_time = now
+
         if self.automation.running:
             self._stop_run()
             return
 
-        # 手动重新开始时解除报警（说明玩家已经处理完测谎）
-        self._ack_lie_alarm()
+        # 报警正在响时，第一次按只静音，不启动：
+        # 否则玩家"想让机器人停下来"的这一按，反而会把机器人重新拉起来。
+        if self._alarm_on:
+            self._ack_lie_alarm()
+            self._log("[热键] 已静音测谎报警（再按一次才开始自动打怪）")
+            return
 
         # 启动前: 读 UI → 存配置 → (必要时)重建检测器 → 锁窗口 → 启动
         self._read_ui_to_config()
@@ -1089,13 +1246,54 @@ class MainWindow(QMainWindow):
     def _log(self, msg):
         self.log_signal.emit(msg)
 
+    # ---------------- 全局启停热键 ----------------
+    #
+    # 两条通道并行，互为备份：
+    #   1. keyboard 库的低级键盘钩子：支持任意组合键，但依赖 WH_KEYBOARD_LL。
+    #      该钩子的回调是 Python 代码，若被 GIL 拖住超过系统 LowLevelHooksTimeout
+    #      （默认 300ms），Windows 会【静默摘掉钩子】，此后按键完全没反应；
+    #      部分游戏的反外挂也会屏蔽外来钩子。
+    #   2. GetAsyncKeyState 轮询：不装钩子、不抢键、不受上述限制，代价是只支持单键。
+    #
+    # 两条路各自打日志（"触发（钩子）" / "触发（轮询）"），所以下次按 F6 没反应时，
+    # 看日志就能判断是哪条通道失效。
+
+    # 常见单键热键 → 虚拟键码（仅轮询用；组合键不在表内则只靠钩子）
+    # 键统一小写：_register_hotkey 查表前会把配置值 .lower()
+    _VK_MAP = {f"f{i}": 0x6F + i for i in range(1, 13)}              # f1~f12
+    _VK_MAP.update({chr(c): c for c in range(0x30, 0x3A)})           # 0~9
+    _VK_MAP.update({chr(c).lower(): c for c in range(0x41, 0x5B)})   # a~z
+    _VK_MAP.update({
+        "space": 0x20, "tab": 0x09, "esc": 0x1B, "enter": 0x0D,
+        "home": 0x24, "end": 0x23, "insert": 0x2D, "delete": 0x2E,
+        "pause": 0x13, "numlock": 0x90, "scrolllock": 0x91,
+    })
+
+    # 启停热键去重窗口（秒）：一次实体按键可能被钩子与轮询各触发一次，
+    # 不去重会 toggle 两次（停止后立刻又启动）＝看起来"按热键没反应"。
+    _TOGGLE_DEBOUNCE = 0.25
+
     def _register_hotkey(self):
+        key_name = self.config.start_stop_hotkey
+
+        # ---- 通道1：键盘钩子 ----
         try:
             import keyboard
-            keyboard.add_hotkey(self.config.start_stop_hotkey, self._on_hotkey)
-            self._log(f"[热键] 已注册 {self.config.start_stop_hotkey}（启动/停止）")
+            keyboard.add_hotkey(key_name, self._on_hotkey)
+            self._log(f"[热键] 钩子已注册 {key_name}（启动/停止）")
         except Exception as e:
-            self._log(f"[热键] 注册 {self.config.start_stop_hotkey} 失败: {e}")
+            self._log(f"[热键] 钩子注册 {key_name} 失败: {e}")
+
+        # ---- 通道2：GetAsyncKeyState 轮询备份 ----
+        self._poll_vk = self._VK_MAP.get(str(key_name).strip().lower())
+        if self._poll_vk:
+            self._poll_key_down = False
+            self._poll_timer.start()
+            self._log(f"[热键] 已启用 {key_name} 轮询备份（不依赖键盘钩子）")
+        else:
+            self._log(
+                f"[热键] {key_name} 不在轮询表内（组合键？）→ 仅靠钩子触发"
+            )
 
     def _on_hotkey(self):
         """keyboard 钩子线程回调：显式排队到 GUI 线程执行 _toggle_run。
@@ -1104,13 +1302,41 @@ class MainWindow(QMainWindow):
         emit Qt 信号跨线程可能静默丢失；改用 QMetaObject.invokeMethod
         显式 QueuedConnection 排队到 GUI 线程，确保热键可靠触发。
         """
+        self.log_signal.emit(
+            f"[热键] {self.config.start_stop_hotkey} 触发（钩子）"
+        )
         QMetaObject.invokeMethod(self, "_toggle_run", Qt.QueuedConnection)
+
+    def _poll_stop_key(self):
+        """轮询启停热键（GetAsyncKeyState，不依赖键盘钩子）。
+
+        只在"按下沿"触发一次：最高位 0x8000 表示当前是否处于按下状态。
+        轮询跑在 GUI 线程（QTimer），因此直接调用 _toggle_run 即可，
+        比钩子线程 invokeMethod 更可靠。
+        """
+        if not self._poll_vk:
+            return
+        try:
+            down = bool(
+                ctypes.windll.user32.GetAsyncKeyState(self._poll_vk) & 0x8000
+            )
+        except Exception:
+            self._poll_timer.stop()   # 轮询不可用 → 停掉，仍靠钩子
+            return
+        if down and not self._poll_key_down:
+            self._log(f"[热键] {self.config.start_stop_hotkey} 触发（轮询）")
+            self._toggle_run()
+        self._poll_key_down = down
 
     # ---------------- 关闭 ----------------
     def closeEvent(self, event):
         # 先静音：报警音跑在独立线程里，不关会一直响到进程退出
         try:
             self._ack_lie_alarm()
+        except Exception:
+            pass
+        try:
+            self._poll_timer.stop()
         except Exception:
             pass
         try:

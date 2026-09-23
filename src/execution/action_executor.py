@@ -116,16 +116,18 @@ class ActionExecutor:
         """
         return self._kb.key_down(key)
 
-    def key_up(self, key: str) -> bool:
-        """释放指定键（停止移动/攀爬）。
+    def key_up(self, key: str, force: bool = False) -> bool:
+        """释放指定键（停止移动）。
 
         Args:
-            key: 按键名
+            key:   按键名
+            force: True 时即使本地没有"已按住"记录也补发一次 KEYUP，
+                   用于清理游戏侧可能卡住的方向键（见 KeyboardController.key_up）。
 
         Returns:
             True 已释放
         """
-        return self._kb.key_up(key)
+        return self._kb.key_up(key, force=force)
 
     # =========================================================================
     # 鼠标

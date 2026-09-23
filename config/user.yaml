@@ -4,7 +4,7 @@ reference_width: 1368
 reference_height: 800
 fps: 10
 keyboard_mode: sendinput
-confidence: 0.5
+confidence: 0.6
 model_path: D:/GAME/mxd-automation/train/scripts/02_train_yolo/model/best.onnx
 monster_classes: monster
 floor_classes: floor
@@ -25,14 +25,14 @@ hp_tolerance: 20
 hp_threshold: 0.5
 hp_key: end
 mp_region:
-- 0.46266471449487556
-- 0.9635416666666666
-- 0.12298682284040996
-- 0.03515625
+- 0.4633967789165447
+- 0.9661458333333334
+- 0.1273792093704246
+- 0.032552083333333336
 mp_color:
-- 117
-- 169
-- 199
+- 6
+- 114
+- 201
 mp_tolerance: 20
 mp_threshold: 0.5
 mp_key: pdn
@@ -40,29 +40,38 @@ target_key: tab
 jump_key: alt
 attack_type: long
 attack_range: 400
-attack_range_y: 80
-attack_min_range: 10
+attack_range_y: 30
+attack_min_range: 0
+knockback_skill:
+  name: 击退技能
+  key: D
+  cooldown: 0.2
+  range: 120
 stand_mode: false
 stand_facing: right
 stand_default_attack: false
+stand_skill2_only: false
+stand_micro_move_enabled: false
+stand_micro_move_interval: 180.0
+stand_micro_move_tap_ms: 30
 skills:
 - name: 连击
   key: a
-  cooldown: 1.0
+  cooldown: 0.4
 - name: 爆炸箭
   key: space
-  cooldown: 0.5
+  cooldown: 0.4
 buff_skills:
 - name: 无形箭
   key: '2'
-  cooldown: 70.0
+  cooldown: 140.0
 - name: 快速箭
   key: '3'
   cooldown: 50.0
 pickup_enabled: false
 pickup_key: z
 pickup_interval: 0.333
-screenshot_interval: 30
+screenshot_interval: 60
 lie_detect_enabled: true
 lie_detect_template: assets/templates/lie_detector.png
 lie_detect_threshold: 0.78

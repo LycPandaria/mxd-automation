@@ -165,15 +165,21 @@ class LieDetector:
             self._log(f"[测谎] 模板读取失败，测谎检测已禁用: {self.template_path}")
             return
         self._template = tpl
-        self._log(
-            f"[测谎] 弹窗模板已加载 {tpl.shape[1]}x{tpl.shape[0]} "
-            f"阈值={self.threshold} 尺度档位={len(self._scale_factors)}"
-        )
+        self._log(f"[测谎] 弹窗模板已加载：{self.describe()}")
 
     @property
     def available(self) -> bool:
         """模板是否可用。"""
         return self._template is not None
+
+    def describe(self) -> str:
+        """一行状态描述（供启动日志，便于确认阈值/尺度档位是否符合预期）。"""
+        if self._template is None:
+            return "未加载（模板不可用）"
+        th, tw = self._template.shape[:2]
+        return (f"模板 {tw}x{th} 阈值={self.threshold} "
+                f"尺度档位={len(self._scale_factors)} "
+                f"降采样=1/{self.downsample} 搜索边距=±{self.search_margin}px")
 
     # ------------------------------------------------------------------
     # 检测

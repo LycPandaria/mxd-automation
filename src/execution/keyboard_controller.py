@@ -351,16 +351,25 @@ class KeyboardController:
         self._held_keys.add(key)
         return True
 
-    def key_up(self, key: str) -> bool:
+    def key_up(self, key: str, force: bool = False) -> bool:
         """释放指定键。
 
         Args:
-            key: 按键名
+            key:   按键名
+            force: True 时即使本地没有"已按住"记录也补发一次 KEYUP。
+
+        force 的用途（防"游戏侧卡住"）：
+            移动/转向是 key_down + key_up 成对发送的，若某次 KEYUP 没被游戏
+            收到（SendInput 成功但游戏漏采），游戏侧会一直认为该键按着 →
+            角色持续朝一个方向走、朝向也固定错，而本地 _held_keys 里没有记录。
+            决策层检测到"没按方向键却在持续漂移"时用 force=True 补发一次，
+            把游戏侧的状态抹平。KEYUP 不会改变游戏内朝向（朝向只在按下方向键
+            时改变），所以补发是安全的。
 
         Returns:
-            True: 已释放（或本就未按住）；False: 键无效 / 发送失败
+            True: 已释放（或本就未按住，且未要求 force）；False: 键无效 / 发送失败
         """
-        if key not in self._held_keys:
+        if key not in self._held_keys and not force:
             return True  # 未按住，无需释放
         vk_code = self._get_vk_code(key)
         if not vk_code:
