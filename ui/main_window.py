@@ -50,7 +50,7 @@ from ui.alarm_overlay import AlarmOverlay, flash_taskbar
 class MainWindow(QMainWindow):
     # 跨线程信号：自动化线程 → GUI 线程
     log_signal = pyqtSignal(str)
-    frame_signal = pyqtSignal(object, object, object, object)  # frame, detections, hp, mp
+    frame_signal = pyqtSignal(object, object, object, object, object)  # frame, detections, hp, mp, locked_target
     hotkey_signal = pyqtSignal()  # F12 触发
     lie_signal = pyqtSignal(float)  # 测谎弹窗命中（匹配得分）
 
@@ -102,6 +102,7 @@ class MainWindow(QMainWindow):
         # 攻击距离/近战距离（统一）修改时实时同步到 YAML
         self.distance_spin.valueChanged.connect(self._on_distance_changed)
         self.attack_range_y_spin.valueChanged.connect(self._on_attack_range_y_changed)
+        self.attack_lock_spin.valueChanged.connect(self._on_attack_lock_changed)
         # 近身击退参数：改动即写入配置并落盘（运行中也即时生效）
         self.knockback_key_edit.textChanged.connect(self._on_knockback_changed)
         self.knockback_name_edit.textChanged.connect(self._on_knockback_changed)
@@ -393,6 +394,21 @@ class MainWindow(QMainWindow):
         self.attack_range_y_spin.setFixedWidth(70)
         row.addWidget(self.attack_range_y_spin)
 
+        row.addWidget(QLabel("动画锁s:"))
+        self.attack_lock_spin = QDoubleSpinBox()
+        self.attack_lock_spin.setRange(0.0, 3.0)
+        self.attack_lock_spin.setSingleStep(0.05)
+        self.attack_lock_spin.setDecimals(2)
+        self.attack_lock_spin.setValue(0.6)
+        self.attack_lock_spin.setFixedWidth(70)
+        self.attack_lock_spin.setToolTip(
+            "攻击动画锁（秒）：按出一次攻击键（技能/击退）后，此时间内不再发\n"
+            "攻击/击退/转向键——游戏会忽略攻击动画期间的按键，多发只会被吞。\n"
+            "0=关闭。建议 0.5~0.8：太小仍被吞（等于没锁），太大浪费输出。\n"
+            "校准：怪还压得过来 → 降到 0.5；经常'挥弓不射箭' → 加到 0.7。"
+        )
+        row.addWidget(self.attack_lock_spin)
+
         row.addStretch()
         v.addLayout(row)
 
@@ -607,6 +623,12 @@ class MainWindow(QMainWindow):
         # 攻击距离：长手读 config.attack_range，短手固定 50（_sync_distance_ui 内处理）
         self.distance_spin.setValue(int(getattr(c, "attack_range", 200)))
         self.attack_range_y_spin.setValue(int(getattr(c, "attack_range_y", 60)))
+        # 攻击动画锁
+        try:
+            self.attack_lock_spin.setValue(
+                float(getattr(c, "attack_lock_seconds", 0.6) or 0.6))
+        except (TypeError, ValueError):
+            self.attack_lock_spin.setValue(0.6)
         # 近身击退
         _kb = getattr(c, "knockback_skill", None) or {}
         self.knockback_name_edit.setText(str(_kb.get("name", "") or ""))
@@ -685,6 +707,8 @@ class MainWindow(QMainWindow):
         if c.attack_type == "long":
             c.attack_range = self.distance_spin.value()  # 长手距离可在界面修改
         c.attack_range_y = self.attack_range_y_spin.value()
+        # 攻击动画锁（0=关闭）
+        c.attack_lock_seconds = float(self.attack_lock_spin.value())
         # 近身击退（按键留空 = 不启用）
         c.knockback_skill = {
             "name": self.knockback_name_edit.text().strip() or "击退技能",
@@ -767,6 +791,11 @@ class MainWindow(QMainWindow):
     def _on_attack_range_y_changed(self, value):
         """垂直容差微调框变化时，实时同步到 config 并保存到 YAML。"""
         self.config.attack_range_y = value
+        save_user_config(self.config)
+
+    def _on_attack_lock_changed(self, value):
+        """攻击动画锁变化时，实时同步到 config 并保存到 YAML（运行中即时生效）。"""
+        self.config.attack_lock_seconds = float(value)
         save_user_config(self.config)
 
     def _on_knockback_changed(self, *_):
@@ -1176,7 +1205,7 @@ class MainWindow(QMainWindow):
         # 同时持久化到 logs/mxd.log
         get_logger().info(msg)
 
-    def _on_frame(self, frame, detections, hp_ratio, mp_ratio):
+    def _on_frame(self, frame, detections, hp_ratio, mp_ratio, locked_target=None):
         if frame is None:
             return
         h, w = frame.shape[:2]
@@ -1200,6 +1229,13 @@ class MainWindow(QMainWindow):
             cv2.putText(disp, f"{d.cls_name} {d.confidence:.2f}",
                         (d.x, max(0, d.y - 5)),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 1)
+        # 锁定目标：红色粗框覆盖在绿色怪物框上（最后画，保证不被盖住）
+        if locked_target is not None:
+            t = locked_target
+            cv2.rectangle(disp, (t.x, t.y), (t.x + t.w, t.y + t.h), (0, 0, 255), 3)
+            cv2.putText(disp, f"TARGET {t.confidence:.2f}",
+                        (t.x, max(0, t.y - 22)),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 255), 2)
         # 画血条区域
         hp_region = self.config.scale_region(
             self.config.hp_region, frame.shape[1], frame.shape[0]

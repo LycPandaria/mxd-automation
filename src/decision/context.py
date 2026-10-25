@@ -160,6 +160,29 @@ TARGET_MISS_RETAIN_SECONDS = 0.5
 fps=10 时仅 5 帧，取值不能太小——YOLO 对同一只怪的检测本身会逐帧波动，
 窗口太短（如 0.3s=3 帧）会让正常战斗被误判成"目标消失"，掉锁转探索。"""
 
+SELECT_FALLBACK_SECONDS = 3.0
+"""自身定位失败时，选怪允许使用"最后已知位置"的最大时效（秒）。
+
+不超过此时间 → 仍按"同平台最近"选怪（短时漏检不影响锁定/换怪）；
+超过 → 宁可本帧不选怪（转探索/等待定位），也不再按"画面最大框"
+乱锁远处或上层平台的怪——10/24 日志里 500px+ 的跨半屏追击多由此产生。
+（按 fps 换算成帧）"""
+
+NEARER_SWITCH_MARGIN_X = 120
+"""更近的怪抢占所需的距离优势（像素）。
+
+锁定目标还可见时，新怪至少要近这么多才切换，避免两只怪距离接近时
+左右来回换目标、反复转身抖动。"""
+
+NEARER_CLOSE_X = 250
+"""贴身怪抢占距离（像素）。
+
+同层怪进入角色 250px 内且比锁定目标近 120px 以上 → 直接抢占
+（对应"身边有怪却还在打/追远处"的场景）。"""
+
+NEARER_SWITCH_FRAMES = 3
+"""更近的怪连续满足条件多少帧才真正切换（吸收 YOLO 单帧漏检/抖动）。"""
+
 ROPE_SEARCH_RANGE_X = 200
 """搜索绳索的水平范围（像素）"""
 
@@ -205,7 +228,7 @@ FACE_TURN_X = 20
 #      都没有，只能看到技能一直朝反方向放）。
 # 对策：
 #   · 转向单独占一帧（本帧不按技能键），方向键按住 120~200ms（不是短按）；
-#   · 攻击中定期重申一次朝向（0.6~1.2s 抖动），把被吞掉的转向自愈回来；
+#   · 攻击中定期重申一次朝向（2.5~4s 抖动），把被吞掉的转向自愈回来；
 #   · 用"角色有没有朝该方向动几像素"自检按键是否被游戏接收，没接收就提前重试；
 #   · 站定期间补发方向键 KEYUP，兜住"某次 KEYUP 丢失 → 角色一直朝一个方向走"。
 
@@ -221,11 +244,18 @@ TURN_MIN_GAP_SECONDS = 0.30
 """两次转向按键之间的最小间隔（秒）：目标左右横跳时防止每帧狂按方向键——
 每帧都变成"转向帧"会把技能全挤掉（实测 12:37:50~52 出现过 right→left→right）。"""
 
-TURN_REASSERT_MIN_SECONDS = 0.6
+TURN_REASSERT_MIN_SECONDS = 2.5
 """朝向重申间隔下限（秒）：攻击中即使认为朝向已正确，也隔这么久重申一次，
-用一次干净的转向按键把"可能已被吞掉"的朝向自愈回来。"""
+用一次干净的转向按键把"可能已被吞掉"的朝向自愈回来。
 
-TURN_REASSERT_MAX_SECONDS = 1.2
+【为什么从 0.6~1.2 放宽到 2.5~4】重申点按是按住方向键 120~200ms，游戏里
+就是"朝面朝方向走 1~2 步"（约 15~25px）。旧间隔 ≈ 动画锁时长，导致几乎
+每次击退/攻击后锁一过期就跟着一次重申点按——角色一直在小幅前移（实测
+2026-10-06：一局 168 次"卡键漂移"救援、角色位置持续漂移）。自愈兜底
+放宽后，真实转向仍由生效自检 + 0.15~0.3s 快速重试保证，12 秒错向 bug
+依旧防得住（最多 4s 自愈）。"""
+
+TURN_REASSERT_MAX_SECONDS = 4.0
 """朝向重申间隔上限（秒）：与下限之间随机取值，避免按键节奏完全规律。"""
 
 TURN_RETRY_MIN_SECONDS = 0.15
@@ -243,6 +273,32 @@ TURN_VERIFY_MIN_MOVE_X = 2
 
 TURN_VERIFY_MAX_FAILS = 3
 """连续自检失败上限：超过就退回正常重申间隔，避免一直重试抢掉技能输出。"""
+
+# =============================================================================
+# 攻击动画锁 + 换边防抖（实测 2026-10-05 被群怪围堵时的根因对策）
+# =============================================================================
+#
+# 现场数据（125 秒会话）：攻击键 3.0 次/秒 + 击退 0.6 次/秒 + 转向 0.55 次/秒
+# ≈ 每秒 4+ 次按键，而游戏的攻击动画期间会忽略按键 → 大部分被吞：
+# 表现为"释放不出技能、击退按了没放出来"、转向 35% 未生效。
+# 对策：按出攻击键后进入"动画锁"，锁内不发任何攻击/击退/转向键——
+# 每次按键都真正落地，反而更快。换边防抖解决群怪两侧导致的原地狂转身。
+
+ATTACK_LOCK_SECONDS_DEFAULT = 0.6
+"""攻击动画锁默认时长（秒）：按出一次攻击键（技能/击退）后，视为角色进入
+攻击动画，此时间内不再发攻击/击退/转向键——游戏会忽略动画期间的按键，
+多发只有害处。实际生效值取配置 attack_lock_seconds（0=关闭）。
+
+校准：太小仍会被吞（等于没锁），太大浪费输出。默认 0.6 对应经典弓的
+攻击节奏；如果怪还是压过来就降到 0.5，发现"挥弓不射箭"就加到 0.7。"""
+
+TURN_SIDE_CONFIRM_SECONDS = 0.2
+"""换边防抖（秒）：目标从一侧换到另一侧后，新侧需连续稳定此时间才真正转身。
+
+群怪分布在角色两侧时，"最近目标"每帧左右翻 → 每次翻边都转身会让角色原地
+狂转（转向键被动画吞掉 + 转向帧堵输出，实测 3 秒转 5 次、3 次白转）。
+防抖后瞬时翻边不转身（照常施法），稳定换边才转。
+按 fps 换算成帧；朝向记忆为空（首次定位）时不防抖，立即转身。"""
 
 TURN_VERIFY_WAIT_SECONDS = 0.35
 """自检等待时间（秒）：按下转向键后等这么久（≈一次按住 + 一帧）再判定是否生效。
@@ -408,6 +464,16 @@ SELF_POS_STALE_FRAMES = 60
 超过该帧数仍定位不到 → 判定真丢失，避免用过期坐标乱跑。
 """
 
+BLIND_CHASE_SECONDS = 2.0
+"""自身定位连续失败时，按最后已知位置继续移动的时长上限（秒）。
+
+追击时定位一失败就松键，角色会永远停在遮挡物后面（定位失败 →
+不移动 → 继续被遮挡），实测 10/23 角色走进装饰铁门/藤蔓后卡死。
+但盲走太久又会按过时坐标冲过目标甚至落崖，所以只给 2 秒预算：
+够走过栅栏/藤蔓（约 1~2 秒），又不会冲出攻击范围。
+超过预算松键等待定位恢复，恢复后立即继续追/打。
+"""
+
 
 @dataclass
 class Context:
@@ -485,9 +551,18 @@ class DecisionEngine:
         self._stuck_release_at = 0.0              # 上次补发方向键 KEYUP 的时间
         self._face_hold_since = 0.0               # 本段"等转向不施法"的起始时间（0=未在等）
         self._face_edge_skip_log_at = 0.0          # "前方无地板跳过转向"日志限频
+        # ---- 攻击动画锁 + 换边防抖 ----
+        self._attack_busy_until = 0.0             # 动画锁截止时刻（此前不发攻击/击退/转向键）
+        self._face_need_side: Optional[str] = None  # 换边防抖：上一帧"需要的朝向"
+        self._face_need_frames = 0                # 该朝向已连续保持的帧数
+        self._drift_suppress_until = 0.0          # 转向/微动点按后短暂抑制漂移检测
         self._melee_leave_frames = 0              # 短手攻击中连续超限帧数（防抖计数）
         self._occluded_frames = 0                 # 目标被角色遮挡的连续帧数（虚拟目标维持）
         self._self_pos_stale_frames = 0           # 自身定位连续失败的帧数（最后已知位置时效）
+        self._blind_chase_warned = False          # 本次定位丢失是否已打过"盲追"日志
+        self._target_wait_warned = False          # 本次定位丢失是否已打过"保留目标等待"日志
+        self._nearer_candidate: Optional[Detection] = None  # 更近怪抢占据防抖：候选目标
+        self._nearer_frames = 0                   # 该候选连续满足条件的帧数
         self._retreating = False                  # 长手是否正在后撤拉开距离（保持最小射程）
         self._occluded_retreat_frames = 0         # 长手遮挡后撤的连续帧数（防无限后撤）
         self._prev_hp_ratio: Optional[float] = None  # 上一帧血量（掉血检测）
@@ -533,9 +608,17 @@ class DecisionEngine:
         self._stuck_release_at = 0.0
         self._face_hold_since = 0.0
         self._face_edge_skip_log_at = 0.0
+        self._attack_busy_until = 0.0
+        self._face_need_side = None
+        self._face_need_frames = 0
+        self._drift_suppress_until = 0.0
         self._melee_leave_frames = 0
         self._occluded_frames = 0
         self._self_pos_stale_frames = 0
+        self._blind_chase_warned = False
+        self._target_wait_warned = False
+        self._nearer_candidate = None
+        self._nearer_frames = 0
         self._occluded_retreat_frames = 0
         self._prev_hp_ratio = None
         self._hp_drop_active_frames = 0
@@ -581,6 +664,8 @@ class DecisionEngine:
         # 检测卡住 + 自身定位时效统计
         if ctx.self_position:
             self._self_pos_stale_frames = 0
+            self._blind_chase_warned = False
+            self._target_wait_warned = False
             if self._last_self_pos and self._last_self_pos == ctx.self_position:
                 self._stuck_counter += 1
             else:
@@ -772,7 +857,7 @@ class DecisionEngine:
                 self._explore(ctx)
                 return
 
-        self._target_monster = target
+        self._set_locked_target(target)
 
         # ---- 短手（近战）走独立攻击流程，长手走远程流程 ----
         # 近战判定与远程完全不同：必须贴脸才打，未贴脸就径直追上，
@@ -790,10 +875,22 @@ class DecisionEngine:
         # 攻击距离 = 水平方向 |角色x - 怪物中心x| ≤ 攻击距离px（规则2）
         foot = self._effective_self_pos(ctx)
         if foot is None:
-            # OCR 定位失败（技能特效遮挡名字/OCR 抖动）且不在站定攻击中
-            # → 无法判断距离，不能攻击，转入探索状态，避免盲打空放技能。
-            # 站定攻击中定位失败由 _effective_self_pos 用最后已知位置兜底，
-            # 不会走到这里。
+            # 定位失败超过 5s（技能特效/场景遮挡导致 YOLO 看不到 player）。
+            # 有最后已知位置时不要丢目标转随机探索：_explore 的方向可能和怪
+            # 相反，会把角色越带越远。保留锁定目标停在原地等定位恢复，
+            # 恢复后立刻继续追/打；盲走预算已在 _chase 里用尽，这里不移动。
+            if self._last_self_pos is not None:
+                if not self._target_wait_warned:
+                    self._target_wait_warned = True
+                    secs = self._self_pos_stale_frames / max(1, self.config.fps)
+                    self._log(
+                        f"[目标] 自身定位丢失 {secs:.1f}s，保留目标等待定位恢复"
+                        f"（不随机探索，疑似被场景遮挡/模型漏检）"
+                    )
+                self._release_move()
+                self._fsm.transition(State.CHASING)
+                return
+            # 从启动起就没定位到过：无法判断距离，不能攻击，只能探索
             self._target_monster = None
             self._attack_stale_counter = 0
             self._release_move()
@@ -967,9 +1064,15 @@ class DecisionEngine:
         攻击，不需要走到怪物脸上（不追到 攻击距离-5px）。
         """
         if ctx.self_position is None:
-            self._release_move()
-            return
-        sx = ctx.self_position[0]
+            # 定位暂时失败（遮挡/漏检）不要立刻松键：用最后已知位置继续追一段，
+            # 否则角色会永远停在遮挡物后面（定位失败 → 不移动 → 继续被遮挡）。
+            if self._last_self_pos is None or not self._blind_move_allowed():
+                self._release_move()
+                return
+            self._log_blind_move("近战追击")
+            sx = self._last_self_pos[0]
+        else:
+            sx = ctx.self_position[0]
         # 追击目标点 = 怪近侧身体边缘（走到离怪身体 攻击距离-5px 处停下）
         tx = self._melee_edge_x(sx, target)
         melee_range = self._get_attack_range()
@@ -1009,6 +1112,10 @@ class DecisionEngine:
         """
         self._release_move()  # 攻击时站定
         self._stuck_counter = 0  # 站定攻击不算"卡住"（位置不变是正常的）
+
+        # 攻击动画锁：动画中不发攻击/转向键（发了也会被游戏吞）
+        if self._attack_busy():
+            return
 
         # 先判定怪在哪边（怪中心 x 相对角色 x 的符号），背对怪就扭头。
         # 方向看怪中心（符号决定面朝哪侧），距离看怪近侧身体边缘
@@ -1091,6 +1198,9 @@ class DecisionEngine:
             return 0.0
         time.sleep(seconds)
         self.executor.key_up(direction)
+        # 点按本身会让角色朝该方向挪几像素（预期行为），短暂抑制漂移检测，
+        # 避免被"无按键却持续漂移"卡键兜底误判（实测一局误触发 15 次）
+        self._drift_suppress_until = time.time() + 0.5
         return seconds
 
     def _face_clear_pending(self):
@@ -1172,8 +1282,10 @@ class DecisionEngine:
         于是 need == _face_dir，代码再也不按方向键 → 一直朝反方向放技能
         （实测连续 12 秒，日志里一条 [朝向] 都没有）。
 
-        【定期重申】即使认为朝向正确，也每 TURN_REASSERT(0.6~1.2s 抖动) 重申
-        一次：一次被吞掉的转向最多 1.2 秒就自愈，不会长期错向。
+        【定期重申】即使认为朝向正确，也每 TURN_REASSERT(2.5~4s 抖动) 重申
+        一次：一次被吞掉的转向最多 4 秒就自愈，不会长期错向。
+        重申点按会朝面朝方向走 1~2 步，所以有近身威胁时跳过（避免往贴身怪
+        身上撞），并把计时器往后推一个完整间隔。
 
         Args:
             ctx:         当前帧感知数据
@@ -1215,6 +1327,17 @@ class DecisionEngine:
             return False      # 定位不到就不按方向键（会朝错方向乱走）
         sx = foot[0]
         need = self._face_needed(sx, target)
+
+        # ---- 换边防抖：统计"需要的朝向"已连续保持多少帧 ----
+        # 群怪分布在角色两侧时最近目标每帧左右翻，每次翻边都转身 = 原地狂转
+        # （转向键被动画吞 + 转向帧堵输出，实测 3 秒转 5 次、3 次白转）。
+        # 瞬时翻边不转（照常施法），新侧稳定满 TURN_SIDE_CONFIRM_SECONDS 才转。
+        if need == self._face_need_side:
+            self._face_need_frames += 1
+        else:
+            self._face_need_side = need
+            self._face_need_frames = 1
+
         self._face_diag(ctx, target, sx)
 
         now = time.time()
@@ -1230,9 +1353,21 @@ class DecisionEngine:
 
         # ---- 2) 判断要不要（重新）按方向键 ----
         if need != self._face_dir:
-            need_press = True          # 朝向不符 → 立刻转
+            if self._face_dir is None \
+                    or self._face_need_frames >= self._frames(TURN_SIDE_CONFIRM_SECONDS):
+                need_press = True          # 朝向不符（且换边已稳定/首次定位）→ 转
+            else:
+                return False               # 瞬时翻边 → 不转，本帧照常施法
         elif now >= self._face_next_assert:
-            need_press = True          # 朝向"认为"对 → 到点重申一次（自愈被吞的转向）
+            if self._nearest_knockback_threat(ctx, foot) is not None:
+                # 有近身威胁时跳过重申：重申点按 = 朝面朝方向走 1~2 步，
+                # 此时面朝方向上就贴着怪，点按等于往怪身上撞。
+                # 推迟一个完整间隔，避免威胁刚解除（怪刚被推走）就立刻点按。
+                self._face_next_assert = now + random.uniform(
+                    TURN_REASSERT_MIN_SECONDS, TURN_REASSERT_MAX_SECONDS)
+                need_press = False
+            else:
+                need_press = True      # 朝向"认为"对 → 到点重申一次（自愈被吞的转向）
         else:
             need_press = False
 
@@ -1326,6 +1461,11 @@ class DecisionEngine:
             self._stand_x = None            # 自己在移动：漂移是预期的，不干预
             self._stand_drift_frames = 0
             return
+        if time.time() < self._drift_suppress_until:
+            # 刚做过转向/微动点按：角色因点按挪几像素是预期行为，不是卡键
+            self._stand_x = None
+            self._stand_drift_frames = 0
+            return
         pos = ctx.self_position
         if pos is None:
             self._stand_x = None
@@ -1393,6 +1533,8 @@ class DecisionEngine:
         self.executor.key_down(direction)
         time.sleep(seconds)
         self.executor.key_up(direction)
+        # 点按会挪动角色几像素（预期），短暂抑制漂移检测，避免卡键兜底误判
+        self._drift_suppress_until = time.time() + 0.5
 
     def _micro_reset_timer(self):
         """重置微动计时（下一次在间隔之后）。"""
@@ -1491,6 +1633,95 @@ class DecisionEngine:
             self._fsm.transition(State.CHASING)
             self._chase(ctx, target)
 
+    def _pick_nearer_visible(self, ctx: Context,
+                             locked: Detection) -> Optional[Detection]:
+        """锁定目标不合适时，改打"更近 / 真实可见"的同层怪（带防抖）。
+
+        两类情况（都只处理长手；近战贴脸由 _handle_melee 自己判定）：
+          1. 锁定目标本帧已漏检（画面里没有它），而另一只同层怪可见且在
+             攻击距离内 → 不追"鬼目标"，改打真实可见的怪。
+          2. 锁定目标可见，但：
+             - 它在射程外，新怪在射程内，且新怪至少近 NEARER_SWITCH_MARGIN_X
+             - 或新怪进到 NEARER_CLOSE_X 内，且比锁定目标至少近
+               NEARER_SWITCH_MARGIN_X（身边的怪优先）
+
+        连续 NEARER_SWITCH_FRAMES 帧指向同一只怪才切换，吸收 YOLO 单帧
+        漏检/抖动，避免两个距离接近的怪左右来回换目标。
+
+        Returns:
+            更该打的怪物；不满足条件时返回 None（维持原锁定）。
+        """
+        if getattr(self.config, "attack_type", "long") == "short":
+            return None
+
+        foot = ctx.self_position
+        if foot is None:
+            if self._last_self_pos is None \
+                    or self._self_pos_stale_frames > self._frames(SELECT_FALLBACK_SECONDS):
+                self._nearer_candidate = None
+                self._nearer_frames = 0
+                return None
+            foot = self._last_self_pos
+        sx, sy = foot
+        attack_range = self._get_attack_range()
+
+        locked_visible = any(self._is_same_monster(locked, m) for m in ctx.monsters)
+        locked_dist = abs(sx - locked.center[0])
+
+        best = None
+        best_dist = float("inf")
+        for m in ctx.monsters:
+            if self._is_same_monster(locked, m):
+                continue
+            if not self._same_platform(sy, m.y + m.h):
+                continue
+            if not self._in_front(m, sx):
+                continue  # 站桩模式：只考虑朝向正前方
+            d = abs(sx - m.center[0])
+            if d < best_dist:
+                best = m
+                best_dist = d
+
+        if best is None:
+            self._nearer_candidate = None
+            self._nearer_frames = 0
+            return None
+
+        if locked_visible:
+            # 可见目标只在"明显更近"时抢，避免抖动；且新目标要在射程内
+            ok = (best_dist + NEARER_SWITCH_MARGIN_X < locked_dist
+                  and best_dist <= attack_range)
+        else:
+            # 原目标已漏检：真实可见且在射程内的怪比追最后位置可靠。
+            # 但原目标最后位置本来就贴身（≤NEARER_CLOSE_X）时例外——
+            # 那多半是被角色自身/攻击特效挡住，切到远处的怪反而更差。
+            ok = (best_dist <= attack_range
+                  and (locked_dist > NEARER_CLOSE_X
+                       or best_dist + NEARER_SWITCH_MARGIN_X < locked_dist))
+
+        if not ok:
+            self._nearer_candidate = None
+            self._nearer_frames = 0
+            return None
+
+        if self._nearer_candidate is not None \
+                and self._is_same_monster(self._nearer_candidate, best):
+            self._nearer_frames += 1
+        else:
+            self._nearer_candidate = best
+            self._nearer_frames = 1
+        if self._nearer_frames < NEARER_SWITCH_FRAMES:
+            return None
+
+        self._nearer_candidate = None
+        self._nearer_frames = 0
+        self._log(
+            f"[目标] 更近的可见怪优先 新目标x={best.center[0]} 距离={best_dist}px "
+            f"→ 原目标x={locked.center[0]} 距离={locked_dist}px"
+            + ("" if locked_visible else "（原目标本帧漏检）")
+        )
+        return best
+
     def _resolve_locked_target(self, ctx: Context) -> Detection:
         """解析当前应攻击的目标怪物（就近原则 + 攻击期保持锁定）。
 
@@ -1503,6 +1734,16 @@ class DecisionEngine:
             当前应攻击的怪物；若画面中没有同平台怪，返回 None。
         """
         if self._target_monster is not None:
+            # 先看有没有"更该打"的可见同层怪：
+            #   - 身边的怪优先于远处还在追的目标
+            #   - 真实可见的怪优先于本帧已漏检、只剩最后位置的"鬼目标"
+            # 连续 NEARER_SWITCH_FRAMES 帧成立才切换，避免来回抖。
+            nearer = self._pick_nearer_visible(ctx, self._target_monster)
+            if nearer is not None:
+                self._occluded_frames = 0
+                self._occluded_retreat_frames = 0
+                self._target_miss_frames = 0
+                return nearer
             for m in ctx.monsters:
                 if self._is_same_monster(self._target_monster, m):
                     # 锁定目标仍在画面，但已不在角色同一平台
@@ -1543,6 +1784,30 @@ class DecisionEngine:
         tolerance = max(int(a.w * 1.5), 40)
         d = abs(a.center[0] - b.center[0]) + abs(a.center[1] - b.center[1])
         return d <= tolerance
+
+    def _set_locked_target(self, target: Detection):
+        """更新锁定目标；锁定对象真正更换时打印新目标坐标。
+
+        每帧都会调用（目标位置本身有检测抖动），所以用 _is_same_monster
+        判断还是同一只怪：同一只不打印，只有换怪（含首次锁定）才打印，
+        方便事后按日志核对"为什么打这只/为什么换目标"。
+        """
+        old = self._target_monster
+        self._target_monster = target
+        if old is not None and self._is_same_monster(old, target):
+            return
+        cx, cy = target.center
+        self._log(
+            f"[目标] 锁定新目标 中心=({cx},{cy}) "
+            f"脚底=({cx},{target.y + target.h}) "
+            f"框=({target.x},{target.y},{target.w}x{target.h}) "
+            f"conf={target.confidence:.2f}"
+        )
+
+    @property
+    def locked_target(self) -> Optional[Detection]:
+        """当前锁定的怪物检测框（供 UI 预览画红框/调试）。"""
+        return self._target_monster
 
     def _occluded_target(self, ctx: Context) -> Optional[Detection]:
         """目标从画面消失时，判断是否被角色遮挡并返回可继续攻击的虚拟目标。
@@ -1620,7 +1885,14 @@ class DecisionEngine:
                 return None
         player = ctx.self_position
         if player is None:
-            return max(monsters, key=lambda d: d.w * d.h)
+            # 自身定位失败：不要退回"画面最大框"——那会锁到远处/上层平台的怪
+            # （10/24 日志里 500~1000px 的跨屏追击大多来自这里）。
+            # 用最后已知位置继续按"同平台最近"选；位置太旧就本帧不选，
+            # 宁可转探索/等定位，也不跨半张地图乱追。
+            if self._last_self_pos is None \
+                    or self._self_pos_stale_frames > self._frames(SELECT_FALLBACK_SECONDS):
+                return None
+            player = self._last_self_pos
 
         # 【只打同平台】仅考虑与角色在同一平台的怪物：
         # 脚底垂直差 ≤ 垂直容差（attack_range_y）。
@@ -1692,6 +1964,32 @@ class DecisionEngine:
                 and self._self_pos_stale_frames <= SELF_POS_STALE_FRAMES:
             return self._last_self_pos
         return None
+
+    def _blind_move_allowed(self) -> bool:
+        """定位连续失败时，是否还允许按最后已知位置继续移动。
+
+        追击/近战追击里定位一失败就松键，角色会永远停在遮挡物后面
+        （定位失败 → 不移动 → 继续被遮挡）。这里给一个很短的盲走预算：
+        够走过栅栏/藤蔓这类装饰物，恢复检测后立刻回到正常追击；
+        超过预算则松键等待，避免用过期坐标冲过目标或落崖。
+        """
+        return self._self_pos_stale_frames <= self._frames(BLIND_CHASE_SECONDS)
+
+    def _log_blind_move(self, where: str):
+        """定位丢失但仍继续移动时打一次日志（每次丢失只打一条）。
+
+        丢失不足 0.5s 不打（技能特效挡一两帧很常见），超过才提示，
+        避免正常抖动把日志刷满。
+        """
+        if self._blind_chase_warned \
+                or self._self_pos_stale_frames < self._frames(0.5):
+            return
+        self._blind_chase_warned = True
+        secs = max(0.1, self._self_pos_stale_frames / max(1, self.config.fps))
+        self._log(
+            f"[{where}] 自身定位丢失 {secs:.1f}s → 按最后已知位置继续移动"
+            f"（盲走上限 {BLIND_CHASE_SECONDS:.1f}s，疑似被场景遮挡/模型漏检）"
+        )
 
     def _get_attack_range(self) -> int:
         """返回当前生效的攻击距离（像素）。
@@ -1868,9 +2166,17 @@ class DecisionEngine:
         贴近目标后保持朝向（不翻转），交给攻击判定，避免原地乱跑抖动。
         """
         if ctx.self_position is None:
+            # 定位暂时失败（遮挡/漏检）不要立刻松键：用最后已知位置继续追一段，
+            # 否则角色会永远停在遮挡物后面（定位失败 → 不移动 → 继续被遮挡）。
+            if self._last_self_pos is None or not self._blind_move_allowed():
+                self._release_move()
+                return
+            self._log_blind_move("追击")
+        foot = self._effective_self_pos(ctx) or self._last_self_pos
+        if foot is None:
             self._release_move()
             return
-        sx = ctx.self_position[0]
+        sx = foot[0]
         tx = target.center[0]
         attack_range = self._get_attack_range()
         is_melee = getattr(self.config, "attack_type", "long") == "short"
@@ -2115,6 +2421,11 @@ class DecisionEngine:
         """
         self._release_move()  # 攻击时保持不动
 
+        # ---- 攻击动画锁：上次攻击还在动画中 → 本帧不发攻击/击退/转向键 ----
+        # 游戏会忽略动画期间的按键，此时硬发只会被吞（白按还挤掉能生效的输入）。
+        if self._attack_busy():
+            return
+
         # ---- 距离守卫（规则1/2）：脚底判同平台 + 中心x判攻击距离 ----
         # 不满足 → 直接放弃攻击，避免怪物不在附近时一直空打/乱跑。
         # 攻击中带滞回（_can_attack）：轻微抖动/怪物中心波动不中断攻击，
@@ -2136,14 +2447,21 @@ class DecisionEngine:
                 )
                 return
 
+            # ---- 近身威胁扫描（击退提速核心）：扫"面朝方向"的全部同平台怪 ----
+            # 只看锁定目标的话，锁定目标远在射程边缘而同侧另一只怪已贴身时，
+            # 击退永远不会触发。威胁必须与角色面朝方向同侧（击退是方向性技能，
+            # 不转身打背后），且只在"击退就绪"时才认。
+            threat = self._nearest_knockback_threat(ctx, foot)
+
             # ---- 转向（与施法分帧）：朝向不对就本帧只转向、不放技能 ----
             if self._face_step(ctx, target):
                 return
 
-            # ---- 近身击退：怪贴到触发距离内 → 本帧改放击退技能（原地，不移动）----
+            # ---- 近身击退：有同侧近身威胁打威胁，否则照旧看锁定目标 ----
             # 只吃掉本帧这一次技能按键；冷却期内 _try_knockback 返回 False，
             # 普通技能照常输出（所以不需要追踪怪有没有被推开）。
-            if self._try_knockback(target, foot[0]):
+            kb_target = threat if threat is not None else target
+            if self._try_knockback(kb_target, foot[0]):
                 return
 
         # ---- 技能选择 ----
@@ -2175,6 +2493,8 @@ class DecisionEngine:
         无法定位自身时直接放弃攻击，不盲打。
         """
         self._release_move()
+        if self._attack_busy():
+            return
 
         # ---- 距离守卫（规则1/2）：脚底判同平台 + 中心x判攻击距离 ----
         # 无法定位自身 → 放弃攻击（不盲打）
@@ -2548,6 +2868,8 @@ class DecisionEngine:
         否则两个技能交替（各自受冷却约束）。
         """
         self._release_move()
+        if self._attack_busy():
+            return
         self._cast_attack_skill()
 
     def _explore(self, ctx: Context):
@@ -2602,6 +2924,31 @@ class DecisionEngine:
     # 近身击退（长手专用）
     # =========================================================================
 
+    def _attack_lock_seconds(self) -> float:
+        """攻击动画锁时长（秒），配置 attack_lock_seconds，0=关闭。"""
+        try:
+            v = float(getattr(self.config, "attack_lock_seconds",
+                              ATTACK_LOCK_SECONDS_DEFAULT) or 0)
+        except (TypeError, ValueError):
+            v = ATTACK_LOCK_SECONDS_DEFAULT
+        return max(0.0, v)
+
+    def _attack_busy(self) -> bool:
+        """是否处于攻击动画锁内（上次攻击键按下后的动画时长内）。"""
+        return time.time() < self._attack_busy_until
+
+    def _mark_attack_pressed(self):
+        """按出一次攻击键（技能/击退）后开启动画锁。
+
+        游戏会忽略攻击动画期间的按键（代码在 buff 施法窗口里用到了同一条
+        结论）。实测每秒发 4+ 次按键时大部分被吞——表现为"释放不出技能、
+        击退按了没放出来"。锁内不发任何攻击/击退/转向键，让每次按键都落地。
+        加血/加蓝/buff/移动不受影响（在 decide() 更早的阶段处理）。
+        """
+        lock = self._attack_lock_seconds()
+        if lock > 0:
+            self._attack_busy_until = time.time() + lock
+
     def _knockback_conf(self) -> Optional[dict]:
         """读取击退技能配置；未配置（按键为空）→ None（功能关闭）。
 
@@ -2629,6 +2976,54 @@ class DecisionEngine:
             "range": max(1, rng),
         }
 
+    def _nearest_knockback_threat(self, ctx: Context,
+                                  foot: Tuple[int, int]) -> Optional[Detection]:
+        """击退范围内的最近同平台怪，且必须在角色面朝的方向一侧。
+
+        与只看锁定目标的差别：锁定目标可能远在射程边缘，而同侧另一只怪已经
+        贴身——逐帧扫描全部怪才能第一时间发现近身威胁（锁定目标不死亡/不
+        消失就一直被锁定，贴身的怪永远轮不到）。
+
+        过滤条件（全部满足才算威胁）：
+          · 击退已启用且当前可用（冷却已过）——冷却中不认威胁，避免
+            "为它调整朝向后却打不出击退"；
+          · 与角色同平台（脚底垂直差 ≤ attack_range_y）；
+          · 在角色面朝方向一侧（按 _face_dir；朝向未知时不认，
+            先由转向流程建立朝向，不盲打）；
+          · 与角色中心 x 距离 < knockback_skill.range。
+        站桩模式：_in_front 自动按站桩朝向过滤（只认正前方）。
+
+        Returns:
+            最近的威胁怪；没有则 None。
+        """
+        conf = self._knockback_conf()
+        if conf is None or foot is None:
+            return None
+        if not self.executor.can_press(conf["key"], conf["cooldown"]):
+            return None          # 击退冷却中：不认威胁（本帧照常普攻）
+        sx, sy = foot
+        facing = self._face_dir
+        if facing not in ("left", "right"):
+            return None          # 朝向未知：先由转向流程建立
+        ry = getattr(self.config, "attack_range_y", 60)
+        best = None
+        best_dx = conf["range"]
+        for m in ctx.monsters:
+            if not self._in_front(m, sx):
+                continue         # 站桩：按站桩朝向过滤；普通模式恒过
+            if abs(sy - (m.y + m.h)) > ry:
+                continue         # 跨层不打
+            mx = m.center[0]
+            if facing == "right" and mx < sx:
+                continue         # 不在面朝方向
+            if facing == "left" and mx > sx:
+                continue
+            dx = abs(mx - sx)
+            if dx < best_dx:
+                best = m
+                best_dx = dx
+        return best
+
     def _try_knockback(self, target: Detection, sx: int) -> bool:
         """近身击退：怪贴到触发距离以内时，本帧改放击退技能（原地，不移动）。
 
@@ -2654,6 +3049,8 @@ class DecisionEngine:
         conf = self._knockback_conf()
         if conf is None or target is None:
             return False
+        if self._attack_busy():
+            return False      # 动画锁内发击退也会被游戏吞
         # 刚按过转向、还没确认生效时先不击退：击退是有方向的技能，
         # 朝着旧朝向放等于白放（等一下也就 0.35s）。
         if self._turn_dir is not None and \
@@ -2664,6 +3061,7 @@ class DecisionEngine:
             return False
         if not self.executor.press_key(conf["key"], conf["cooldown"]):
             return False      # 冷却中 / 按键无效 → 让普通技能照常输出
+        self._mark_attack_pressed()   # 击退也是一次攻击：同样进入动画锁
         self._log(
             f"[击退] 怪近身 dx={dx}px < {conf['range']}px，"
             f"按 {conf['name']}({conf['key']})"
@@ -2704,6 +3102,7 @@ class DecisionEngine:
             skill = skills[force_index]
             if self.executor.press_key(skill["key"],
                                        self._jitter_cooldown(skill["cooldown"])):
+                self._mark_attack_pressed()
                 self._log(f"[技能] 释放 {skill['name']} ({skill['key']})")
                 return True
             return False
@@ -2713,6 +3112,7 @@ class DecisionEngine:
             self._skill_index += 1
             if self.executor.press_key(skill["key"],
                                        self._jitter_cooldown(skill["cooldown"])):
+                self._mark_attack_pressed()
                 self._log(f"[技能] 释放 {skill['name']} ({skill['key']})")
                 return True
         return False

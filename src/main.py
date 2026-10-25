@@ -103,7 +103,9 @@ class Automation:
         config:   全局配置对象（窗口/检测/按键/技能等）
         detector: YOLO 检测器实例，None 时自动创建 MockDetector
         on_log:   日志回调，参数 (message: str)
-        on_frame: 预览回调，参数 (frame, detections, hp_ratio, mp_ratio)
+        on_frame: 预览回调，参数
+                  (frame, detections, hp_ratio, mp_ratio, locked_target)
+                  locked_target 为当前锁定的怪物 Detection（无目标时为 None）
     """
 
     def __init__(self, config: Config, detector: Optional[Detector] = None,
@@ -136,7 +138,7 @@ class Automation:
 
         # ---- 回调 ----
         self.on_log = on_log or (lambda m: None)
-        self.on_frame = on_frame or (lambda f, d, h, m: None)
+        self.on_frame = on_frame or (lambda f, d, h, m, t: None)
         # 测谎弹窗命中回调（参数为匹配得分）。UI 侧据此弹报警。
         self.on_lie_detected = on_lie_detected or (lambda score: None)
 
@@ -333,7 +335,7 @@ class Automation:
 
         # 推一帧预览，让 UI 显示命中画面（无检测框/无血蓝值）
         try:
-            self.on_frame(frame, [], None, None)
+            self.on_frame(frame, [], None, None, None)
         except Exception:
             pass
 
@@ -507,8 +509,10 @@ class Automation:
         self._auto_buff()
 
         # ---- 7. 预览回调 ----
-        # 把 frame 和检测结果推给 UI 线程渲染
-        self.on_frame(frame, detections, hp_ratio, mp_ratio)
+        # 把 frame 和检测结果推给 UI 线程渲染；锁定目标随帧一起传，
+        # 保证红框画的就是这一帧决策用的目标（不在 UI 线程读决策层状态）。
+        self.on_frame(frame, detections, hp_ratio, mp_ratio,
+                      self.engine.locked_target)
 
         # ---- 8. FPS 控制 ----
         elapsed = time.time() - t0
@@ -577,7 +581,7 @@ class Automation:
             return time.perf_counter() - t0
 
         detections, hp_ratio, mp_ratio, self_pos = self._run_perception(frame)
-        self.on_frame(frame, detections, hp_ratio, mp_ratio)
+        self.on_frame(frame, detections, hp_ratio, mp_ratio, None)
 
         # 输出自身坐标（脚底 + 角色中心）到日志，供调试
         center = self._get_last_center()

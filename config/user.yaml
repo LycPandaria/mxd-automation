@@ -2,7 +2,7 @@ window_title: 冒险岛怀旧服
 start_stop_hotkey: F6
 reference_width: 1368
 reference_height: 800
-fps: 10
+fps: 12
 keyboard_mode: sendinput
 confidence: 0.6
 model_path: D:/GAME/mxd-automation/train/scripts/02_train_yolo/model/best.onnx
@@ -22,7 +22,7 @@ hp_color:
 - 131
 - 130
 hp_tolerance: 20
-hp_threshold: 0.5
+hp_threshold: 0.01
 hp_key: end
 mp_region:
 - 0.4633967789165447
@@ -34,7 +34,7 @@ mp_color:
 - 114
 - 201
 mp_tolerance: 20
-mp_threshold: 0.5
+mp_threshold: 0.01
 mp_key: pdn
 target_key: tab
 jump_key: alt
@@ -42,11 +42,12 @@ attack_type: long
 attack_range: 400
 attack_range_y: 30
 attack_min_range: 0
+attack_lock_seconds: 0.4
 knockback_skill:
   name: 击退技能
   key: D
-  cooldown: 0.2
-  range: 120
+  cooldown: 0.3
+  range: 100
 stand_mode: false
 stand_facing: right
 stand_default_attack: false
@@ -57,21 +58,18 @@ stand_micro_move_tap_ms: 30
 skills:
 - name: 连击
   key: a
-  cooldown: 0.4
+  cooldown: 0.5
 - name: 爆炸箭
   key: space
-  cooldown: 0.4
+  cooldown: 0.5
 buff_skills:
 - name: 无形箭
   key: '2'
-  cooldown: 140.0
-- name: 快速箭
-  key: '3'
-  cooldown: 50.0
+  cooldown: 200.0
 pickup_enabled: false
 pickup_key: z
 pickup_interval: 0.333
-screenshot_interval: 60
+screenshot_interval: 5
 lie_detect_enabled: true
 lie_detect_template: assets/templates/lie_detector.png
 lie_detect_threshold: 0.78
