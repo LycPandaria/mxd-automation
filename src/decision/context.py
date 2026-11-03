@@ -223,13 +223,36 @@ CLIMB_ALIGN_TOLERANCE = 5
 CLIMB_EXIT_FRAMES = 45
 """爬绳结束后横向走出绳索的帧数（约 2 秒 @20fps），期间不重新抓绳"""
 
-ATTACK_STALE_FRAMES = 90
-"""锁定同一目标持续攻击的最大帧数（约 4.5 秒 @20fps）。
+GHOST_CASTS = 6
+"""同一个目标打了这么多下还在 → 判定为残影/误识别（config.ghost_casts 可改，0=关闭）。
 
-怪物死亡后 YOLO 仍可能把尸体/消失残影检测为 monster，
-位置匹配会一直锁定这个残影，导致角色原地打空气、不换下一只。
-超过该帧数目标仍未消失（画面仍检测到）→ 判定为残影/无敌，
-立即解除锁定重新选目标。"""
+怪物死亡后 YOLO 仍可能把尸体/消失残影、或背景里像怪的东西检测为 monster，
+位置匹配会一直锁定它，导致角色对着空气打、不换下一只。
+按出手次数算而不是帧数：跳跃攻击的起跳/滞空期间不做决策，按帧数累计会慢几十倍。"""
+
+GHOST_ZONE_SECONDS = 8.0
+"""判定为残影的位置，第一次忽略这么多秒（避免换走后马上又选回来）。
+
+同一个位置再次被判定为残影，忽略时间翻倍（8 → 16 → 32 …），最长 GHOST_ZONE_MAX_SECONDS。
+地图边上的固定物体被误认成怪时，会被一次次判定为残影，越罚越久，不会反复去追。"""
+
+GHOST_ZONE_MAX_SECONDS = 300.0
+"""残影位置最长忽略时间（秒）。"""
+
+GHOST_MEMORY_SECONDS = 600.0
+"""残影位置的"前科"保留多久（秒）：这段时间内再被判定，按次数翻倍计时。"""
+
+GHOST_ZONE_RADIUS = 60
+"""残影位置的忽略半径（px，768 高画面下）。"""
+
+GHOST_MIN_SECONDS = 3.0
+"""残影判定还要求对它打了至少这么久（秒）：攻击冷却设得很短时按键次数涨得快，
+但出手动作没做完时多按的那几下游戏不认，不能凭次数就判残影。"""
+
+GHOST_STATIC_PX = 20
+"""从开始计数起目标位置偏离超过这么多（px，768 高画面下）就说明是活的（在走、被打得往后退、
+或是好几只怪轮流经过同一个地方），要打两倍次数、两倍时间还在才放弃（多半是打不到）。
+误识别的地图物体、死亡残影是不动的，按 ghost_casts 次判定。"""
 
 STUCK_FRAMES = 60
 """卡住判定帧数：持续此帧数位置不变则视为卡住"""
@@ -650,7 +673,13 @@ class DecisionEngine:
         self._climbing = False                    # 是否正在沿绳索攀爬
         self._climb_exit_frames = 0               # 脱离绳索后横向走出的剩余帧数
         self._climb_log_count = 0                 # 攀爬日志限频计数
-        self._attack_stale_counter = 0            # 锁定同一目标持续攻击的帧数（残影检测）
+        # ---- 残影判定（出手次数 + 静止判定 + 位置记忆）----
+        self._casts_on_target = 0                 # 对当前锁定目标已出手的次数
+        self._ghost_anchor: Optional[Tuple[int, int]] = None  # 开始计数时目标的位置，动过就重新计数
+        self._ghost_since = 0.0                   # 开始计数的时间
+        self._ghost_moved = False                 # 计数期间目标动过（活的）
+        # 残影位置：{"x","y","until"(忽略到何时),"count"(被判定次数),"last"(最近判定时间)}
+        self._ghost_zones: List[dict] = []
         # 角色朝向：只记录"已被游戏确认"的朝向（按键后实际位移验证过），
         # 未确认的转向只存在 _turn_dir / _face_attempt_side 里，绝不写进来——
         # 否则游戏吞掉转向键时会变成"以为转了、其实没转"（10/25 实测脱钩）。
@@ -733,7 +762,11 @@ class DecisionEngine:
         self._stuck_counter = 0
         self._explore_frame_count = 0
         self._distance_log_frame_count = 0
-        self._attack_stale_counter = 0
+        self._casts_on_target = 0
+        self._ghost_anchor = None
+        self._ghost_since = 0.0
+        self._ghost_moved = False
+        self._ghost_zones = []
         self._face_dir = None
         self._face_last_press_at = 0.0
         self._face_next_assert = 0.0
@@ -938,7 +971,7 @@ class DecisionEngine:
             # 画面中已没有怪物：立即解除锁定并清理攀爬等残留状态，
             # 防止"上帧还锁着怪/在爬绳"的状态影响后续探索与重新选怪
             self._target_monster = None
-            self._attack_stale_counter = 0
+            self._casts_on_target = 0
             self._occluded_retreat_frames = 0
             self._aoe_burst_left = 0
             self._target_miss_frames = 0
@@ -954,7 +987,7 @@ class DecisionEngine:
             # 画面中已没有怪物：立即解除锁定并清理攀爬等残留状态，
             # 防止"上帧还锁着怪/在爬绳"的状态影响后续探索与重新选怪
             self._target_monster = None
-            self._attack_stale_counter = 0
+            self._casts_on_target = 0
             self._occluded_retreat_frames = 0
             self._aoe_burst_left = 0
             self._target_miss_frames = 0
@@ -972,50 +1005,59 @@ class DecisionEngine:
 
         【就近原则】每帧重新选择附近最近的怪物，谁在附近打谁：
           1. 怪物消失/离开画面后，下一帧自动选到别的怪，不用等
-          2. 【残影防护】持续攻击同一目标超过 ATTACK_STALE_FRAMES 帧
-             仍未击杀（画面仍检测到）→ 判定为死尸残影/无敌，
-             跳过它重新选目标，避免原地打空气
+          2. 【残影防护】对同一目标出手 ghost_casts 次（且超过 3 秒）仍未消失
+             → 判定为死尸残影/误识别，把该位置记入忽略表，跳过它重新选目标，
+             避免原地打空气；动过的目标要 2 倍次数/时间才判定（活怪打不到）
         """
         target = self._resolve_locked_target(ctx)
 
-        # ---- 无有效目标（same_platform_only 过滤后无同平台怪）----
+        # ---- 无有效目标（没有同平台怪 / 全在残影忽略位置）----
         # 不走 CRASH 路径，释放移动键并转探索，避免角色卡在上一帧的移动状态
         if target is None:
             # 攻击中目标短暂从画面消失（YOLO 单帧漏检/波动）→ 沿用旧锁定
             # 目标继续攻击。若此时重选别的怪，dx 会瞬间翻转、角色左右乱转。
-            # 若怪真被杀/消失，残影检测(ATTACK_STALE_FRAMES)会兜底换目标。
+            # 若怪真被杀/消失，残影检测会兜底换目标。
             if self._fsm.current == State.ATTACKING and self._target_monster is not None:
                 target = self._target_monster
             else:
                 self._target_monster = None
-                self._attack_stale_counter = 0
+                self._casts_on_target = 0
                 self._release_move()
                 self._fsm.transition(State.IDLE)
                 self._explore(ctx)
                 return
 
-        # ---- 攻击超时检测（残影防护）----
-        # 持续攻击同一只怪（上帧目标 == 本帧最近目标）才累计；
-        # 目标被角色遮挡期间（虚拟目标维持中）不计入，避免"攻击超时
-        # 判定残影→中断"把遮挡中的正常战斗打断
-        if self._occluded_frames == 0 and self._target_monster is not None \
-                and self._is_same_monster(self._target_monster, target):
-            if self._fsm.current == State.ATTACKING:
-                self._attack_stale_counter += 1
-            else:
-                self._attack_stale_counter = 0
-        else:
-            self._attack_stale_counter = 0
-
-        # 同一只怪攻击过久仍没死 → 很可能是尸体残影/无敌
-        if self._attack_stale_counter >= ATTACK_STALE_FRAMES:
-            self._log("[换目标] 持续攻击无效果(疑似残影/已死)，跳过该目标")
-            self._attack_stale_counter = 0
-            # 排除残影后重新选最近目标
-            target = self._pick_best_target(ctx, exclude=self._target_monster)
+        # ---- 残影防护：同一个目标打了 ghost_casts 下还在 → 残影/误识别 ----
+        # 换了目标（不是同一只）就重新计数；遮挡/漏检宽限期间的虚拟目标沿用计数
+        if self._occluded_frames == 0 and (self._target_monster is None
+                                           or not self._is_same_monster(self._target_monster, target)):
+            self._casts_on_target = 0
+        if self._occluded_frames == 0:
+            # 只有一直不动的目标才可能是残影：动过就是活的，重新计数
+            c = target.center
+            a = self._ghost_anchor
+            if a is None or self._casts_on_target == 0:
+                self._ghost_anchor = c
+                self._ghost_since = time.time()
+                self._ghost_moved = False
+            elif abs(c[0] - a[0]) + abs(c[1] - a[1]) > self._px(GHOST_STATIC_PX):
+                self._ghost_moved = True  # 动过：是活的，要打更久才算"打不到"
+        limit = int(getattr(self.config, "ghost_casts", GHOST_CASTS) or 0)
+        # 不动的：打 limit 下、3 秒还在 → 残影/误识别；
+        # 动过的（活怪）：打 2×limit 下、6 秒还在 → 多半打不到（比如飘在高一截的地方）
+        k = 2 if self._ghost_moved else 1
+        if limit > 0 and self._casts_on_target >= limit * k \
+                and time.time() - self._ghost_since >= GHOST_MIN_SECONDS * k:
+            seconds, count = self._mark_ghost(target)
+            self._log(f"[换目标] 对同一目标出手 {self._casts_on_target} 次仍未消失"
+                      f"（疑似残影/误识别），第 {count} 次判定，{seconds:.0f} 秒内忽略该位置")
+            self._casts_on_target = 0
+            self._ghost_anchor = None
+            self._target_monster = None
+            # 该位置已进忽略表，重新选目标时会被过滤掉
+            target = self._pick_best_target(ctx)
             if target is None:
                 # 画面里只剩打不死的残影 → 不空耗，转探索
-                self._target_monster = None
                 self._fsm.transition(State.IDLE)
                 self._explore(ctx)
                 return
@@ -1055,7 +1097,7 @@ class DecisionEngine:
                 return
             # 从启动起就没定位到过：无法判断距离，不能攻击，只能探索
             self._target_monster = None
-            self._attack_stale_counter = 0
+            self._casts_on_target = 0
             self._release_move()
             self._fsm.transition(State.IDLE)
             self._explore(ctx)
@@ -1124,7 +1166,7 @@ class DecisionEngine:
         # 跨层追过去成本高且容易卡地形。释放移动转探索，
         # 等画面里出现同平台怪物再攻击。
         self._target_monster = None
-        self._attack_stale_counter = 0
+        self._casts_on_target = 0
         self._release_move()
         self._fsm.transition(State.IDLE)
         self._explore(ctx)
@@ -1152,7 +1194,7 @@ class DecisionEngine:
         """
         if target is None:
             self._target_monster = None
-            self._attack_stale_counter = 0
+            self._casts_on_target = 0
             self._release_move()
             self._fsm.transition(State.IDLE)
             self._explore(ctx)
@@ -1186,7 +1228,7 @@ class DecisionEngine:
         # 不同平台：放弃该目标（与长手一致，不跨层）
         if dy > ry:
             self._target_monster = None
-            self._attack_stale_counter = 0
+            self._casts_on_target = 0
             self._release_move()
             self._fsm.transition(State.IDLE)
             self._explore(ctx)
@@ -1966,6 +2008,8 @@ class DecisionEngine:
         for m in ctx.monsters:
             if self._is_same_monster(locked, m):
                 continue
+            if self._in_ghost_zone(m):
+                continue  # 残影位置：不当成"更近的可见怪"去抢占
             if not self._same_platform(sy, m.y + m.h):
                 continue
             if not self._in_front(m, sx):
@@ -2085,7 +2129,13 @@ class DecisionEngine:
                 self._occluded_retreat_frames = 0
                 self._target_miss_frames = 0
                 return nearer
+            ghost_locked = False
             for m in ctx.monsters:
+                if self._in_ghost_zone(m):
+                    # 该位置已被判定为残影：不再锁回来（哪怕是原来的锁定目标）
+                    if self._is_same_monster(self._target_monster, m):
+                        ghost_locked = True
+                    continue
                 if self._is_same_monster(self._target_monster, m):
                     # 锁定目标仍在画面，但已不在角色同一平台
                     # （跨层/掉下平台）→ 放弃锁定，只打同层怪
@@ -2101,6 +2151,13 @@ class DecisionEngine:
                     self._occluded_retreat_frames = 0
                     self._target_miss_frames = 0
                     return m
+            if ghost_locked:
+                # 锁定目标就在残影位置：直接放手，不能走"遮挡/漏检沿用最后位置"
+                # （否则刚判定的残影会被保留逻辑再打 0.5~1 秒）
+                self._target_monster = None
+                self._casts_on_target = 0
+                self._occluded_frames = 0
+                self._target_miss_frames = 0
             # 锁定目标本帧不在画面：可能是被角色自身遮挡（贴脸攻击）
             occluded = self._occluded_target(ctx)
             if occluded is not None:
@@ -2125,6 +2182,35 @@ class DecisionEngine:
         tolerance = max(int(a.w * 1.5), 40)
         d = abs(a.center[0] - b.center[0]) + abs(a.center[1] - b.center[1])
         return d <= tolerance
+
+    def _mark_ghost(self, m: Detection) -> Tuple[float, int]:
+        """把该位置记为残影；同一位置屡次被判定，忽略时间翻倍。返回 (忽略秒数, 第几次)。"""
+        now = time.time()
+        r = self._px(GHOST_ZONE_RADIUS)
+        cx, cy = m.center
+        for z in self._ghost_zones:
+            if abs(cx - z["x"]) + abs(cy - z["y"]) <= r:
+                z["count"] += 1
+                z["x"], z["y"], z["last"] = cx, cy, now
+                seconds = min(GHOST_ZONE_SECONDS * 2 ** (z["count"] - 1),
+                              GHOST_ZONE_MAX_SECONDS)
+                z["until"] = now + seconds
+                return seconds, z["count"]
+        self._ghost_zones.append({"x": cx, "y": cy, "until": now + GHOST_ZONE_SECONDS,
+                                  "count": 1, "last": now})
+        return GHOST_ZONE_SECONDS, 1
+
+    def _in_ghost_zone(self, m: Detection) -> bool:
+        """该检测框是否落在正在忽略的残影位置（顺便清理很久以前的记录）。"""
+        if not self._ghost_zones:
+            return False
+        now = time.time()
+        self._ghost_zones = [z for z in self._ghost_zones
+                             if z["until"] > now or now - z["last"] < GHOST_MEMORY_SECONDS]
+        r = self._px(GHOST_ZONE_RADIUS)
+        cx, cy = m.center
+        return any(z["until"] > now and abs(cx - z["x"]) + abs(cy - z["y"]) <= r
+                   for z in self._ghost_zones)
 
     def _set_locked_target(self, target: Detection):
         """更新锁定目标；锁定对象真正更换时打印新目标坐标。
@@ -2219,7 +2305,8 @@ class DecisionEngine:
             ctx:     当前帧感知数据
             exclude: 需要跳过的怪物（如疑似残影），可选
         """
-        monsters = ctx.monsters
+        # 残影位置整片忽略：判定过残影的地方（可能是误识别的地图物体）不再选
+        monsters = [m for m in ctx.monsters if not self._in_ghost_zone(m)]
         if not monsters:
             return None
         if exclude is not None:
@@ -2778,6 +2865,8 @@ class DecisionEngine:
         ry = getattr(self.config, "attack_range_y", 60)
         count = 0
         for m in ctx.monsters:
+            if self._in_ghost_zone(m):              # 残影不算"前方有怪"
+                continue
             mx = m.center[0]
             if abs(sy - (m.y + m.h)) > ry:          # 跨层不计
                 continue
@@ -3418,8 +3507,8 @@ class DecisionEngine:
         return True
 
     def _range_in_reach(self, foot: Tuple[int, int], m: Detection) -> bool:
-        """这只怪站着不动就打得到：同一层、在攻击距离内。"""
-        if not self._same_platform(foot[1], m.y + m.h):
+        """这只怪站着不动就打得到：同一层、在攻击距离内、不在残影位置。"""
+        if not self._same_platform(foot[1], m.y + m.h) or self._in_ghost_zone(m):
             return False
         if getattr(self.config, "attack_type", "long") == "short":
             return abs(foot[0] - self._melee_edge_x(foot[0], m)) <= self._get_attack_range()
@@ -3590,6 +3679,8 @@ class DecisionEngine:
         best = None
         best_dx = conf["range"]
         for m in ctx.monsters:
+            if self._in_ghost_zone(m):
+                continue         # 残影不当作近身威胁（别把击退浪费在尸体上）
             if not self._in_front(m, sx):
                 continue         # 站桩：按站桩朝向过滤；普通模式恒过
             if abs(sy - (m.y + m.h)) > ry:
@@ -3692,6 +3783,7 @@ class DecisionEngine:
             if self.executor.press_key(skill["key"],
                                        self._jitter_cooldown(skill["cooldown"])):
                 self._mark_attack_pressed()
+                self._casts_on_target += 1   # 残影判定：对当前目标又出手一次
                 self._log(f"[技能] 释放 {skill['name']} ({skill['key']})")
                 return True
             return False
@@ -3702,6 +3794,7 @@ class DecisionEngine:
             if self.executor.press_key(skill["key"],
                                        self._jitter_cooldown(skill["cooldown"])):
                 self._mark_attack_pressed()
+                self._casts_on_target += 1   # 残影判定：对当前目标又出手一次
                 self._log(f"[技能] 释放 {skill['name']} ({skill['key']})")
                 return True
         return False
