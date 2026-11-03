@@ -54,12 +54,16 @@
 import os
 import time
 import threading
+from datetime import datetime
 from typing import Callable, Optional, Any, Tuple
 
 from .perception.screen_capture import ScreenCapture
 from .perception.yolo_detector import Detector, create_detector
 from .perception.hp_mp_detector import detect_bar_ratio
 from .perception.lie_detector import LieDetector
+from .perception.lie_shadow import LieShadow, board_box
+from .perception.lie_detector_watch import LieDetectorWatcher
+from .perception.lie_recorder import LieRecorder, LieLog, client_cursor
 from .execution.action_executor import ActionExecutor
 from .decision.context import Context, DecisionEngine
 from .utils.config_loader import (
@@ -79,6 +83,10 @@ from .utils.config_loader import (
 BUFF_PRESS_DELAY_SECONDS = 0.4   # 开窗后等这么久再按（让上一次攻击动画收尾）
 BUFF_MULTI_GAP_SECONDS = 0.25    # 多个 buff 依次释放之间的间隔
 BUFF_CAST_TAIL_SECONDS = 0.6     # 按完最后一个 buff 后，留给它施法动画的余量
+
+LIE_RESULT_WAIT_SECONDS = 5.0
+"""画板消失后再录这么久，等 OCR 认出「成功通过」对话框：结果要写进这一局的 meta.json / results.csv。
+通过的话通常 1~2 秒内就认出来，会提前结束；没通过就录满这段时间。"""
 
 
 class Automation:
@@ -111,7 +119,11 @@ class Automation:
     def __init__(self, config: Config, detector: Optional[Detector] = None,
                  on_log: Optional[Callable[[str], None]] = None,
                  on_frame: Optional[Callable[..., None]] = None,
-                 on_lie_detected: Optional[Callable[[float], None]] = None):
+                 on_lie_detected: Optional[Callable[[float], None]] = None,
+                 on_lie_resume: Optional[Callable[[], None]] = None):
+        # 日志转发：正常输出，同时留最近几行，测谎录制开始时写进这一局的 log.txt
+        self._lie_log = LieLog(on_log or (lambda m: None))
+        on_log = self._lie_log.write
         # ---- 感知层 ----
         self.config = config
         self.capture = ScreenCapture()  # 窗口截图（客户区 BitBlt）
@@ -141,6 +153,7 @@ class Automation:
         self.on_frame = on_frame or (lambda f, d, h, m, t: None)
         # 测谎弹窗命中回调（参数为匹配得分）。UI 侧据此弹报警。
         self.on_lie_detected = on_lie_detected or (lambda score: None)
+        self.on_lie_resume = on_lie_resume or (lambda: None)
 
         # ---- 测谎弹窗检测（反外挂）----
         # 弹窗出现 → 3 秒后开始"鼠标跟随图形"小游戏 → 必须马上停手让玩家接管。
@@ -162,6 +175,45 @@ class Automation:
                 )
             except Exception as e:
                 self.on_log(f"[测谎] 初始化失败，测谎检测已禁用: {e}")
+
+        # ---- 测谎小游戏自动作答（mxd-lie-logic-code 方案）----
+        # 弹窗命中停机后，LieRecorder 录画面+光标（60fps，影子结果写同目录），
+        # LieShadow 跟踪目标并接管鼠标：白图形可见时直接用重心，淡出后用记下的
+        # 轮廓在两帧对齐差值图上做形状匹配（不看模型），0.5s 没认出白图形才退回
+        # 模型。点一下鼠标左键才交还。认出「成功通过」对话框后按 Esc 关掉并自动
+        # 恢复打怪（lie_auto_resume）；没通过就一直停着。
+        self._lie_shadow: Optional[LieShadow] = None
+        self._lie_watcher: Optional[LieDetectorWatcher] = None
+        self._lie_game_recorder: Optional[LieRecorder] = None
+        self._lie_game_thread: Optional[threading.Thread] = None
+        self._lie_game_stop = threading.Event()
+        if getattr(config, "lie_shadow_enabled", False):
+            try:
+                self._lie_shadow = LieShadow(
+                    resolve_model_path(
+                        getattr(config, "lie_shadow_model", "") or ""
+                    ),
+                    conf=float(getattr(config, "lie_shadow_conf", 0.1) or 0.1),
+                    on_log=self.on_log,
+                )
+                if getattr(config, "lie_shadow_takeover", True):
+                    self._lie_shadow.takeover = (self._read_cursor_client,
+                                                 self._move_cursor_client)
+                self._lie_watcher = LieDetectorWatcher(on_log=self.on_log)
+                self._lie_game_recorder = LieRecorder(
+                    self.capture.grab,
+                    lambda: client_cursor(self.capture.hwnd),
+                    on_log=self.on_log,
+                    out_root=self._lie_evidence_dir(),
+                    shadow=self._lie_shadow,
+                    run_log=self._lie_log,
+                    result=lambda: ("通过" if self._lie_watcher is not None and self._lie_watcher.passed
+                                    else "没看到通过对话框"),
+                )
+                self.on_log("[测谎] 自动作答已启用（形状匹配跟踪 + OCR 通过判定）")
+            except Exception as e:
+                self._lie_shadow = None
+                self.on_log(f"[测谎] 自动作答初始化失败，已禁用: {e}")
 
         # ---- 线程控制 ----
         self._running = False  # 控制循环是否继续
@@ -268,6 +320,10 @@ class Automation:
         # 测谎锁存复位：若弹窗还挂着就重启，允许再报一次警（然后立刻被再次拦下）
         self._lie_latched = False
 
+        # 上次测谎的影子跟踪还在跑（玩家没等结束就重启）→ 先收手并把鼠标交还。
+        # 这是影子在"程序停止"之外唯一的强制退出路径：重启=玩家接管。
+        self._stop_lie_shadow("玩家手动重启")
+
         # 测谎检测状态：模板加载日志发生在 __init__，那时 UI 还没接上日志信号会被丢掉，
         # 所以这里补一条 —— 阈值调错（比如测试时改成 0.2 忘了改回）必须一眼能看见。
         if self._lie_detector is not None:
@@ -284,6 +340,11 @@ class Automation:
 
         设置 _running = False，_loop() 会在下一次迭代时退出。
         同时释放所有按住的移动键，防止停止后方向键卡住。
+
+        注意：这里【不】停止测谎影子跟踪 —— 弹窗命中本来就是先停机、
+        再由影子接管鼠标（20261031 复盘：UI 报警回调 _stop_run() 也会调
+        本方法，曾把刚启动的影子当场杀掉，shadow.csv 只有表头）。
+        影子自己的退出路径：画板消失 / 超时 / 用户手动重启（start()）。
         """
         if not self._running:
             return
@@ -301,11 +362,16 @@ class Automation:
     # =========================================================================
 
     def _handle_lie_detected(self, frame, score: float):
-        """测谎弹窗命中：立即停机 + 报警（同一次弹窗只报警一次）。
+        """测谎弹窗命中：立即停机 + 录屏取证 + 报警（同一次弹窗只报警一次）。
 
         为什么必须先停机：
           1. 弹窗盖住画面正中，此刻 YOLO 的输出全是垃圾，决策层会乱走乱放技能；
           2. 小游戏要求玩家用真实鼠标把光标压在移动图形上，机器人必须让出控制权。
+
+        为什么停机后还要录屏：
+          停机只是不再操作，弹窗还在游戏里，玩家接手的这段处置过程（有没有
+          及时作答、小游戏怎么失败）是事后复核的唯一依据。录屏线程独立于
+          主循环，stop() 之后仍继续录 lie_record_seconds 秒。
 
         停机后不自动恢复：误恢复（在小游戏中途继续打怪）的代价远大于少打一分钟怪。
         玩家按启停热键即可重新开始（会自动解除报警）。
@@ -321,8 +387,12 @@ class Automation:
         )
         self.stop()
 
+        # 截图与录屏共用同一个时间戳，方便事后按文件名对照
+        ts = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+
+        # 录制与跟踪在 _start_lie_game 里一起启动（LieRecorder 内含影子同步）
         try:
-            path = self._save_lie_evidence(frame)
+            path = self._save_lie_evidence(frame, ts)
             if path:
                 self.on_log(f"[测谎] 现场截图已保存: {path}")
         except Exception as e:
@@ -339,18 +409,209 @@ class Automation:
         except Exception:
             pass
 
-    def _save_lie_evidence(self, frame) -> str:
+        # ---- 自动作答（录制 + 跟踪 + 接管 + 通过后自动恢复）----
+        # 放在停机之后；抓帧各自独立（BitBlt 每次自建资源），并发安全。
+        self._start_lie_game()
+
+    # =========================================================================
+    # 测谎影子跟踪 / 接管（mxd-lie-target 方案）
+    # =========================================================================
+
+    def _read_cursor_client(self):
+        """光标在客户区里的坐标 + 左键是否按下；窗口没锁或取不到返回 None。
+
+        接管规则是"点一下左键才交还"，所以光标读取必须带上按键状态
+        （lie_shadow.MouseTakeover 的约定）。
+        """
+        return client_cursor(self.capture.hwnd)
+
+    def _move_cursor_client(self, x: int, y: int) -> bool:
+        """把光标移到客户区 (x, y)。游戏窗口不在前台就不动，返回 False。"""
+        try:
+            import win32api
+            import win32gui
+            hwnd = self.capture.hwnd
+            if not hwnd:
+                return False
+            fg = win32gui.GetForegroundWindow()
+            if fg != hwnd and not win32gui.IsChild(hwnd, fg):
+                return False
+            sx, sy = win32gui.ClientToScreen(hwnd, (int(x), int(y)))
+            win32api.SetCursorPos((sx, sy))
+            return True
+        except Exception:
+            return False
+
+    def _start_lie_game(self):
+        """命中弹窗停机后启动自动作答：录制+跟踪（LieRecorder 内含影子）+
+        OCR 监视（通过判定），另起监督线程负责结束判定 / 按 Esc / 自动恢复。"""
+        if self._lie_game_recorder is None:
+            return
+        if self._lie_game_thread is not None and self._lie_game_thread.is_alive():
+            return
+        if not self.capture.locked:
+            self.on_log("[测谎] 窗口未锁定，跳过自动作答")
+            return
+        try:
+            self._lie_game_stop.clear()
+            self._lie_watcher.start()
+            out_dir = self._lie_game_recorder.start("检测到测谎弹窗")
+            if out_dir is None:
+                self.on_log("[测谎] 已在录制中，跳过重复启动")
+                return
+        except Exception as e:
+            self.on_log(f"[测谎] 自动作答启动失败: {e}")
+            return
+        self._lie_game_thread = threading.Thread(
+            target=self._supervise_lie_game, daemon=True,
+        )
+        self._lie_game_thread.start()
+
+    def _supervise_lie_game(self):
+        """自动作答监督线程（主循环此时已停机）：
+
+        阶段一（小游戏进行中）：按 15 次/秒喂帧给 OCR 监视器、盯画板——
+        连续 N 帧不见就停录制（内含影子）；
+        阶段二（结束后）：继续喂帧 —— 「成功通过」对话框出现在画板消失之后，
+        OCR 要靠这些帧认它；按 watcher.next_step 处理：还开着就按 Esc
+        （每次按之前都要有比上次更晚的画面确认它还在，避免没开任何窗口时
+        Esc 弹出游戏菜单），关掉了就自动恢复打怪；没通过就一直停着。
+        """
+        interval = 1.0 / 15.0
+        end_frames = int(getattr(self.config, "lie_shadow_end_frames", 15) or 15)
+        max_seconds = float(
+            getattr(self.config, "lie_shadow_max_seconds", 60) or 60
+        )
+        t0 = time.perf_counter()
+        missing = 0
+        seen_board = False
+        gone_at = None  # 画板连续消失够帧数的时间点
+
+        # ---- 阶段一：小游戏进行中 ----
+        while not self._lie_game_stop.is_set():
+            elapsed = time.perf_counter() - t0
+            if elapsed > max_seconds:
+                self.on_log(f"[测谎] 超过 {max_seconds:.0f}s，停止录制与跟踪")
+                break
+            try:
+                frame = self.capture.grab()
+            except Exception as e:
+                self.on_log(f"[测谎] 截图失败，停止自动作答: {e}")
+                break
+            self._lie_watcher.feed(frame)
+            if board_box(frame) is not None:
+                seen_board = True
+                missing = 0
+                gone_at = None
+            elif seen_board:
+                missing += 1
+                if missing >= end_frames:
+                    if gone_at is None:
+                        gone_at = time.perf_counter()
+                        self.on_log("[测谎] 画板已消失，小游戏结束")
+                    # 再喂几秒帧，等 OCR 认出「成功通过」对话框（结果要写进这一局的录像）
+                    if (self._lie_watcher.passed
+                            or time.perf_counter() - gone_at >= LIE_RESULT_WAIT_SECONDS):
+                        break
+            wait = interval - (time.perf_counter() - t0 - elapsed)
+            if wait > 0:
+                time.sleep(wait)
+
+        self._lie_game_recorder.stop("画板消失" if seen_board else "停止")
+
+        # ---- 阶段二：通过判定 + Esc + 自动恢复 ----
+        # OCR 监视器继续跑（对话框在画板之后才出现），直到恢复或超时。
+        if not getattr(self.config, "lie_auto_resume", True):
+            self.on_log("[测谎] lie_auto_resume 已关闭，是否通过请看日志，"
+                        "恢复打怪请手动操作")
+            self._lie_watcher.stop()
+            return
+        esc_at, esc_count = 0.0, 0
+        resume_deadline = time.time() + 60.0
+        while time.time() < resume_deadline and not self._lie_game_stop.is_set():
+            try:
+                frame = self.capture.grab()
+            except Exception as e:
+                self.on_log(f"[测谎] 截图失败: {e}")
+                break
+            self._lie_watcher.feed(frame)
+            step = self._lie_watcher.next_step(esc_at, esc_count)
+            if step == "esc":
+                self.on_log(f"[测谎] 测谎通过，按 Esc 关闭对话框"
+                            f"（第 {esc_count + 1} 次）")
+                self.executor.press_key("esc")
+                esc_at = time.time()
+                esc_count += 1
+                time.sleep(1.0)
+            elif step == "resume":
+                self._lie_watcher.stop()
+                self.on_log("[测谎] 通过对话框已关闭，自动恢复打怪")
+                self._resume_after_lie()
+                return
+            else:
+                time.sleep(0.5)
+        self._lie_watcher.stop()
+        self.on_log("[测谎] 未见「成功通过」对话框或未能关闭（可能没通过），"
+                    "不自动恢复打怪；玩家按启停热键可重新开始")
+
+    def _resume_after_lie(self):
+        """测谎通过后恢复打怪（与 start() 相同的状态复位，但不重复锁窗）。"""
+        self._lie_latched = False
+        self._stop_lie_game("恢复打怪")
+        self._running = True
+        self._thread = threading.Thread(target=self._loop, daemon=True)
+        self._thread.start()
+        try:
+            self.on_lie_resume()
+        except Exception:
+            pass
+        self.on_log("[启动] 测谎通过，自动打怪已恢复")
+
+    def _stop_lie_game(self, reason: str = ""):
+        """停止自动作答（录制/影子/OCR 监视/监督线程，幂等）。"""
+        running = (self._lie_game_thread is not None
+                   and self._lie_game_thread.is_alive())
+        self._lie_game_stop.set()
+        try:
+            self._lie_watcher.stop()
+        except Exception:
+            pass
+        try:
+            self._lie_game_recorder.stop(reason or "停止")
+        except Exception as e:
+            self.on_log(f"[测谎] 录制停止异常: {e}")
+        self._lie_game_thread = None
+        if running and reason:
+            self.on_log(f"[测谎] 自动作答已停止（{reason}）")
+
+    def _stop_lie_shadow(self, reason: str = ""):
+        """兼容旧调用：现在自动作答由 _stop_lie_game 统一管理。"""
+        self._stop_lie_game(reason)
+
+    def _lie_evidence_dir(self) -> str:
+        """测谎取证目录（截图与录屏共用；相对路径基于程序目录）。"""
+        out_dir = getattr(self.config, "lie_record_dir", "") or "logs/lie_detected"
+        if not os.path.isabs(out_dir):
+            out_dir = os.path.join(APP_DIR, out_dir)
+        return out_dir
+
+    def _save_lie_evidence(self, frame, ts: Optional[str] = None) -> str:
         """保存命中现场截图（留证 + 便于日后复核/重裁模板）。返回路径或空串。"""
         import cv2
-        from datetime import datetime
 
-        out_dir = os.path.join(APP_DIR, "logs", "lie_detected")
+        out_dir = self._lie_evidence_dir()
         os.makedirs(out_dir, exist_ok=True)
-        ts = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+        if not ts:
+            ts = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
         path = os.path.join(out_dir, f"lie_{ts}.png")
         if not cv2.imwrite(path, frame):
             return ""
         return path
+
+    def shutdown(self):
+        """释放后台资源（关闭程序时调用）：录制正常收尾、各线程退出。"""
+        self._stop_lie_game("程序退出")
+        self._lie_log.close()  # 程序要退了，不等 LOG_AFTER_S 的下一次写日志
 
     def _loop(self):
         """主循环（在独立线程中运行）。
@@ -759,6 +1020,9 @@ def main():
             time.sleep(1)
     except KeyboardInterrupt:
         auto.stop()
+    finally:
+        # 让测谎录屏线程正常收尾（daemon 线程被直接杀掉会留下残缺视频）
+        auto.shutdown()
 
 
 if __name__ == "__main__":

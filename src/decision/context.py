@@ -114,7 +114,7 @@ AOE_MONSTER_COUNT_THRESHOLD = 2
 改放第二个技能(技能2, AOE)；否则放第一个技能(技能1)。仅长手(远程)生效。
 例外：站桩模式 + stand_skill2_only(默认开) 时不做这个判定，恒定只放技能2。"""
 
-AOE_BURST_COUNT = 2
+AOE_BURST_COUNT = 3
 """AOE 连发次数：每次判定放技能2(爆炸箭)时，连发此数量的爆炸箭
 （隔冷却逐发补满，成功放出一发才递减）。"""
 
@@ -154,11 +154,18 @@ HP_RETREAT_HOLD_SECONDS = 1.0
 （按 fps 换算成帧）"""
 
 TARGET_MISS_RETAIN_SECONDS = 0.5
-"""长手(远程)目标漏检保持秒数：攻击中锁定目标因技能特效被遮挡而短时漏检时，
-沿用最后位置继续攻击此时间，避免"换目标/乱跑"；超过才重选。（按 fps 换算成帧）
+"""长手(远程)目标漏检保持秒数（射程外）：攻击中锁定目标因技能特效被遮挡而
+短时漏检时，沿用最后位置继续攻击此时间，避免"换目标/乱跑"；超过才重选。
+（按 fps 换算成帧）
 
-fps=10 时仅 5 帧，取值不能太小——YOLO 对同一只怪的检测本身会逐帧波动，
-窗口太短（如 0.3s=3 帧）会让正常战斗被误判成"目标消失"，掉锁转探索。"""
+射程内的目标用更长的 TARGET_MISS_RETAIN_INRANGE_SECONDS（特效盖住时目标
+通常还在原地，保持更久可以少换目标/少转身）。"""
+
+TARGET_MISS_RETAIN_INRANGE_SECONDS = 1.0
+"""射程内目标漏检保持秒数：目标最后位置仍在攻击距离内时，多半是技能特效/
+角色遮挡导致 YOLO 置信度掉下去，目标本身没消失。保持 1.0s 让特效过去，
+期间不换目标；只有明显更近（≥NEARER_GHOST_INRANGE_MARGIN_X）的可见怪
+才会抢占（见 _pick_nearer_visible）。（按 fps 换算成帧）"""
 
 SELECT_FALLBACK_SECONDS = 3.0
 """自身定位失败时，选怪允许使用"最后已知位置"的最大时效（秒）。
@@ -174,14 +181,37 @@ NEARER_SWITCH_MARGIN_X = 120
 锁定目标还可见时，新怪至少要近这么多才切换，避免两只怪距离接近时
 左右来回换目标、反复转身抖动。"""
 
-NEARER_CLOSE_X = 250
-"""贴身怪抢占距离（像素）。
+NEARER_TRULY_CLOSE_X = 150
+"""跨侧切换的"真正贴身"距离（像素）。
 
-同层怪进入角色 250px 内且比锁定目标近 120px 以上 → 直接抢占
-（对应"身边有怪却还在打/追远处"的场景）。"""
+跨侧换目标必须先转身（约 0.25~0.4s 停手）。只有新目标进到这个距离内、
+并且确实比当前锁定目标更近时，才值得转一次身。原阈值 250px 太宽：会把
+195px 的前排目标换成 229px 的背后目标（10/29 日志 26 次），收紧到 150。"""
+
+NEARER_GHOST_INRANGE_MARGIN_X = 300
+"""射程内鬼目标被抢占所需的距离优势（像素）。
+
+原目标本帧漏检、但最后位置仍在射程内时，先当成"被特效挡住"保持锁定
+（TARGET_MISS_RETAIN_INRANGE_SECONDS）；只有可见新目标比它近至少 300px
+才允许抢占。跨侧另加 NEARER_CROSS_SIDE_EXTRA_X。"""
 
 NEARER_SWITCH_FRAMES = 3
 """更近的怪连续满足条件多少帧才真正切换（吸收 YOLO 单帧漏检/抖动）。"""
+
+NEARER_CROSS_SIDE_EXTRA_X = 150
+"""跨侧换目标的额外距离优势（像素）。
+
+当前锁定目标在角色面朝这一侧时，切到另一侧的目标必须先转身（约 0.25~0.4s
+停手）。因此跨侧抢占要求新目标再多近 150px（总优势 = 120 + 150），
+避免为了两只距离接近的怪反复转身；真正贴身的怪仍会抢占。"""
+
+SAMESIDE_PREFER_X = 300
+"""选怪时的"同侧优先"距离（像素）。
+
+朝向已知时，优先打面朝这一侧的同平台怪；另一侧的怪必须比同侧最近怪
+还近 150px 以上才会被选中——选背后的怪意味着转身（约 0.25~0.4s 停手），
+远一点的同侧怪用现有朝向直接就能打。朝向未知（_face_dir 为空）时不做
+同侧偏好，保持原来的"最近优先"。"""
 
 ROPE_SEARCH_RANGE_X = 200
 """搜索绳索的水平范围（像素）"""
@@ -227,8 +257,8 @@ FACE_TURN_X = 20
 #      "以为朝向对了、实际是反的"这个状态一直持续下去（日志里一条 [朝向]
 #      都没有，只能看到技能一直朝反方向放）。
 # 对策：
-#   · 转向单独占一帧（本帧不按技能键），方向键按住 120~200ms（不是短按）；
-#   · 攻击中定期重申一次朝向（2.5~4s 抖动），把被吞掉的转向自愈回来；
+#   · 转向单独占一帧（本帧不按技能键），方向键按住 120~180ms（不是短按）；
+#   · 攻击中定期重申一次朝向（4~6s 抖动），把被吞掉的转向自愈回来；
 #   · 用"角色有没有朝该方向动几像素"自检按键是否被游戏接收，没接收就提前重试；
 #   · 站定期间补发方向键 KEYUP，兜住"某次 KEYUP 丢失 → 角色一直朝一个方向走"。
 
@@ -236,26 +266,28 @@ TURN_TAP_MIN_SECONDS = 0.12
 """转向按住时长下限（秒）。press_key 是 30~90ms 的短按，实测容易被游戏吞掉；
 转向需要一次"明确的按住"，让 DirectInput 的按下状态稳定被游戏采样到。"""
 
-TURN_TAP_MAX_SECONDS = 0.20
+TURN_TAP_MAX_SECONDS = 0.18
 """转向按住时长上限（秒）。再长就是明显走动（一次约 5~15px）；转向键带一点
-位移属于冒险岛的正常操作（原地转头也会挪半步），不影响贴脸判定。"""
+位移属于冒险岛的正常操作（原地转头也会挪半步），不影响贴脸判定。
 
-TURN_MIN_GAP_SECONDS = 0.30
+上限从 0.20 收到 0.18：每次转向少阻塞约 20ms，配合下面的快速确认，
+整体转向耗时明显下降。"""
+
+TURN_MIN_GAP_SECONDS = 0.20
 """两次转向按键之间的最小间隔（秒）：目标左右横跳时防止每帧狂按方向键——
-每帧都变成"转向帧"会把技能全挤掉（实测 12:37:50~52 出现过 right→left→right）。"""
+每帧都变成"转向帧"会把技能全挤掉（实测 12:37:50~52 出现过 right→left→right）。
 
-TURN_REASSERT_MIN_SECONDS = 2.5
+从 0.30 收到 0.20：按键被吞后的重试/等间隔停手更短，减少技能空窗。"""
+
+TURN_REASSERT_MIN_SECONDS = 4.0
 """朝向重申间隔下限（秒）：攻击中即使认为朝向已正确，也隔这么久重申一次，
 用一次干净的转向按键把"可能已被吞掉"的朝向自愈回来。
 
-【为什么从 0.6~1.2 放宽到 2.5~4】重申点按是按住方向键 120~200ms，游戏里
-就是"朝面朝方向走 1~2 步"（约 15~25px）。旧间隔 ≈ 动画锁时长，导致几乎
-每次击退/攻击后锁一过期就跟着一次重申点按——角色一直在小幅前移（实测
-2026-10-06：一局 168 次"卡键漂移"救援、角色位置持续漂移）。自愈兜底
-放宽后，真实转向仍由生效自检 + 0.15~0.3s 快速重试保证，12 秒错向 bug
-依旧防得住（最多 4s 自愈）。"""
+【为什么放宽到 4~6】转向确认已改为"6px + 连续两帧/大幅位移立即确认"，
+一次性被吞的转向会被自检发现并 0.2s 内重试，不再依赖高频重申兜底；
+而每次重申都要占一帧不放技能。放宽后减少约 1/3 的转向帧，提升输出节奏。"""
 
-TURN_REASSERT_MAX_SECONDS = 4.0
+TURN_REASSERT_MAX_SECONDS = 6.0
 """朝向重申间隔上限（秒）：与下限之间随机取值，避免按键节奏完全规律。"""
 
 TURN_RETRY_MIN_SECONDS = 0.15
@@ -264,15 +296,43 @@ TURN_RETRY_MIN_SECONDS = 0.15
 TURN_RETRY_MAX_SECONDS = 0.30
 """自检判定"这次转向没被游戏接收"后的重试间隔上限（秒）。"""
 
-TURN_VERIFY_MIN_MOVE_X = 2
+TURN_VERIFY_MIN_MOVE_X = 6
 """转向生效自检：按下方向键后角色朝该方向水平位移 ≥ 此值（像素）视为生效。
 
 冒险岛里按一下方向键角色会挪几像素，所以"一点没动"基本等价于按键没被游戏
-接收（技能动画输入锁 / 按键丢失）。只作提示用：没生效就提前重试 + 打日志，
-不做硬性门禁——地形挡着走不动时也会"没动"，硬判会导致反复重试抢掉技能输出。"""
+接收（技能动画输入锁 / 按键丢失）。
+
+原值 2px 小于 YOLO 自身框的逐帧抖动（常见 3~10px）和被怪击退的位移，
+会把"没转成功"误判成成功 → _face_dir 写错且不再纠正，随后连续朝反方向打
+（10/25 21:36 现场）。提高到 6px 并要求连续两帧达标（见
+TURN_VERIFY_CONFIRM_HITS），避免单帧检测抖动误确认。"""
+
+TURN_VERIFY_CONFIRM_HITS = 2
+"""转向自检连续达标帧数：位移 ≥ TURN_VERIFY_MIN_MOVE_X 需连续满足此帧数
+才写入 _face_dir。
+
+单帧位置跳变（YOLO 框抖动/被击退一帧）不足以确认转向；真实转向后角色会
+持续保持在偏移位置，连续两帧达标才可信。"""
+
+TURN_VERIFY_FAST_MOVE_X = 12
+"""转向快速确认阈值（像素）：首帧位移 ≥ 此值时直接确认（1 帧即可）。
+
+转向点按本身会移动 12~20px，一次就达到 12px 基本不可能是检测抖动；
+用"6px 需连续两帧 / ≥12px 一帧即确认"的混合规则，大多数转向能少等一帧。
+取 12 而不是 10：YOLO 自身框单帧抖动偶见 10px，12px 以上才足够可信。"""
+
+TURN_VERIFY_MISSING_GRACE_SECONDS = 0.35
+"""自检期间自身定位丢失的额外等待时间（秒）。
+
+等待窗口内定位失败 → 本帧无法判断转向是否生效。多等这段时间让定位恢复；
+仍不恢复则丢掉这一轮待检（不写 _face_dir），由后续重试/盲点继续纠正。
+期间调用方禁止施法，避免朝未确认的朝向打。"""
 
 TURN_VERIFY_MAX_FAILS = 3
-"""连续自检失败上限：超过就退回正常重申间隔，避免一直重试抢掉技能输出。"""
+"""连续自检失败上限：仅用于日志限频（第 1 次和达到上限时各打一条）。
+
+纠正转向失败后始终按 TURN_RETRY 的短间隔重试，不再退回长间隔——严格模式
+下宁可停手等转向生效，也不朝旧方向施法。"""
 
 # =============================================================================
 # 攻击动画锁 + 换边防抖（实测 2026-10-05 被群怪围堵时的根因对策）
@@ -297,21 +357,32 @@ TURN_SIDE_CONFIRM_SECONDS = 0.2
 
 群怪分布在角色两侧时，"最近目标"每帧左右翻 → 每次翻边都转身会让角色原地
 狂转（转向键被动画吞掉 + 转向帧堵输出，实测 3 秒转 5 次、3 次白转）。
-防抖后瞬时翻边不转身（照常施法），稳定换边才转。
+防抖后瞬时翻边不转身、【也不施法】——严格执行"未确认朝向不出手"，
+避免朝旧方向空放（10/25 21:36/21:38 现场）。稳定换边才转。
 按 fps 换算成帧；朝向记忆为空（首次定位）时不防抖，立即转身。"""
 
-TURN_VERIFY_WAIT_SECONDS = 0.35
+TURN_VERIFY_WAIT_SECONDS = 0.15
 """自检等待时间（秒）：按下转向键后等这么久（≈一次按住 + 一帧）再判定是否生效。
 
+从 0.35 收到 0.15：方向键按住本身已阻塞 120~180ms，游戏早已处理完这次输入；
+下一帧的位置就是"按完后的位置"，不需要再等 0.35s。配合 ≥10px 一帧确认，
+转向确认耗时从约 0.6s 降到约 0.25~0.35s。
+
 等待期间如果"朝向确实与目标侧不符"，本帧不施法——对着反方向放技能等于白放，
-等转到位再打反而更划算。"""
+等转到位再打反而更划算。严格模式下本帧 / 本段等待都不会放技能。"""
 
-TURN_HOLD_MAX_SECONDS = 0.6
-"""连续"等转向"而不施法的最长时间（秒）。
+FACE_WAIT_LOG_SECONDS = 2.0
+"""朝向未确认而暂停施法时，等待告警的日志间隔（秒）。
 
-转向帧、等自检生效、等最小间隔这几段都会暂停施法（对着反方向打是白打）。
-但目标两侧每帧翻边的极端情况下，如果一直"等"，角色会完全不出手；
-超过此上限就恢复施法（宁可照当前朝向打一发），保证输出不会被转向饿死。"""
+严格模式下未确认就不出手，可能短暂停手；这条日志会带上已等待时长，
+便于现场判断是"按键被吞/定位丢失"还是彻底卡死。"""
+
+FACE_WAIT_COMMIT_SECONDS = 1.0
+"""目标侧持续抖动时的最长等待（秒）：超过就不再等"换边稳定"，直接朝当前侧转。
+
+严格模式会在目标左右翻边时停手避免反向施法；但如果两侧怪一直交替成为最近
+目标，不能无限停手。等待超过此时长后按当前目标侧发起转向（仍需自检确认
+后才施法），保证不会完全不出手。"""
 
 FACE_DIAG_LOG_FRAMES = 30
 """朝向自检日志间隔帧数（约 3 秒 @10fps）：把"朝向记忆 / 目标在哪侧 / 本窗口
@@ -534,13 +605,18 @@ class DecisionEngine:
         self._climb_exit_frames = 0               # 脱离绳索后横向走出的剩余帧数
         self._climb_log_count = 0                 # 攀爬日志限频计数
         self._attack_stale_counter = 0            # 锁定同一目标持续攻击的帧数（残影检测）
-        self._face_dir: Optional[str] = None      # 记忆的角色朝向（left/right），攻击前据此调整
+        # 角色朝向：只记录"已被游戏确认"的朝向（按键后实际位移验证过），
+        # 未确认的转向只存在 _turn_dir / _face_attempt_side 里，绝不写进来——
+        # 否则游戏吞掉转向键时会变成"以为转了、其实没转"（10/25 实测脱钩）。
+        self._face_dir: Optional[str] = None      # 已确认的角色朝向（left/right/None=未知）
         # ---- 转向（朝向）状态：与施法分帧 / 定期重申 / 生效自检 ----
         self._face_last_press_at = 0.0            # 上次发出转向按键的时间（最小间隔用）
         self._face_next_assert = 0.0              # 下次允许"重申朝向"的时间
+        self._face_attempt_side: Optional[str] = None  # 正在纠正的目标侧（None=无未确认转向）
         self._turn_dir: Optional[str] = None      # 待自检的转向方向（None=无待检）
         self._turn_time = 0.0                     # 发出该转向的时间
         self._turn_x0: Optional[int] = None       # 发出转向时的角色 x（位移自检基准）
+        self._turn_verify_hits = 0                # 转向自检连续达标帧数（≥2 才确认）
         self._face_verify_fails = 0               # 连续自检失败次数（决定是否提前重试）
         self._face_assert_count = 0               # 本日志窗口内转向次数
         self._face_unverified_count = 0           # 本日志窗口内自检未生效次数
@@ -549,7 +625,8 @@ class DecisionEngine:
         self._stand_drift_dir = 0                 # 漂移方向（±1，0=无）
         self._stand_drift_frames = 0              # 连续同向漂移帧数
         self._stuck_release_at = 0.0              # 上次补发方向键 KEYUP 的时间
-        self._face_hold_since = 0.0               # 本段"等转向不施法"的起始时间（0=未在等）
+        self._face_wait_since = 0.0               # 本段"朝向未确认暂停施法"的起始时间（0=未在等）
+        self._face_wait_log_at = 0.0              # "暂停施法等待朝向"日志限频
         self._face_edge_skip_log_at = 0.0          # "前方无地板跳过转向"日志限频
         # ---- 攻击动画锁 + 换边防抖 ----
         self._attack_busy_until = 0.0             # 动画锁截止时刻（此前不发攻击/击退/转向键）
@@ -595,9 +672,11 @@ class DecisionEngine:
         self._face_dir = None
         self._face_last_press_at = 0.0
         self._face_next_assert = 0.0
+        self._face_attempt_side = None
         self._turn_dir = None
         self._turn_time = 0.0
         self._turn_x0 = None
+        self._turn_verify_hits = 0
         self._face_verify_fails = 0
         self._face_assert_count = 0
         self._face_unverified_count = 0
@@ -606,7 +685,8 @@ class DecisionEngine:
         self._stand_drift_dir = 0
         self._stand_drift_frames = 0
         self._stuck_release_at = 0.0
-        self._face_hold_since = 0.0
+        self._face_wait_since = 0.0
+        self._face_wait_log_at = 0.0
         self._face_edge_skip_log_at = 0.0
         self._attack_busy_until = 0.0
         self._face_need_side = None
@@ -1100,7 +1180,7 @@ class DecisionEngine:
 
         核心：每次攻击前判定怪物相对角色的方位（看怪中心 x 的符号），
         只要怪在角色背后就按方向键转身——先扭头再攻击，避免朝反方向
-        空打。转向走 _face_step（按住 120~200ms + 定期重申 + 生效自检，
+        空打。转向走 _face_step（按住 120~180ms + 定期重申 + 生效自检，
         理由见该方法说明），因此【转向那一帧不放技能】。
         转身会让角色朝怪移动一小步，因此两个例外【不转向】:
           - 角色已与怪身体重叠/极近（edge_dx ≤ MELEE_FACE_DEADZONE_X）：
@@ -1187,17 +1267,23 @@ class DecisionEngine:
         """朝 direction 按住一小段（转向专用，同步阻塞）。
 
         与 press_key 的区别：press_key 是 30~90ms 的随机短按，且按下/抬起之间
-        还会被同帧的技能键抢走采样窗口；这里按住 120~200ms，让游戏稳稳吃到
+        还会被同帧的技能键抢走采样窗口；这里按住 120~180ms，让游戏稳稳吃到
         这次方向输入（游戏会忽略攻击动画期间的按键，见模块顶部说明）。
 
         Returns:
             实际按住的秒数；0 表示按键没发出去（键无效/窗口未锁定）。
         """
+        # 先强制释放左右两个方向键：上一次 KEYUP 若被游戏漏采，游戏侧会一直
+        # 按住反向键，反向键会盖掉这次点按（实测 10/25 13:52 左转连续 3 次
+        # 不生效、角色被带着往右走）。KEYUP 不会改变游戏内朝向，补发是安全的。
+        self._force_release_directions()
         seconds = random.uniform(TURN_TAP_MIN_SECONDS, TURN_TAP_MAX_SECONDS)
         if not self.executor.key_down(direction):
             return 0.0
         time.sleep(seconds)
         self.executor.key_up(direction)
+        # 再补一次 force KEYUP：本次 KEYUP 同样可能丢，丢了就会变成卡键漂移
+        self.executor.key_up(direction, force=True)
         # 点按本身会让角色朝该方向挪几像素（预期行为），短暂抑制漂移检测，
         # 避免被"无按键却持续漂移"卡键兜底误判（实测一局误触发 15 次）
         self._drift_suppress_until = time.time() + 0.5
@@ -1208,6 +1294,7 @@ class DecisionEngine:
         self._turn_dir = None
         self._turn_time = 0.0
         self._turn_x0 = None
+        self._turn_verify_hits = 0
 
     def _face_note_movement(self, direction: str):
         """按住方向键移动已真实改变朝向 → 清自检、推迟下一次重申。
@@ -1216,6 +1303,7 @@ class DecisionEngine:
         移动期间不需要重申，否则每走一步就打一次转向按键。
         """
         self._face_clear_pending()
+        self._face_attempt_side = None
         self._face_verify_fails = 0
         self._face_next_assert = time.time() + random.uniform(
             TURN_REASSERT_MIN_SECONDS, TURN_REASSERT_MAX_SECONDS)
@@ -1223,31 +1311,82 @@ class DecisionEngine:
     def _face_settle(self, ctx: Context) -> bool:
         """判定上一轮转向按键是否被游戏接收（用"角色有没有朝该方向动几像素"）。
 
+        【只有生效的转向才算朝向】_face_dir 只在这里（以及真实移动时）写入；
+        按出方向键时不再乐观地改记忆。游戏吞键时 _face_dir 保持旧值 →
+        调用方（_face_step）会继续暂停施法并按间隔重试，而不是朝旧方向打。
+
+        【防误确认】位移需连续 TURN_VERIFY_CONFIRM_HITS 帧达到
+        TURN_VERIFY_MIN_MOVE_X(6px) 才确认——单帧 YOLO 框抖动/被击退一帧
+        不会再被误判成"转向成功"（10/25 21:36 现场：2px 阈值下记忆=left、
+        实际朝 right，随后十几秒没有纠正）。
+
+        【定位丢失】自检期间没定位 → 先额外等一会儿；仍不恢复就丢掉待检状态
+        （不写 _face_dir），返回 True 让调用方继续停手，等定位恢复后重试。
+
         Returns:
-            True 表示"仍在等待生效"（此时若朝向确实与目标侧不符，本帧不施法）。
+            True 表示"仍在等待/无法判定生效"（调用方在朝向与目标侧不符时
+            必须暂停施法）。
         """
         if self._turn_dir is None or self._turn_x0 is None:
             return False
         if ctx.self_position is None:
-            return False      # 本帧没定位 → 自检不了，不扣分，等下一帧
+            # 本帧没定位 → 无法判断这次转向是否生效。先多等一会儿让定位恢复；
+            # 仍不恢复就丢掉待检状态（不写 _face_dir），后续由重试/盲点继续纠正。
+            if time.time() - self._turn_time \
+                    < TURN_VERIFY_WAIT_SECONDS + TURN_VERIFY_MISSING_GRACE_SECONDS:
+                return True
+            direction = self._turn_dir
+            self._face_clear_pending()
+            self._face_verify_fails += 1
+            self._face_unverified_count += 1
+            self._log_face_wait(f"转向 {direction} 无法确认（自身定位丢失）")
+            return True
         dx = ctx.self_position[0] - self._turn_x0
         moved = dx if self._turn_dir == "right" else -dx
         if moved >= TURN_VERIFY_MIN_MOVE_X:
-            # 生效：方向键被游戏接收（游戏内朝向此时已置为该侧）
-            self._face_clear_pending()
-            self._face_verify_fails = 0
-            return False
+            self._turn_verify_hits += 1
+            # 大幅位移（≥10px）一帧即确认；6~9px 的边界情况仍要连续两帧，
+            # 防止检测抖动误确认。多数转向点按会移动 10~20px，少等一帧。
+            need_hits = 1 if moved >= TURN_VERIFY_FAST_MOVE_X \
+                else TURN_VERIFY_CONFIRM_HITS
+            if self._turn_verify_hits >= need_hits:
+                # 生效：方向键被游戏接收（游戏内朝向此时已置为该侧）→ 写入记忆
+                old = self._face_dir
+                self._face_dir = self._turn_dir
+                self._face_attempt_side = None
+                self._face_clear_pending()
+                self._face_verify_fails = 0
+                self._face_next_assert = time.time() + random.uniform(
+                    TURN_REASSERT_MIN_SECONDS, TURN_REASSERT_MAX_SECONDS)
+                if old != self._face_dir:
+                    self._log(
+                        f"[朝向] 转向 {self._face_dir} 已确认生效"
+                        f"（位移 {moved}px / {self._turn_verify_hits} 帧）"
+                    )
+                return False
+            return True       # 边界位移，再等一帧确认；期间不施法
+        self._turn_verify_hits = 0
         if time.time() - self._turn_time < TURN_VERIFY_WAIT_SECONDS:
             return True       # 还没到判定时刻（按住本身也有时长），再等一帧
         # 判定：一点没动 → 这次按键大概率被吞了（技能动画输入锁/按键丢失）
         direction = self._turn_dir
+        was_assert = direction == self._face_dir   # 重申（朝向本已确认）失败
         self._face_clear_pending()
         self._face_verify_fails += 1
         self._face_unverified_count += 1
+        if was_assert:
+            # 重申只是健康检查：点按被吞不代表朝向错了。稍后重试即可。
+            self._face_next_assert = time.time() + random.uniform(
+                TURN_RETRY_MIN_SECONDS, TURN_RETRY_MAX_SECONDS)
+        elif self._held_key is None:
+            # 纠正朝向失败：顺手补发左右 KEYUP，清掉可能卡住的反向键
+            # （卡住的反向键会持续盖掉左/右转向点按）。
+            self._force_release_directions()
         if self._face_verify_fails in (1, TURN_VERIFY_MAX_FAILS):
             self._log(
-                f"[朝向] 转向 {direction} 疑似未被游戏接收"
-                f"（角色未朝该方向移动），提前重试"
+                f"[朝向] 转向 {direction} 未被游戏接收"
+                f"（角色未朝该方向移动），"
+                f"{'稍后重申' if was_assert else '暂停施法并重试'}"
                 f"（连续第 {self._face_verify_fails} 次）"
             )
         return False
@@ -1263,8 +1402,11 @@ class DecisionEngine:
             return
         self._face_diag_frames = 0
         side = "右" if target.center[0] > sx else "左"
+        memory = self._face_dir or "未知"
+        if self._face_attempt_side is not None and self._face_attempt_side != self._face_dir:
+            memory += f"(未确认→{self._face_attempt_side})"
         self._log(
-            f"[朝向自检] 朝向记忆={self._face_dir or '未知'} 目标在{side}"
+            f"[朝向自检] 朝向记忆={memory} 目标在{side}"
             f"(dx={target.center[0] - sx:+d}px) "
             f"近{FACE_DIAG_LOG_FRAMES}帧转向{self._face_assert_count}次"
             f"(自检未生效{self._face_unverified_count}次)"
@@ -1277,15 +1419,23 @@ class DecisionEngine:
         """攻击前的朝向处理：转向 / 定期重申 / 生效自检。
 
         【为什么转向要单独占一帧】游戏会忽略攻击动画期间的按键（代码在 buff
-        施法窗口里已经用到这条结论）。原来转向键和技能键挤在同一帧按、还是
-        30~90ms 短按，很容易被吞；被吞之后 _face_dir 已被写成"目标那侧"，
-        于是 need == _face_dir，代码再也不按方向键 → 一直朝反方向放技能
-        （实测连续 12 秒，日志里一条 [朝向] 都没有）。
+        施法窗口里已经用到这条结论）。转向键和技能键挤在同一帧按、还是
+        30~90ms 短按，很容易被吞，所以转向单独占一帧、按住 120~180ms。
 
-        【定期重申】即使认为朝向正确，也每 TURN_REASSERT(2.5~4s 抖动) 重申
+        【记忆只记"已确认"的朝向】按出方向键时不再乐观地把 _face_dir 改成
+        目标侧：只有自检到角色真的朝该方向移动（或按住移动）才写入。游戏吞键
+        时 _face_dir 保持旧值 → 这里会继续暂停施法并按 0.2s 间隔重试，直到
+        转成为止；不会出现"以为转了、其实没转，然后连续朝反方向打"（10/25
+        13:52 现场：记忆=left、画面朝 right，连续 14 秒攻击打向反侧）。
+
+        【定期重申】即使认为朝向正确，也每 TURN_REASSERT(4~6s 抖动) 重申
         一次：一次被吞掉的转向最多 4 秒就自愈，不会长期错向。
         重申点按会朝面朝方向走 1~2 步，所以有近身威胁时跳过（避免往贴身怪
         身上撞），并把计时器往后推一个完整间隔。
+
+        【唯一放行条件】只有"朝向已确认且与目标侧一致"（或目标在正上方死区）
+        才返回 False 允许施法。未确认 / 正在纠正 / 目标刚翻边 / 自身未定位
+        一律返回 True 停手：宁可少打几发，也不朝反方向空放（10/25 现场）。
 
         Args:
             ctx:         当前帧感知数据
@@ -1294,44 +1444,50 @@ class DecisionEngine:
                          目标期间传 False——那些场景按方向键会朝怪迈步、穿怪身体。
 
         Returns:
-            True  → 本帧不要施法（正在转向，或正在等上一次转向生效）
-            False → 朝向无需处理，调用方照常放技能
+            True  → 本帧不要施法（正在转向，或朝向未确认）
+            False → 朝向已确认且无需处理，调用方照常放技能
         """
         hold = self._face_step_inner(ctx, target, allow_press)
         if not hold:
-            self._face_hold_since = 0.0   # 恢复施法 → 停手计时复位
+            self._face_wait_since = 0.0   # 恢复施法 → 等待计时复位
         return hold
 
-    def _face_hold_now(self) -> bool:
-        """记一次"本帧不施法"，并保证停手不超过 TURN_HOLD_MAX_SECONDS。
-
-        Returns:
-            True 继续等（本帧不施法）；False 已等太久 → 恢复施法。
-        """
+    def _log_face_wait(self, reason: str):
+        """朝向未确认而暂停施法时，限频打一条带已等待时长的日志。"""
         now = time.time()
-        if self._face_hold_since <= 0.0:
-            self._face_hold_since = now
-        return now - self._face_hold_since < TURN_HOLD_MAX_SECONDS
+        if self._face_wait_since <= 0.0:
+            self._face_wait_since = now
+        if now - self._face_wait_log_at < FACE_WAIT_LOG_SECONDS:
+            return
+        self._face_wait_log_at = now
+        self._log(
+            f"[朝向] {reason}，暂停施法等待朝向确认"
+            f"（已等待 {now - self._face_wait_since:.1f}s）"
+        )
 
     def _face_step_inner(self, ctx: Context, target: Detection,
                          allow_press: bool = True) -> bool:
         """_face_step 的实现体（返回值语义见 _face_step）。"""
         if self._is_stand_mode() or target is None:
             self._face_clear_pending()
+            self._face_attempt_side = None
             return False
         if not allow_press:
             self._face_clear_pending()
+            self._face_attempt_side = None
             return False
         foot = self._effective_self_pos(ctx)
         if foot is None:
-            return False      # 定位不到就不按方向键（会朝错方向乱走）
+            # 连最后已知位置都没有 → 无法判断目标在哪侧，不盲打（等定位恢复）
+            self._log_face_wait("无法定位自身")
+            return True
         sx = foot[0]
         need = self._face_needed(sx, target)
 
         # ---- 换边防抖：统计"需要的朝向"已连续保持多少帧 ----
         # 群怪分布在角色两侧时最近目标每帧左右翻，每次翻边都转身 = 原地狂转
         # （转向键被动画吞 + 转向帧堵输出，实测 3 秒转 5 次、3 次白转）。
-        # 瞬时翻边不转（照常施法），新侧稳定满 TURN_SIDE_CONFIRM_SECONDS 才转。
+        # 瞬时翻边不转、也不施法；新侧稳定满 TURN_SIDE_CONFIRM_SECONDS 才转。
         if need == self._face_need_side:
             self._face_need_frames += 1
         else:
@@ -1347,17 +1503,46 @@ class DecisionEngine:
         if need is None:
             return False      # 目标近似正上方/重叠：保持朝向，正常施法
 
-        # 朝向确实不符时，等转向生效期间不施法：对着反方向放技能等于白放
+        # 本帧无法自检（自身定位丢失）：绝不能朝未确认的朝向施法。
+        # 按最小间隔盲点一下方向键（可能被游戏接收），等定位恢复后再核实。
+        if ctx.self_position is None:
+            if need != self._face_dir:
+                if now >= self._face_last_press_at + TURN_MIN_GAP_SECONDS \
+                        and self._floor_ahead(ctx, sx, foot[1], need,
+                                              MICRO_MOVE_EDGE_LOOKAHEAD_X):
+                    self._turn_tap(need)
+                    self._face_last_press_at = time.time()
+                    self._face_assert_count += 1
+                    # 盲点无法自检：实际朝向已不可信 → 标记未知，
+                    # 定位恢复后必须重新转向并确认，绝不沿用旧记忆施法。
+                    self._face_dir = None
+                self._log_face_wait("自身未定位")
+                return True
+            return False
+
+        # 上一轮转向还在等判定：严格禁止施法，等确认/失败重试。
         if settling and need != self._face_dir:
-            return self._face_hold_now()
+            self._log_face_wait("转向未确认")
+            return True
+
+        # 目标回到"已确认朝向"这一侧、且没有待检转向 → 之前那次纠正作废
+        # （否则 _face_attempt_side 会一直挂着，击退等方向性动作被永久拦掉）。
+        if need == self._face_dir and self._turn_dir is None:
+            self._face_attempt_side = None
 
         # ---- 2) 判断要不要（重新）按方向键 ----
         if need != self._face_dir:
             if self._face_dir is None \
-                    or self._face_need_frames >= self._frames(TURN_SIDE_CONFIRM_SECONDS):
-                need_press = True          # 朝向不符（且换边已稳定/首次定位）→ 转
+                    or self._face_need_frames >= self._frames(TURN_SIDE_CONFIRM_SECONDS) \
+                    or (self._face_wait_since > 0
+                        and now - self._face_wait_since >= FACE_WAIT_COMMIT_SECONDS):
+                # 朝向不符（换边已稳定 / 首次定位），或目标侧抖动太久
+                # （不能无限停手）→ 朝当前目标侧转
+                need_press = True
             else:
-                return False               # 瞬时翻边 → 不转，本帧照常施法
+                # 瞬时翻边 → 不转，也【不施法】（绝不朝旧方向空放）
+                self._log_face_wait("目标刚换边")
+                return True
         elif now >= self._face_next_assert:
             if self._nearest_knockback_threat(ctx, foot) is not None:
                 # 有近身威胁时跳过重申：重申点按 = 朝面朝方向走 1~2 步，
@@ -1374,30 +1559,30 @@ class DecisionEngine:
         if need_press:
             earliest = self._face_last_press_at + TURN_MIN_GAP_SECONDS
             if now < earliest:
-                # 最小间隔未到（目标左右横跳时防狂按，否则每帧都变成转向帧）
+                # 最小间隔未到：真需要转向就停手等（不朝旧方向打）；
+                # 只是重申 → 让路给施法，下一帧再说。
                 if need != self._face_dir:
-                    return self._face_hold_now()   # 真需要转向：等这段很短的间隔
-                need_press = False     # 只是重申 → 让路给施法，下一帧再说
+                    self._log_face_wait("等待转向最小间隔")
+                    return True
+                need_press = False
 
         if not need_press:
             return False
 
         # ---- 边缘安全：按一下方向键角色会朝那边迈几像素 ----
-        # 前方很近处没有地板（悬崖/平台边缘）时不按，宁可照当前朝向打一发，
-        # 也不为了转向掉下平台。前瞻距离按"一次转向的位移量级"取小值。
+        # 前方很近处没有地板（悬崖/平台边缘）时不按。此时也不施法——
+        # 朝向与目标侧不符，放技能等于朝反方向空放（宁可停手等目标移动）。
         if not self._floor_ahead(ctx, sx, foot[1], need,
                                  MICRO_MOVE_EDGE_LOOKAHEAD_X):
             self._face_next_assert = now + random.uniform(
                 TURN_REASSERT_MIN_SECONDS, TURN_REASSERT_MAX_SECONDS)
-            if now - self._face_edge_skip_log_at >= 2.0:
-                self._face_edge_skip_log_at = now
-                self._log(
-                    f"[朝向] {need} 侧前方无地板，跳过转向（防落崖），"
-                    f"按当前朝向攻击"
-                )
-            return False
+            if need == self._face_dir:
+                # 只是定期重申，朝向本来就对 → 跳过点按，照常施法
+                return False
+            self._log_face_wait(f"{need} 侧前方无地板，跳过转向")
+            return True
 
-        # ---- 3) 转向：按住 120~200ms，本帧不施法 ----
+        # ---- 3) 转向：按住 120~180ms，本帧不施法 ----
         seconds = self._turn_tap(need)
         if seconds <= 0:
             # 按键根本没发出去（键无效/窗口未锁定）→ 绝不能更新 _face_dir，
@@ -1405,30 +1590,41 @@ class DecisionEngine:
             self._log("[朝向] 转向按键发送失败，保持原朝向")
             self._face_next_assert = now + random.uniform(
                 TURN_RETRY_MIN_SECONDS, TURN_RETRY_MAX_SECONDS)
-            return False
+            if need == self._face_dir:
+                return False    # 只是重申失败，朝向本身正确 → 照常施法
+            self._log_face_wait("转向按键发送失败")
+            return True
 
-        changed = need != self._face_dir
-        self._face_dir = need
-        # 计时基准取"按住结束"的时刻：下一秒重申间隔、最小间隔、生效自检
-        # 等待窗口都从按键真正发出之后开始算（按住本身要 120~200ms）。
+        # 纠正（need 与已确认朝向不符）才登记为"未确认转向"；重申不登记。
+        # 【关键】这里绝不写 _face_dir：还没被游戏确认，写了就会变成
+        # "以为转了、其实没转"（10/25 13:52 连续 14 秒朝反方向打的根因）。
+        # 只有 _face_settle 自检到实际位移（或按住移动）才写入记忆。
+        is_correction = need != self._face_dir
+        started = is_correction and need != self._face_attempt_side
+        if is_correction:
+            self._face_attempt_side = need
+        # 计时基准取"按住结束"的时刻：下一次重申间隔、最小间隔、生效自检
+        # 等待窗口都从按键真正发出之后开始算（按住本身要 120~180ms）。
         pressed_at = time.time()
         self._face_last_press_at = pressed_at
         self._face_assert_count += 1
         self._turn_dir = need
         self._turn_time = pressed_at
         self._turn_x0 = ctx.self_position[0] if ctx.self_position else None
-        # 下一次重申：自检连续失败 → 提前重试（超过上限退回正常间隔，别抢输出）
-        if 0 < self._face_verify_fails < TURN_VERIFY_MAX_FAILS:
+        self._turn_verify_hits = 0       # 新一轮转向：重新累计达标帧数
+        # 纠正转向失败 → 始终按短间隔重试（严格模式下不靠"恢复施法"兜底）；
+        # 重申只是健康检查 → 用正常重申间隔。
+        if is_correction:
             self._face_next_assert = pressed_at + random.uniform(
                 TURN_RETRY_MIN_SECONDS, TURN_RETRY_MAX_SECONDS)
         else:
             self._face_next_assert = pressed_at + random.uniform(
                 TURN_REASSERT_MIN_SECONDS, TURN_REASSERT_MAX_SECONDS)
-        if changed:
+        if started:
             self._log(
                 f"[朝向] 怪物在{'右' if need == 'right' else '左'}"
                 f"(dx={target.center[0] - sx:+d}px)，按住 {need} "
-                f"{seconds * 1000:.0f}ms 转向（本帧只转向不施法）"
+                f"{seconds * 1000:.0f}ms 转向（未确认前暂停施法）"
             )
         return True
 
@@ -1587,7 +1783,8 @@ class DecisionEngine:
         保持条件（全部满足）：
           1. 长手且处于战斗中（ATTACKING/CHASING/HEALING/RECOVERING）
           2. 最后已知位置与角色同平台、水平距离 ≥ OCCLUSION_RETREAT_X（远程，非贴脸）
-          3. 连续漏检未超 TARGET_MISS_RETAIN_SECONDS（按 fps 换算）
+          3. 连续漏检未超保持时间：射程内目标 1.0s（技能特效遮挡居多），
+             射程外目标 0.5s（可能已死/走远）；均按 fps 换算成帧
         贴脸漏检(dx < OCCLUSION_RETREAT_X)由 _handle_long_range_occlusion 后撤处理。
         """
         if getattr(self.config, "attack_type", "long") == "short":
@@ -1596,8 +1793,6 @@ class DecisionEngine:
             return None
         if not self._in_combat():
             return None
-        if self._target_miss_frames >= self._frames(TARGET_MISS_RETAIN_SECONDS):
-            return None
         foot = self._effective_self_pos(ctx)
         if foot is None:
             return None
@@ -1605,8 +1800,14 @@ class DecisionEngine:
         t = self._target_monster
         if abs(sy - (t.y + t.h)) > getattr(self.config, "attack_range_y", 60):
             return None  # 跨层 → 非特效遮挡
-        if abs(sx - t.center[0]) < OCCLUSION_RETREAT_X:
+        dist = abs(sx - t.center[0])
+        if dist < OCCLUSION_RETREAT_X:
             return None  # 贴脸 → 交给后撤逻辑
+        # 射程内目标多半只是被特效挡住 → 保持更久；射程外（可能已死/走远）保持 0.5s。
+        retain_seconds = TARGET_MISS_RETAIN_INRANGE_SECONDS \
+            if dist <= self._get_attack_range() else TARGET_MISS_RETAIN_SECONDS
+        if self._target_miss_frames >= self._frames(retain_seconds):
+            return None
         self._target_miss_frames += 1
         # 漏检保持是"继续对着最后位置打"，日志缺失时完全看不出角色在打空气
         # （本次朝向问题排查时就是因为这条被注释掉而绕了远路）→ 每个漏检
@@ -1638,12 +1839,14 @@ class DecisionEngine:
         """锁定目标不合适时，改打"更近 / 真实可见"的同层怪（带防抖）。
 
         两类情况（都只处理长手；近战贴脸由 _handle_melee 自己判定）：
-          1. 锁定目标本帧已漏检（画面里没有它），而另一只同层怪可见且在
-             攻击距离内 → 不追"鬼目标"，改打真实可见的怪。
-          2. 锁定目标可见，但：
-             - 它在射程外，新怪在射程内，且新怪至少近 NEARER_SWITCH_MARGIN_X
-             - 或新怪进到 NEARER_CLOSE_X 内，且比锁定目标至少近
-               NEARER_SWITCH_MARGIN_X（身边的怪优先）
+          1. 锁定目标本帧漏检：
+             - 最后位置仍在射程内（多半是技能特效遮挡）→ 保持期内先信它，
+               只接受明显更近（≥NEARER_GHOST_INRANGE_MARGIN_X）的可见怪；
+               跨侧另加 NEARER_CROSS_SIDE_EXTRA_X，或新目标真正贴身
+               （≤NEARER_TRULY_CLOSE_X）且更近才转。
+             - 最后位置在射程外（可能已死/走远）→ 真实可见且在射程内的怪优先。
+          2. 锁定目标可见：新怪明显更近才抢；跨侧需要更大优势，只有真正贴身
+             （≤NEARER_TRULY_CLOSE_X）且更近才值得转一次身。
 
         连续 NEARER_SWITCH_FRAMES 帧指向同一只怪才切换，吸收 YOLO 单帧
         漏检/抖动，避免两个距离接近的怪左右来回换目标。
@@ -1668,8 +1871,15 @@ class DecisionEngine:
         locked_visible = any(self._is_same_monster(locked, m) for m in ctx.monsters)
         locked_dist = abs(sx - locked.center[0])
 
-        best = None
-        best_dist = float("inf")
+        # 候选也按"同侧优先"分组：背后怪即使更近一点，也要先让给面朝侧的怪
+        # （转身停手 0.25~0.4s）。同侧怪在射程内且没有明显更近的跨侧怪时，
+        # 一律考虑同侧怪。
+        facing_known = self._face_dir in ("left", "right")
+        facing_right = self._face_dir == "right"
+        same_best = None
+        same_dist = float("inf")
+        cross_best = None
+        cross_dist = float("inf")
         for m in ctx.monsters:
             if self._is_same_monster(locked, m):
                 continue
@@ -1678,26 +1888,74 @@ class DecisionEngine:
             if not self._in_front(m, sx):
                 continue  # 站桩模式：只考虑朝向正前方
             d = abs(sx - m.center[0])
-            if d < best_dist:
-                best = m
-                best_dist = d
+            if not facing_known \
+                    or ((m.center[0] > sx) == facing_right):
+                if d < same_dist:
+                    same_best = m
+                    same_dist = d
+            elif d < cross_dist:
+                cross_best = m
+                cross_dist = d
+
+        attack_range = self._get_attack_range()
+        if same_best is not None and cross_best is not None:
+            cross_wins = cross_dist + SAMESIDE_PREFER_X < same_dist \
+                or (cross_dist <= attack_range < same_dist)
+            if cross_wins:
+                best, best_dist = cross_best, cross_dist
+            else:
+                best, best_dist = same_best, same_dist
+        elif same_best is not None:
+            best, best_dist = same_best, same_dist
+        else:
+            best, best_dist = cross_best, cross_dist
 
         if best is None:
             self._nearer_candidate = None
             self._nearer_frames = 0
             return None
 
-        if locked_visible:
-            # 可见目标只在"明显更近"时抢，避免抖动；且新目标要在射程内
-            ok = (best_dist + NEARER_SWITCH_MARGIN_X < locked_dist
-                  and best_dist <= attack_range)
+        # 跨侧换目标需要额外距离优势：当前锁定目标在面朝侧、新目标在另一侧时，
+        # 切过去必须先转身（约 0.25~0.4s 停手）。不额外加门槛的话，两只距离
+        # 接近的怪来回抢占会让角色反复转身、技能空窗明显（10/28 实测 315 次
+        # 转向/28 分钟）。跨侧只有"真正贴身且更近"或"优势足够大"才转。
+        facing = self._face_dir
+        cross_side = False
+        if facing in ("left", "right"):
+            facing_right = facing == "right"
+            cross_side = ((best.center[0] > sx) != facing_right) \
+                and ((locked.center[0] > sx) == facing_right)
+
+        locked_in_range = locked_dist <= attack_range
+        # 射程内鬼目标保持期内（多半是特效遮挡）→ 先信它，只有明显更近才抢
+        ghost_retaining = (not locked_visible and locked_in_range
+                           and self._target_miss_frames
+                           < self._frames(TARGET_MISS_RETAIN_INRANGE_SECONDS))
+
+        if ghost_retaining:
+            if cross_side:
+                ok = ((best_dist <= NEARER_TRULY_CLOSE_X
+                       and best_dist < locked_dist)
+                      or (best_dist <= attack_range
+                          and best_dist + NEARER_GHOST_INRANGE_MARGIN_X
+                          + NEARER_CROSS_SIDE_EXTRA_X < locked_dist))
+            else:
+                ok = (best_dist <= attack_range
+                      and best_dist + NEARER_GHOST_INRANGE_MARGIN_X < locked_dist)
+        elif not locked_visible:
+            # 原目标漏检且不在射程内（可能已死/走远）：真实可见且在射程内的怪优先
+            ok = best_dist <= attack_range
         else:
-            # 原目标已漏检：真实可见且在射程内的怪比追最后位置可靠。
-            # 但原目标最后位置本来就贴身（≤NEARER_CLOSE_X）时例外——
-            # 那多半是被角色自身/攻击特效挡住，切到远处的怪反而更差。
-            ok = (best_dist <= attack_range
-                  and (locked_dist > NEARER_CLOSE_X
-                       or best_dist + NEARER_SWITCH_MARGIN_X < locked_dist))
+            # 锁定目标可见：只在明显更近时抢；跨侧要求更高
+            if cross_side:
+                ok = ((best_dist <= NEARER_TRULY_CLOSE_X
+                       and best_dist < locked_dist)
+                      or (best_dist <= attack_range
+                          and best_dist + NEARER_SWITCH_MARGIN_X
+                          + NEARER_CROSS_SIDE_EXTRA_X < locked_dist))
+            else:
+                ok = (best_dist <= attack_range
+                      and best_dist + NEARER_SWITCH_MARGIN_X < locked_dist)
 
         if not ok:
             self._nearer_candidate = None
@@ -1858,18 +2116,21 @@ class DecisionEngine:
 
     def _pick_best_target(self, ctx: Context,
                           exclude: Optional[Detection] = None) -> Detection:
-        """选择离角色最近的【同平台】怪物。
+        """选择【同平台】怪物：朝向已知时同侧优先，否则取最近。
 
-        只打同平台的怪：角色脚底（名字中心）与怪物脚底（bbox 底部）
-        的垂直差 ≤ 垂直容差（attack_range_y，exe 界面"垂直容差px"）
-        才视为可攻击目标，距离只算水平方向：dx = |角色x - 怪物中心x|。
+        只打同平台的怪：角色脚底与怪物脚底（bbox 底部）的垂直差
+        ≤ 垂直容差（attack_range_y）才视为可攻击目标，距离只算水平方向。
         跨层怪物直接忽略（不爬绳/不跳跃/不追击），画面里没有同平台怪
         时返回 None，转探索等自己走到那一层再打。
+
+        【同侧优先】朝向已知（_face_dir 非空）时优先打面朝侧的怪：
+        选背后的怪 = 转身停手 0.25~0.4s。另一侧的怪必须比同侧最近怪
+        还近 SAMESIDE_PREFER_X(150px) 才会被选中。朝向未知时退化为
+        "最近优先"。
 
         说明：同平台必须用"脚底 vs 脚底"。若用"角色中心y vs 怪物bbox中心y"，
         高大怪物（如 150px 高）的中心点比角色中心高出 40~50px，
         超过 30px 容差 → 同平台的怪被误判为跨层 → 一直爬绳/跳跃/乱跑不攻击。
-        无法定位自身时回退为画面中最大的怪物。
 
         Args:
             ctx:     当前帧感知数据
@@ -1897,8 +2158,15 @@ class DecisionEngine:
         # 【只打同平台】仅考虑与角色在同一平台的怪物：
         # 脚底垂直差 ≤ 垂直容差（attack_range_y）。
         # 跨层怪物直接忽略——不爬绳不跳跃，等角色自己走到那层再打。
-        best = None
-        best_dist = float("inf")
+        # 【同侧优先】长手模式且朝向已知时优先打面朝侧的怪：换边意味着
+        # 转身停手，另一侧的怪必须明显更近（≥SAMESIDE_PREFER_X）才选它。
+        # 短手（近战）要跑过去贴脸，朝向随移动变化，不做同侧偏好。
+        facing = self._face_dir \
+            if getattr(self.config, "attack_type", "long") == "long" else None
+        same_best = None
+        same_dist = float("inf")
+        cross_best = None
+        cross_dist = float("inf")
         for m in monsters:
             mfoot = m.y + m.h  # 怪物脚底（bbox 底部）
             if not self._same_platform(player[1], mfoot):
@@ -1906,10 +2174,26 @@ class DecisionEngine:
             if not self._in_front(m, player[0]):
                 continue  # 站桩模式：只考虑朝向正前方的怪
             dx = abs(player[0] - m.center[0])
-            if dx < best_dist:
-                best = m
-                best_dist = dx
-        return best
+            same_side = (m.center[0] > player[0]) == (facing == "right") \
+                if facing in ("left", "right") else True
+            if same_side:
+                if dx < same_dist:
+                    same_best = m
+                    same_dist = dx
+            elif dx < cross_dist:
+                cross_best = m
+                cross_dist = dx
+
+        if same_best is not None and cross_best is not None:
+            attack_range = self._get_attack_range()
+            cross_wins = cross_dist + SAMESIDE_PREFER_X < same_dist \
+                or (cross_dist <= attack_range < same_dist)
+            if cross_wins:
+                # 跨侧怪明显更近 / 同侧超出射程而跨侧在射程内 → 值得转一次身
+                return cross_best
+        if same_best is not None:
+            return same_best
+        return cross_best
 
     # =========================================================================
     # 地板判定
@@ -2410,7 +2694,7 @@ class DecisionEngine:
 
         攻击前【每次】都判断怪物在角色左边还是右边，朝向不对就先转向再打。
         转向不再用 30~90ms 的 press_key 短按，而是走 _face_step：单独占一帧
-        （本帧不按技能键）、方向键按住 120~200ms，并按间隔重申 + 生效自检——
+        （本帧不按技能键）、方向键按住 120~180ms，并按间隔重申 + 生效自检——
         因为游戏会忽略攻击动画期间的按键，和技能键挤在同一帧的短按会被吞掉，
         被吞之后朝向记忆就会和游戏内朝向长期脱钩（实测连续 12 秒朝反方向放技能）。
 
@@ -3051,13 +3335,21 @@ class DecisionEngine:
             return False
         if self._attack_busy():
             return False      # 动画锁内发击退也会被游戏吞
-        # 刚按过转向、还没确认生效时先不击退：击退是有方向的技能，
-        # 朝着旧朝向放等于白放（等一下也就 0.35s）。
-        if self._turn_dir is not None and \
-                time.time() - self._turn_time < TURN_VERIFY_WAIT_SECONDS:
+        # 朝向必须已确认：未知 / 正在纠正（_face_attempt_side 未落地）/
+        # 正在等自检生效 → 一律不按。击退是有方向的技能，朝旧朝向放等于白放。
+        if self._face_dir not in ("left", "right"):
+            return False
+        if self._face_attempt_side is not None \
+                and self._face_attempt_side != self._face_dir:
+            return False
+        if self._turn_dir is not None:
             return False
         dx = abs(target.center[0] - sx)
         if dx >= conf["range"]:
+            return False
+        # 目标必须已在面朝的那一侧：换边防抖窗口内目标刚翻边、角色还没转过去，
+        # 此时放击退等于朝反方向空放。
+        if (target.center[0] > sx) != (self._face_dir == "right"):
             return False
         if not self.executor.press_key(conf["key"], conf["cooldown"]):
             return False      # 冷却中 / 按键无效 → 让普通技能照常输出

@@ -82,28 +82,44 @@ class OnnxDetector(Detector):
     """基于 onnxruntime 的 YOLO 检测器（无需 torch/ultralytics，体积 ~200MB vs ~700MB）。
 
     预处理:  letterbox resize → RGB → normalize → CHW → batch
-    后处理:  sigmoid scores → NMS → scale back to original frame
+    后处理: 原始预测做 NMS，已处理的端到端预测只过滤分数，再还原坐标。
 
     模型输出格式 (YOLOv8, end2end=False):
-      shape (1, 8, 8400)
-      8 = 4 (cx, cy, w, h in 640×640 pixel coords) + 4 (class logits: floor, monster, rope, player)
+      shape (1, 4 + 类别数, N)，如 3 类 640 输入为 (1, 7, 8400)
+      4 = cx, cy, w, h（输入尺寸像素坐标），其后为各类别分数；
+      类别名从模型元数据读取（floor / monster / rope / player）
+
+    也支持 YOLO26 端到端/内嵌 NMS 导出的 (1, N, 6)：
+      每行为 x1, y1, x2, y2, confidence, class_id，不重复做 NMS。
     """
 
-    def __init__(self, model_path: str, conf: float = 0.5, iou: float = 0.45):
+    def __init__(self, model_path: str, conf: float = 0.5, iou: float = 0.45,
+                 intra_op_threads: int = 0):
         import onnxruntime as ort
-        self.session = ort.InferenceSession(model_path, providers=["CPUExecutionProvider"])
+        options = None
+        if intra_op_threads > 0:
+            options = ort.SessionOptions()
+            options.intra_op_num_threads = intra_op_threads
+            options.inter_op_num_threads = 1
+        self.session = ort.InferenceSession(model_path, sess_options=options,
+                                             providers=["CPUExecutionProvider"])
         self.conf = conf
         self.iou = iou
         self._path = model_path
 
         meta = self.session.get_modelmeta()
+        metadata = meta.custom_metadata_map or {}
+        self._end2end = str(metadata.get("end2end", "false")).lower() == "true"
         self._names = {0: "floor", 1: "monster", 2: "rope", 3: "player"}
-        if meta.custom_metadata_map:
-            import json
+        # ultralytics 导出的 names 是 Python 字典字面量（单引号），不是 JSON
+        raw = metadata.get("names")
+        if raw:
+            import ast
             try:
-                self._names = json.loads(meta.custom_metadata_map.get("names", "{}"))
-                self._names = {int(k): v for k, v in self._names.items()}
-            except (json.JSONDecodeError, ValueError):
+                names = ast.literal_eval(raw)
+                if isinstance(names, dict) and names:
+                    self._names = {int(k): str(v) for k, v in names.items()}
+            except (ValueError, SyntaxError):
                 pass
 
         self._input_name = self.session.get_inputs()[0].name
@@ -125,19 +141,25 @@ class OnnxDetector(Detector):
         dh = self._img_size - new_h
         pad_left, pad_top = dw // 2, dh // 2
         pad_right, pad_bottom = dw - pad_left, dh - pad_top
+        channels = 1 if frame.ndim == 2 else frame.shape[2]
         padded = cv2.copyMakeBorder(
             resized, pad_top, pad_bottom, pad_left, pad_right,
-            cv2.BORDER_CONSTANT, value=(114, 114, 114),
+            cv2.BORDER_CONSTANT, value=(114,) * channels,
         )
 
-        img = cv2.cvtColor(padded, cv2.COLOR_BGR2RGB)
+        # 4 通道（测谎形状先验模型，lie_shadow.with_prior）已经是网络看到的顺序，和训练时一样不换通道
+        img = cv2.cvtColor(padded, cv2.COLOR_BGR2RGB) if channels == 3 else padded
         img = img.astype(np.float32) / 255.0
         img = np.transpose(img, (2, 0, 1))
         img = np.expand_dims(img, 0)
         return img, (scale, pad_left, pad_top)
 
     def _postprocess(self, output, frame, scale, pad_left, pad_top):
-        """解析 YOLOv8 ONNX 输出，NMS 后返回 Detection 列表。"""
+        """区分原始 XYWH 输出和已处理的 XYXY 输出。"""
+        processed = (output.ndim == 3 and output.shape[-1] == 6
+                     and output.shape[1] != 6)
+        if getattr(self, "_end2end", False) or processed:
+            return self._postprocess_end2end(output, frame, scale, pad_left, pad_top)
         pred = output[0].T  # (7, 8400) → (8400, 7)
         boxes = pred[:, :4]   # (8400, 4)  cx, cy, w, h
         scores = pred[:, 4:]  # (8400, 3)  class scores
@@ -192,6 +214,34 @@ class OnnxDetector(Detector):
                 confidence=float(max_scores[i]),
                 x=int(x1[i]), y=int(y1[i]),
                 w=int(x2[i] - x1[i]), h=int(y2[i] - y1[i]),
+            ))
+        return dets
+
+    def _postprocess_end2end(self, output, frame, scale, pad_left, pad_top):
+        """解析已处理的 (1, N, 6)，同时保留不同实例的重叠框。"""
+        if output.ndim != 3 or output.shape[0] != 1 or output.shape[-1] != 6:
+            raise ValueError(f"不支持的端到端 ONNX 输出形状: {output.shape}")
+        pred = output[0]
+        finite = np.isfinite(pred).all(axis=1)
+        pred = pred[finite & (pred[:, 4] > self.conf)]
+        h, w = frame.shape[:2]
+        dets = []
+        for row in pred:
+            cls_id = int(row[5])
+            if cls_id < 0 or abs(float(row[5]) - cls_id) > 1e-4:
+                continue
+            x1, y1, x2, y2 = row[:4]
+            if x2 <= x1 or y2 <= y1:
+                continue
+            x1 = int(np.clip((x1 - pad_left) / scale, 0, w))
+            y1 = int(np.clip((y1 - pad_top) / scale, 0, h))
+            x2 = int(np.clip((x2 - pad_left) / scale, 0, w))
+            y2 = int(np.clip((y2 - pad_top) / scale, 0, h))
+            if x2 <= x1 or y2 <= y1:
+                continue
+            dets.append(Detection(
+                cls_name=self._names.get(cls_id, f"class_{cls_id}"),
+                confidence=float(row[4]), x=x1, y=y1, w=x2 - x1, h=y2 - y1,
             ))
         return dets
 
@@ -307,6 +357,14 @@ def create_detector(model_path: str, conf: float = 0.5,
     if not os.path.exists(model_path):
         log(f"[警告] 模型文件不存在: {model_path}，使用 Mock 检测器")
         return MockDetector()
+
+    # GitHub ZIP 下载 / 未执行 git lfs pull 时，模型只是一个百余字节的 LFS 指针文本
+    if os.path.getsize(model_path) < 1024:
+        with open(model_path, "rb") as f:
+            if f.read(64).startswith(b"version https://git-lfs"):
+                log(f"[警告] 模型文件是 Git LFS 指针而非真实模型: {model_path}，"
+                    f"请用 git clone + git lfs pull 获取，或自行训练。使用 Mock 检测器")
+                return MockDetector()
 
     path_lower = model_path.lower()
 

@@ -53,6 +53,7 @@ class MainWindow(QMainWindow):
     frame_signal = pyqtSignal(object, object, object, object, object)  # frame, detections, hp, mp, locked_target
     hotkey_signal = pyqtSignal()  # F12 触发
     lie_signal = pyqtSignal(float)  # 测谎弹窗命中（匹配得分）
+    lie_resume_signal = pyqtSignal()  # 测谎通过、打怪已自动恢复（复位按钮/静音报警）
 
     def __init__(self):
         super().__init__()
@@ -70,6 +71,7 @@ class MainWindow(QMainWindow):
             on_log=self.log_signal.emit,
             on_frame=self.frame_signal.emit,
             on_lie_detected=self.lie_signal.emit,
+            on_lie_resume=self.lie_resume_signal.emit,
         )
 
         # ---- 测谎报警状态 ----
@@ -86,6 +88,15 @@ class MainWindow(QMainWindow):
         self._poll_timer = QTimer(self)
         self._poll_timer.setInterval(50)
         self._poll_timer.timeout.connect(self._poll_stop_key)
+
+        # ---- F7 立即截屏热键轮询备份 ----
+        # 与启停热键同样的双通道：钩子 + GetAsyncKeyState 轮询。
+        self._shot_vk = 0x76            # VK_F7
+        self._shot_key_down = False     # 上一轮按下状态（做按下沿判定）
+        self._last_shot_time = 0.0      # 上次截屏时间（钩子/轮询去重用）
+        self._shot_poll_timer = QTimer(self)
+        self._shot_poll_timer.setInterval(50)
+        self._shot_poll_timer.timeout.connect(self._poll_screenshot_key)
 
         self._fps_counter = [0, time.time()]
         self._preview_timer = QTimer(self)
@@ -118,6 +129,7 @@ class MainWindow(QMainWindow):
         self.frame_signal.connect(self._on_frame)
         self.hotkey_signal.connect(self._toggle_run)
         self.lie_signal.connect(self._on_lie_detected)
+        self.lie_resume_signal.connect(self._on_lie_resume)
 
         # 报警横幅闪烁定时器（400ms 一次相位翻转）
         self._alarm_blink_timer = QTimer(self)
@@ -217,7 +229,10 @@ class MainWindow(QMainWindow):
         self.preview_once_btn.clicked.connect(self._on_preview_frame)
         ctl.addWidget(self.preview_once_btn)
         self.auto_shot_check = QCheckBox("自动截图")
-        self.auto_shot_check.setToolTip("开启后按右侧间隔截取游戏画面，保存到 train/data/raw/")
+        self.auto_shot_check.setToolTip(
+            "开启后按右侧间隔截取游戏画面，保存到 train/data/raw/\n"
+            "任何时候按 F7 可立即截一张（无需开启自动截图）"
+        )
         self.auto_shot_check.toggled.connect(self._on_toggle_auto_shot)
         ctl.addWidget(self.auto_shot_check)
         self.screenshot_interval_spin = QSpinBox()
@@ -999,7 +1014,24 @@ class MainWindow(QMainWindow):
             self._log("[截图] 自动截图已关闭")
 
     def _on_auto_screenshot_tick(self):
-        """截取当前锁定窗口画面，保存为 PNG 到 train/data/raw/。"""
+        """自动截图定时器回调：截取当前锁定窗口画面。"""
+        self._take_screenshot_once()
+
+    @pyqtSlot()
+    def _take_screenshot_once(self):
+        """截取当前锁定窗口画面，保存为 PNG 到 train/data/raw/。
+
+        自动截图定时器与 F7 热键共用；在这段去重窗口内只存一张，
+        避免一次按键被钩子、轮询各触发一次而存出两张重复图。
+        """
+        now = time.time()
+        if now - self._last_shot_time < self._SHOT_DEBOUNCE:
+            return
+        self._last_shot_time = now
+
+        if not self.automation.window_locked:
+            self._log("[截图] 未锁定游戏窗口，跳过一次截屏")
+            return
         try:
             frame = self.automation.capture.grab()
         except Exception as e:
@@ -1032,6 +1064,23 @@ class MainWindow(QMainWindow):
             "background-color:#27ae60;color:white;"
         )
         self.preview_once_btn.setEnabled(True)
+
+    def _set_running_ui(self):
+        """运行中的按钮/计时器状态（手动启动与测谎自动恢复共用）。"""
+        self.run_btn.setText("⏹ 停止")
+        self.run_btn.setStyleSheet(
+            "padding:10px;font-size:14px;font-weight:bold;"
+            "background-color:#c0392b;color:white;"
+        )
+        self._preview_timer.start(1000)
+        self.preview_once_btn.setEnabled(False)
+
+    @pyqtSlot()
+    def _on_lie_resume(self):
+        """测谎通过、打怪已自动恢复（工作线程回调）：静音报警 + 复位按钮。"""
+        self._ack_lie_alarm()
+        self._log("[测谎] 已自动恢复打怪")
+        self._set_running_ui()
 
     @pyqtSlot()
     def _toggle_run(self):
@@ -1089,13 +1138,7 @@ class MainWindow(QMainWindow):
             QMessageBox.warning(self, "启动失败", str(e))
             return
 
-        self.run_btn.setText("⏹ 停止")
-        self.run_btn.setStyleSheet(
-            "padding:10px;font-size:14px;font-weight:bold;"
-            "background-color:#c0392b;color:white;"
-        )
-        self._preview_timer.start(1000)
-        self.preview_once_btn.setEnabled(False)
+        self._set_running_ui()
 
     # ---------------- 测谎报警 ----------------
     #
@@ -1113,8 +1156,15 @@ class MainWindow(QMainWindow):
         self._stop_run()
 
         # 1) 主窗口横幅（闪烁 + 确认按钮）
+        # 若开了现场录屏，把时长一并显示，玩家知道这 30 秒会被完整录下。
+        rec_note = ""
+        if getattr(self.config, "lie_record_enabled", False):
+            secs = int(getattr(self.config, "lie_record_seconds", 30) or 0)
+            if secs > 0:
+                rec_note = f"，正在录屏 {secs}s"
         self.alarm_label.setText(
-            f"⚠ 测谎弹窗！已停机 —— 请立即切到游戏，用鼠标作答（score={score:.2f}）"
+            f"⚠ 测谎弹窗！已停机 —— 请立即切到游戏，用鼠标作答"
+            f"（score={score:.2f}）{rec_note}"
         )
         self.alarm_bar.setVisible(True)
         self._alarm_blink_on = False
@@ -1309,6 +1359,10 @@ class MainWindow(QMainWindow):
     # 不去重会 toggle 两次（停止后立刻又启动）＝看起来"按热键没反应"。
     _TOGGLE_DEBOUNCE = 0.25
 
+    # F7 截屏去重窗口（秒）：钩子与轮询可能各触发一次；也避免长按 F7 时
+    # 键盘自动重复把硬盘刷出一堆重复图。
+    _SHOT_DEBOUNCE = 0.3
+
     def _register_hotkey(self):
         key_name = self.config.start_stop_hotkey
 
@@ -1330,6 +1384,17 @@ class MainWindow(QMainWindow):
             self._log(
                 f"[热键] {key_name} 不在轮询表内（组合键？）→ 仅靠钩子触发"
             )
+
+        # ---- F7 立即截屏：同样的钩子 + 轮询双通道 ----
+        try:
+            import keyboard
+            keyboard.add_hotkey("f7", self._on_screenshot_hotkey)
+            self._log("[热键] 钩子已注册 F7（立即截屏）")
+        except Exception as e:
+            self._log(f"[热键] 钩子注册 F7 失败: {e}")
+        self._shot_key_down = False
+        self._shot_poll_timer.start()
+        self._log("[热键] 已启用 F7 轮询备份（立即截屏）")
 
     def _on_hotkey(self):
         """keyboard 钩子线程回调：显式排队到 GUI 线程执行 _toggle_run。
@@ -1364,6 +1429,29 @@ class MainWindow(QMainWindow):
             self._toggle_run()
         self._poll_key_down = down
 
+    # ---------------- F7 立即截屏热键 ----------------
+
+    def _on_screenshot_hotkey(self):
+        """keyboard 钩子回调（后台线程）→ 排队到 GUI 线程截屏。"""
+        QMetaObject.invokeMethod(self, "_take_screenshot_once", Qt.QueuedConnection)
+
+    def _poll_screenshot_key(self):
+        """轮询 F7 按下沿（GetAsyncKeyState），钩子失效时兜底。
+
+        轮询跑在 GUI 线程（QTimer），因此直接调用截屏方法即可。
+        """
+        try:
+            down = bool(
+                ctypes.windll.user32.GetAsyncKeyState(self._shot_vk) & 0x8000
+            )
+        except Exception:
+            self._shot_poll_timer.stop()   # 轮询不可用 → 停掉，仍靠钩子
+            return
+        if down and not self._shot_key_down:
+            self._log("[热键] F7 触发（轮询）")
+            self._take_screenshot_once()
+        self._shot_key_down = down
+
     # ---------------- 关闭 ----------------
     def closeEvent(self, event):
         # 先静音：报警音跑在独立线程里，不关会一直响到进程退出
@@ -1376,7 +1464,16 @@ class MainWindow(QMainWindow):
         except Exception:
             pass
         try:
+            self._shot_poll_timer.stop()
+        except Exception:
+            pass
+        try:
             self.automation.stop()
+        except Exception:
+            pass
+        # 测谎录屏线程是 daemon，直接退出进程会留下残缺视频 —— 先正常收尾
+        try:
+            self.automation.shutdown()
         except Exception:
             pass
         try:

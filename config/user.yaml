@@ -46,7 +46,7 @@ attack_lock_seconds: 0.4
 knockback_skill:
   name: 击退技能
   key: D
-  cooldown: 0.3
+  cooldown: 0.4
   range: 100
 stand_mode: false
 stand_facing: right
@@ -65,11 +65,19 @@ skills:
 buff_skills:
 - name: 无形箭
   key: '2'
-  cooldown: 200.0
+  cooldown: 300.0
 pickup_enabled: false
 pickup_key: z
 pickup_interval: 0.333
-screenshot_interval: 5
+screenshot_interval: 1
 lie_detect_enabled: true
 lie_detect_template: assets/templates/lie_detector.png
 lie_detect_threshold: 0.78
+lie_shadow_enabled: true
+lie_shadow_model: models/lie_target/best.onnx
+lie_shadow_conf: 0.1
+lie_shadow_takeover: true
+lie_shadow_end_frames: 15
+lie_shadow_max_seconds: 60
+lie_auto_resume: true
+lie_record_dir: logs/lie_detected

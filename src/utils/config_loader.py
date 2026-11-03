@@ -317,6 +317,30 @@ def _defaults() -> Dict[str, Any]:
         "lie_detect_enabled": True,
         "lie_detect_template": "assets/templates/lie_detector.png",
         "lie_detect_threshold": 0.78,  # 匹配得分阈值（实测正样本 0.96 / 普通帧最高 0.39）
+        # ---- 测谎小游戏自动作答（mxd-lie-logic-code 方案）----
+        # 命中弹窗停机后：LieRecorder 录画面+光标（60fps，影子跟踪结果写同目录），
+        # LieShadow 用形状匹配跟踪目标并接管鼠标（点一下左键才交还）；
+        # OCR 认出「成功通过」对话框后按 Esc 关掉并自动恢复打怪，没通过一直停着。
+        # 实现见 src/perception/lie_shadow.py（ShapeFinder）/ lie_detector_watch.py / lie_recorder.py。
+        "lie_shadow_enabled": True,
+        "lie_shadow_model": "models/lie_target/best.onnx",
+        "lie_shadow_conf": 0.1,
+        "lie_shadow_takeover": True,   # False=只算位置写日志，不动鼠标
+        "lie_shadow_end_frames": 15,   # 画板连续 N 帧不见 → 小游戏结束（15 帧≈1 秒）
+        "lie_shadow_max_seconds": 60,  # 录制+跟踪最长时长（秒）
+        "lie_auto_resume": True,       # 测谎通过后按 Esc 关对话框并自动恢复打怪
+        "lie_record_dir": "logs/lie_detected",  # 录制输出目录（相对路径基于程序目录）
+        # ---- 测谎影子跟踪 / 接管（mxd-lie-target 方案）----
+        # 画板出现后：找金色画板 → 藏准星 → 两帧对齐相减（+ 形状先验）→ YOLO26n 出框
+        # → 运动预测跟踪。图形淡出后靠"跟花纹动得不一样"和倒计时记下的剪影继续跟。
+        # 你没动鼠标时程序把鼠标移过去；一动就交还给你，这次测谎只录制。
+        # 实现与模型说明见 mxd-lie-target/docs/LIE_TARGET.md。
+        "lie_shadow_enabled": True,
+        "lie_shadow_model": "models/lie_target/best.onnx",
+        "lie_shadow_conf": 0.1,
+        "lie_shadow_takeover": True,   # False=只算位置写日志，不动鼠标
+        "lie_shadow_end_frames": 15,   # 画板连续 N 帧不见 → 判定小游戏结束（15 帧≈1 秒）
+        "lie_shadow_max_seconds": 60,  # 影子跟踪最长时长（秒），超时收手
     }
 
 
