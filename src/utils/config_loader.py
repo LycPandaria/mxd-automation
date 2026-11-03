@@ -75,9 +75,6 @@ YAML 配置字段说明
   range_split:      分界线在小地图宽度的什么位置 (0.0~1.0)，默认 0.5 = 正中间
   minimap_region:   小地图的地图部分（百分比 [x, y, w, h]，界面「框选小地图」写入）
   minimap_scale:    小地图 1px 对应画面多少 px（默认 16）
-  restock_enabled / restock_interval_min: 自动补飞镖开关 / 间隔（分钟）
-  restock_icon_x / restock_icon_y: 枫叶（冒险岛会员）图标位置（按 1920×1080 填写）
-  restock_horn_x / restock_horn_y: 灯泡下面的喇叭（点了展开/收起左侧图标栏），按 1920×1080 填写
   channel_enabled / channel_idle_min: 自动换频道开关 / 多少分钟没放过技能就换
   channel_hold_key / channel_hold_seconds: 换完按住哪个键 / 按多久（秒）
   exp_enabled:      打怪时记录经验（读状态栏的 EXP，每分钟一行写到 exp_log/日期.csv）
@@ -334,13 +331,6 @@ def _defaults() -> Dict[str, Any]:
         "range_split": 0.5,      # 分界线在小地图宽度的位置（0.5 = 正中间）
         "minimap_region": None,  # 小地图的地图部分（百分比 [x, y, w, h]，界面「框选小地图」写入）
         "minimap_scale": 16,     # 小地图 1px 对应画面多少 px
-        # ---- 自动补飞镖（去便捷杂货店充值）----
-        "restock_enabled": False,      # 每 restock_interval_min 分钟暂停打怪去补一次
-        "restock_interval_min": 30,    # 补飞镖间隔（分钟）
-        "restock_icon_x": 200,         # 左侧快捷图标里枫叶（冒险岛会员）的位置（按 1920×1080 填）
-        "restock_icon_y": 571,
-        "restock_horn_x": 32,          # 灯泡下面的喇叭（点了展开/收起左侧图标栏），按 1920×1080 填
-        "restock_horn_y": 571,
         # ---- 自动换频道 ----
         "channel_enabled": False,      # 这么久没放过技能（这层没怪了）就换一个频道
         "channel_idle_min": 3,         # 多少分钟没攻击就换

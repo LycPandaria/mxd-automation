@@ -169,11 +169,6 @@ class ActionExecutor:
         self._kb._activate_window()
         return self._mouse.real_double_click(x, y)
 
-    def real_move(self, x: int, y: int) -> bool:
-        """真实地把光标移到窗口客户区 (x, y)，不点击、不激活窗口；
-        游戏窗口不在前台返回 False。"""
-        return self._mouse.real_move(x, y)
-
     # =========================================================================
     # 重置
     # =========================================================================

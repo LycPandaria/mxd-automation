@@ -190,25 +190,6 @@ class MouseController:
     # 真实鼠标（游戏界面按钮只认系统全局输入）
     # =========================================================================
 
-    def real_move(self, x: int, y: int) -> bool:
-        """真实地把光标移到窗口客户区 (x, y)（SendInput 绝对移动，和手动挪鼠标一样有移动事件），不点击。
-
-        游戏窗口不在前台时不动、返回 False（不能在你切到别的窗口时乱挪鼠标）。
-        """
-        if not self._hwnd or user32.GetForegroundWindow() != self._hwnd:
-            return False
-        from .keyboard_controller import INPUT, _MOUSEINPUT, SendInput
-        pt = wintypes.POINT(int(x), int(y))
-        if not user32.ClientToScreen(self._hwnd, ctypes.byref(pt)):
-            return False
-        vx, vy = user32.GetSystemMetrics(76), user32.GetSystemMetrics(77)      # 虚拟桌面左上角
-        vw, vh = user32.GetSystemMetrics(78), user32.GetSystemMetrics(79)      # 虚拟桌面宽高
-        inp = INPUT(type=0, mi=_MOUSEINPUT(
-            dx=int(round((pt.x - vx) * 65535 / max(1, vw - 1))),
-            dy=int(round((pt.y - vy) * 65535 / max(1, vh - 1))), mouseData=0,
-            dwFlags=0x0001 | 0x8000 | 0x4000, time=0, dwExtraInfo=0))  # MOVE | ABSOLUTE | VIRTUALDESK
-        return SendInput(1, ctypes.byref(inp), ctypes.sizeof(INPUT)) == 1
-
     def real_click(self, x: int, y: int) -> bool:
         """真实鼠标左键点击：把光标移到窗口客户区 (x, y)，用 SendInput 按下/抬起。
 
