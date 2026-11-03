@@ -187,6 +187,78 @@ class MouseController:
         return True
 
     # =========================================================================
+    # 真实鼠标（游戏界面按钮只认系统全局输入）
+    # =========================================================================
+
+    def real_move(self, x: int, y: int) -> bool:
+        """真实地把光标移到窗口客户区 (x, y)（SendInput 绝对移动，和手动挪鼠标一样有移动事件），不点击。
+
+        游戏窗口不在前台时不动、返回 False（不能在你切到别的窗口时乱挪鼠标）。
+        """
+        if not self._hwnd or user32.GetForegroundWindow() != self._hwnd:
+            return False
+        from .keyboard_controller import INPUT, _MOUSEINPUT, SendInput
+        pt = wintypes.POINT(int(x), int(y))
+        if not user32.ClientToScreen(self._hwnd, ctypes.byref(pt)):
+            return False
+        vx, vy = user32.GetSystemMetrics(76), user32.GetSystemMetrics(77)      # 虚拟桌面左上角
+        vw, vh = user32.GetSystemMetrics(78), user32.GetSystemMetrics(79)      # 虚拟桌面宽高
+        inp = INPUT(type=0, mi=_MOUSEINPUT(
+            dx=int(round((pt.x - vx) * 65535 / max(1, vw - 1))),
+            dy=int(round((pt.y - vy) * 65535 / max(1, vh - 1))), mouseData=0,
+            dwFlags=0x0001 | 0x8000 | 0x4000, time=0, dwExtraInfo=0))  # MOVE | ABSOLUTE | VIRTUALDESK
+        return SendInput(1, ctypes.byref(inp), ctypes.sizeof(INPUT)) == 1
+
+    def real_click(self, x: int, y: int) -> bool:
+        """真实鼠标左键点击：把光标移到窗口客户区 (x, y)，用 SendInput 按下/抬起。
+
+        游戏的界面按钮（商店、会员窗口等）不一定认 PostMessage 发来的点击，
+        这里和按键一样走系统全局输入。调用前游戏窗口要在前台（ActionExecutor 会先激活）。
+        """
+        if not self._hwnd:
+            return False
+        from .keyboard_controller import INPUT, _MOUSEINPUT, SendInput
+        pt = wintypes.POINT(int(x), int(y))
+        if not user32.ClientToScreen(self._hwnd, ctypes.byref(pt)):
+            return False
+
+        def send(flags, dx=0, dy=0):
+            inp = INPUT(type=0, mi=_MOUSEINPUT(dx=dx, dy=dy, mouseData=0,
+                                               dwFlags=flags, time=0, dwExtraInfo=0))
+            SendInput(1, ctypes.byref(inp), ctypes.sizeof(INPUT))
+
+        # 用"真实的鼠标移动"把光标移过去：只 SetCursorPos 不产生移动事件，
+        # 有的游戏界面收不到悬停、点击无效
+        vx, vy = user32.GetSystemMetrics(76), user32.GetSystemMetrics(77)
+        vw, vh = user32.GetSystemMetrics(78), user32.GetSystemMetrics(79)
+        MOVE_ABS = 0x0001 | 0x8000 | 0x4000  # MOVE | ABSOLUTE | VIRTUALDESK
+        for ox in (2, 0):                    # 先移到旁边 2px 再移到目标，保证有一次移动
+            send(MOVE_ABS, int((pt.x + ox - vx) * 65535 / max(1, vw - 1)),
+                 int((pt.y - vy) * 65535 / max(1, vh - 1)))
+            time.sleep(0.03)
+        user32.SetCursorPos(pt.x, pt.y)
+        time.sleep(0.15)                     # 停一下，让游戏认到鼠标悬停在按钮上
+        send(0x0002)                         # LEFTDOWN
+        time.sleep(0.08)
+        send(0x0004)                         # LEFTUP
+        return True
+
+    def real_double_click(self, x: int, y: int) -> bool:
+        """真实鼠标左键双击窗口客户区 (x, y)。
+
+        连着两次 real_click 太慢（每次都要移动、悬停），游戏不一定认成双击。
+        """
+        if not self.real_click(x, y):
+            return False
+        from .keyboard_controller import INPUT, _MOUSEINPUT, SendInput
+        for flags in (0x0002, 0x0004):       # LEFTDOWN, LEFTUP
+            time.sleep(0.06)
+            inp = INPUT(type=0, mi=_MOUSEINPUT(dx=0, dy=0, mouseData=0,
+                                               dwFlags=flags, time=0, dwExtraInfo=0))
+            SendInput(1, ctypes.byref(inp), ctypes.sizeof(INPUT))
+        return True
+
+    # =========================================================================
     # 重置
     # =========================================================================
 

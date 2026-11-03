@@ -29,7 +29,7 @@ from PyQt5.QtWidgets import (
     QPushButton, QLabel, QLineEdit, QComboBox, QSlider, QGroupBox,
     QGridLayout, QTableWidget, QTableWidgetItem, QHeaderView,
     QPlainTextEdit, QCheckBox, QFileDialog, QMessageBox, QSplitter,
-    QAbstractItemView, QSpinBox, QDoubleSpinBox,
+    QAbstractItemView, QSpinBox, QDoubleSpinBox, QDialog, QSizePolicy,
 )
 from PyQt5.QtCore import Qt, QTimer, pyqtSignal, pyqtSlot, QMetaObject
 from PyQt5.QtGui import QImage, QPixmap
@@ -42,6 +42,7 @@ from src.perception.yolo_detector import create_detector
 from src.perception.hp_mp_detector import detect_region_color
 from src.main import Automation
 from src.utils.logger import get_logger
+from src.perception.exp_meter import CSV_HEADER, LOG_DIR, read_history
 
 from ui.preview_label import PreviewLabel
 from ui.alarm_overlay import AlarmOverlay, flash_taskbar
@@ -124,6 +125,9 @@ class MainWindow(QMainWindow):
         self.stand_facing_combo.currentIndexChanged.connect(self._on_stand_facing_changed)
         self.stand_default_attack_checkbox.toggled.connect(self._on_stand_default_attack_changed)
         self.stand_skill2_checkbox.toggled.connect(self._on_stand_skill2_changed)
+        # 活动范围：改动即写入配置并落盘（运行中框小地图、改分界线立即生效）
+        self.range_combo.currentIndexChanged.connect(self._on_range_changed)
+        self.range_split_spin.valueChanged.connect(self._on_range_changed)
 
         self.log_signal.connect(self._on_log)
         self.frame_signal.connect(self._on_frame)
@@ -529,6 +533,123 @@ class MainWindow(QMainWindow):
         micro_row.addStretch()
         v.addLayout(micro_row)
 
+        # 活动范围：只在地图左半边/右半边打怪（同一层有别的玩家时各占一半）
+        range_row = QHBoxLayout()
+        range_row.addWidget(QLabel("活动范围:"))
+        self.range_combo = QComboBox()
+        self.range_combo.addItem("不限制", "none")
+        self.range_combo.addItem("只在左半边", "left")
+        self.range_combo.addItem("只在右半边", "right")
+        self.range_combo.setToolTip(
+            "同一层有别的玩家时各占一半：分界线另一边的怪不选不追，探索和后撤不过线，\n"
+            "被打退过线会走回来。\n"
+            "要先点「框选小地图」，框住小地图的地图部分（不含标题/地图名）。"
+        )
+        self.range_combo.setFixedWidth(110)
+        range_row.addWidget(self.range_combo)
+        range_row.addWidget(QLabel("分界:"))
+        self.range_split_spin = QSpinBox()
+        self.range_split_spin.setRange(5, 95)
+        self.range_split_spin.setSuffix("%")
+        self.range_split_spin.setToolTip("分界线在小地图从左往右的什么位置，50% = 正中间")
+        self.range_split_spin.setFixedWidth(70)
+        range_row.addWidget(self.range_split_spin)
+        self.minimap_pick_btn = QPushButton("框选小地图")
+        self.minimap_pick_btn.setToolTip(
+            "在预览画面上框住小地图的地图部分（不含上面的标题和地图名）。\n"
+            "小地图要展开；换地图后大小会变，要重新框。运行中也能框。"
+        )
+        self.minimap_pick_btn.clicked.connect(
+            lambda: self.preview.set_select_mode(True, "minimap")
+        )
+        range_row.addWidget(self.minimap_pick_btn)
+        self.minimap_region_label = QLabel("未框选")
+        range_row.addWidget(self.minimap_region_label)
+        range_row.addStretch()
+        v.addLayout(range_row)
+
+        # 自动补飞镖
+        restock_row = QHBoxLayout()
+        self.restock_checkbox = QCheckBox("自动补飞镖")
+        self.restock_checkbox.setToolTip(
+            "每隔设定的分钟数暂停打怪：点左侧枫叶（冒险岛会员）→ 便捷杂货店 → 消耗 →\n"
+            "有几个「充值」就点几个并确定 → Esc 退出，然后继续打怪。\n"
+            "补充期间不做任何别的操作（检测到测谎会立即中止）。"
+        )
+        restock_row.addWidget(self.restock_checkbox)
+        restock_row.addWidget(QLabel("每"))
+        self.restock_interval_spin = QSpinBox()
+        self.restock_interval_spin.setRange(1, 240)
+        self.restock_interval_spin.setSuffix("分钟")
+        self.restock_interval_spin.setFixedWidth(80)
+        restock_row.addWidget(self.restock_interval_spin)
+        restock_row.addWidget(QLabel("枫叶图标:"))
+        self.restock_x_spin = QSpinBox()
+        self.restock_x_spin.setRange(0, 1920)
+        self.restock_x_spin.setPrefix("x ")
+        self.restock_x_spin.setFixedWidth(80)
+        self.restock_y_spin = QSpinBox()
+        self.restock_y_spin.setRange(0, 1080)
+        self.restock_y_spin.setPrefix("y ")
+        self.restock_y_spin.setFixedWidth(80)
+        for sp in (self.restock_x_spin, self.restock_y_spin):
+            sp.setToolTip(
+                "左侧快捷图标里枫叶（冒险岛会员）的位置，按 1920×1080 游戏画面填写；\n"
+                "程序会在这个高度的整排图标里找橙色的枫叶（排第几个都行），x 只用来在两处一样像时挑近的"
+            )
+            restock_row.addWidget(sp)
+        self.restock_test_btn = QPushButton("测试补飞镖")
+        self.restock_test_btn.setToolTip(
+            "立刻执行一次补飞镖（打怪中会先暂停打怪），看日志里每一步点了哪里")
+        self.restock_test_btn.clicked.connect(self._test_restock)
+        restock_row.addWidget(self.restock_test_btn)
+        restock_row.addStretch()
+        v.addLayout(restock_row)
+
+        # 自动换频道
+        channel_row = QHBoxLayout()
+        self.channel_checkbox = QCheckBox("自动换频道")
+        self.channel_checkbox.setToolTip(
+            "这么多分钟没放过技能（这层没怪了）就暂停打怪：Esc → 切换频道 → 双击下一个频道，\n"
+            "看到黑屏才算换成，没反应就换一个再试；换完按住右方向键走一段，再继续打怪"
+        )
+        channel_row.addWidget(self.channel_checkbox)
+        channel_row.addWidget(QLabel("没攻击"))
+        self.channel_idle_spin = QSpinBox()
+        self.channel_idle_spin.setRange(1, 60)
+        self.channel_idle_spin.setSuffix("分钟")
+        self.channel_idle_spin.setFixedWidth(80)
+        channel_row.addWidget(self.channel_idle_spin)
+        channel_row.addWidget(QLabel("换完按住"))
+        self.channel_hold_spin = QSpinBox()
+        self.channel_hold_spin.setRange(0, 30)
+        self.channel_hold_spin.setSuffix("秒")
+        self.channel_hold_spin.setFixedWidth(70)
+        channel_row.addWidget(self.channel_hold_spin)
+        self.channel_test_btn = QPushButton("测试换频道")
+        self.channel_test_btn.setToolTip(
+            "立刻换一次频道（打怪中会先暂停打怪），看日志和 channel_debug 里的截图")
+        self.channel_test_btn.clicked.connect(self._test_channel)
+        channel_row.addWidget(self.channel_test_btn)
+        channel_row.addStretch()
+        v.addLayout(channel_row)
+
+        # 经验记录
+        exp_row = QHBoxLayout()
+        self.exp_checkbox = QCheckBox("记录经验")
+        self.exp_checkbox.setToolTip(
+            "打怪时每 5 秒读一次状态栏的 EXP，算出这次打了多少、每小时多少；\n"
+            "每分钟记一行到 exp_log\\日期.csv，点「经验记录」可以查某个时间有多少经验"
+        )
+        exp_row.addWidget(self.exp_checkbox)
+        self.exp_label = QLabel("经验: -")
+        self.exp_label.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Preferred)  # 数字变长也不撑宽窗口
+        exp_row.addWidget(self.exp_label, 1)
+        self.exp_history_btn = QPushButton("经验记录")
+        self.exp_history_btn.clicked.connect(self._show_exp_history)
+        exp_row.addWidget(self.exp_history_btn)
+        v.addLayout(exp_row)
+
         # 拾取设置
         pickup_row = QHBoxLayout()
         self.pickup_checkbox = QCheckBox("自动拾取")
@@ -678,6 +799,30 @@ class MainWindow(QMainWindow):
             int(getattr(c, "stand_micro_move_tap_ms", 40) or 40)
         )
         self._sync_distance_ui()
+        # 活动范围
+        # 载入期间屏蔽信号：否则 setCurrentIndex 会先触发 _on_range_changed，
+        # 用旧的分界值覆盖 config.range_split，下面读到的就不是 YAML 里的值了
+        self.range_combo.blockSignals(True)
+        self.range_split_spin.blockSignals(True)
+        idx = self.range_combo.findData(getattr(c, "range_limit", "none"))
+        self.range_combo.setCurrentIndex(idx if idx >= 0 else 0)
+        self.range_split_spin.setValue(
+            int(round(float(getattr(c, "range_split", 0.5)) * 100))
+        )
+        self.range_combo.blockSignals(False)
+        self.range_split_spin.blockSignals(False)
+        self.minimap_region_label.setText(
+            "已框选" if getattr(c, "minimap_region", None) else "未框选"
+        )
+        # 自动补飞镖 / 换频道 / 经验
+        self.restock_checkbox.setChecked(bool(getattr(c, "restock_enabled", False)))
+        self.restock_interval_spin.setValue(int(getattr(c, "restock_interval_min", 30)))
+        self.restock_x_spin.setValue(int(getattr(c, "restock_icon_x", 200)))
+        self.restock_y_spin.setValue(int(getattr(c, "restock_icon_y", 571)))
+        self.channel_checkbox.setChecked(bool(getattr(c, "channel_enabled", False)))
+        self.channel_idle_spin.setValue(int(getattr(c, "channel_idle_min", 3)))
+        self.channel_hold_spin.setValue(int(getattr(c, "channel_hold_seconds", 5)))
+        self.exp_checkbox.setChecked(bool(getattr(c, "exp_enabled", True)))
         # 拾取
         self.pickup_checkbox.setChecked(getattr(c, "pickup_enabled", True))
         self.pickup_key_edit.setText(getattr(c, "pickup_key", "z"))
@@ -740,6 +885,18 @@ class MainWindow(QMainWindow):
         c.stand_micro_move_enabled = self.micro_move_checkbox.isChecked()
         c.stand_micro_move_interval = float(self.micro_interval_spin.value())
         c.stand_micro_move_tap_ms = self.micro_tap_spin.value()
+        # 活动范围
+        c.range_limit = self.range_combo.currentData()
+        c.range_split = self.range_split_spin.value() / 100.0
+        # 自动补飞镖 / 换频道 / 经验
+        c.restock_enabled = self.restock_checkbox.isChecked()
+        c.restock_interval_min = self.restock_interval_spin.value()
+        c.restock_icon_x = self.restock_x_spin.value()
+        c.restock_icon_y = self.restock_y_spin.value()
+        c.channel_enabled = self.channel_checkbox.isChecked()
+        c.channel_idle_min = self.channel_idle_spin.value()
+        c.channel_hold_seconds = self.channel_hold_spin.value()
+        c.exp_enabled = self.exp_checkbox.isChecked()
         # 拾取
         c.pickup_enabled = self.pickup_checkbox.isChecked()
         c.pickup_key = self.pickup_key_edit.text().strip() or "z"
@@ -846,6 +1003,12 @@ class MainWindow(QMainWindow):
         self.config.stand_skill2_only = bool(checked)
         save_user_config(self.config)
 
+    def _on_range_changed(self, *_):
+        """活动范围/分界线变化时，实时同步到 config 并保存到 YAML。"""
+        self.config.range_limit = self.range_combo.currentData()
+        self.config.range_split = self.range_split_spin.value() / 100.0
+        save_user_config(self.config)
+
     def _on_attack_type_changed(self, index):
         """攻击类型切换时，更新距离 UI 并同步到 config。"""
         self.config.attack_type = self.attack_type_combo.currentData()
@@ -931,7 +1094,18 @@ class MainWindow(QMainWindow):
         fh, fw = frame.shape[:2]
         # 转换为百分比存储
         region_pct = [x / fw, y / fh, w / fw, h / fh]
-        if target == "mp":
+        if target == "minimap":
+            self.config.minimap_region = region_pct
+            self.minimap_region_label.setText("已框选")
+            try:
+                save_user_config(self.config)
+            except Exception:
+                pass
+            self._log(
+                f"[范围] 小地图区域已设置: x={x} y={y} 宽={w} 高={h}"
+                f"，预览里青色框是小地图、竖线是分界线，黄点上有绿圈说明认出了自己"
+            )
+        elif target == "mp":
             self.config.mp_region = region_pct
             self.mp_region_label.setText(
                 f"x={region_pct[0]:.1%} y={region_pct[1]:.1%} "
@@ -985,6 +1159,69 @@ class MainWindow(QMainWindow):
             return detect_region_color(frame, [x, y, w, h])
         except Exception:
             return None
+
+    def _test_restock(self):
+        """「测试补飞镖」：读界面设置，立刻补一次（打怪中会先暂停打怪）。"""
+        self._read_ui_to_config()
+        try:
+            save_user_config(self.config)
+        except Exception:
+            pass
+        if not self.automation.window_locked and self.config.window_title:
+            try:
+                self.automation.lock_window(self.config.window_title)
+            except Exception as e:
+                QMessageBox.warning(self, "错误", f"锁定窗口失败: {e}")
+                return
+        self.automation.config = self.config
+        self.automation.restock_now()
+
+    def _test_channel(self):
+        """「测试换频道」：读界面设置，立刻换一次（打怪中会先暂停打怪）。"""
+        self._read_ui_to_config()
+        try:
+            save_user_config(self.config)
+        except Exception:
+            pass
+        if not self.automation.window_locked and self.config.window_title:
+            try:
+                self.automation.lock_window(self.config.window_title)
+            except Exception as e:
+                QMessageBox.warning(self, "错误", f"锁定窗口失败: {e}")
+                return
+        self.automation.config = self.config
+        self.automation.channel_switch_now()
+
+    def _show_exp_history(self):
+        """「经验记录」：按天看每个时间有多少经验（最新的在最上面）。"""
+        days = sorted((f for f in os.listdir(LOG_DIR) if f.endswith(".csv")), reverse=True) \
+            if os.path.isdir(LOG_DIR) else []
+        if not days:
+            QMessageBox.information(self, "经验记录", "还没有记录：开始打怪后每分钟记一行")
+            return
+        dialog = QDialog(self)
+        dialog.setWindowTitle("经验记录")
+        dialog.resize(640, 520)
+        layout = QVBoxLayout(dialog)
+        combo = QComboBox()
+        combo.addItems(days)
+        layout.addWidget(combo)
+        table = QTableWidget(0, len(CSV_HEADER))
+        table.setHorizontalHeaderLabels(CSV_HEADER)
+        table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeToContents)
+        table.setEditTriggers(QAbstractItemView.NoEditTriggers)
+        layout.addWidget(table)
+
+        def show_day():
+            rows = read_history(os.path.join(LOG_DIR, combo.currentText()))
+            table.setRowCount(len(rows))
+            for i, row in enumerate(reversed(rows)):
+                for j, value in enumerate(row):
+                    table.setItem(i, j, QTableWidgetItem(value))
+
+        combo.currentIndexChanged.connect(show_day)
+        show_day()
+        dialog.exec_()
 
     def _on_preview_frame(self):
         """单帧预览：截图 + 分析 + 预览，并在日志输出总耗时（供调试）。"""
@@ -1300,6 +1537,18 @@ class MainWindow(QMainWindow):
         if mp_region:
             rx, ry, rw, rh = mp_region
             cv2.rectangle(disp, (rx, ry), (rx + rw, ry + rh), (255, 128, 0), 1)
+        # 画小地图区域、分界线、认出的黄点（框选过小地图就画，方便调分界线）
+        minimap = self.config.scale_region(
+            getattr(self.config, "minimap_region", None), frame.shape[1], frame.shape[0]
+        )
+        if minimap:
+            rx, ry, rw, rh = minimap
+            cv2.rectangle(disp, (rx, ry), (rx + rw, ry + rh), (255, 255, 0), 1)
+            lx = rx + int(rw * float(getattr(self.config, "range_split", 0.5)))
+            cv2.line(disp, (lx, ry), (lx, ry + rh), (255, 255, 0), 1)
+            dot = getattr(self.automation, "_minimap_dot", None)
+            if dot:
+                cv2.circle(disp, dot, 8, (0, 255, 0), 1)
         # 自身位置：直接复用主循环已算好的缓存中心点（避免 UI 线程执行 OCR 卡死）
         center = self.automation._get_last_center()
         if center:
@@ -1326,6 +1575,11 @@ class MainWindow(QMainWindow):
         fps = self._fps_counter[0] / max(0.001, now - self._fps_counter[1])
         self._fps_counter = [0, now]
         self.fps_label.setText(f"FPS: {fps:.1f}")
+        if self.config.exp_enabled:
+            try:
+                self.exp_label.setText(self.automation.exp_summary())
+            except Exception:
+                pass
         if not self.automation.running:
             self._preview_timer.stop()
 

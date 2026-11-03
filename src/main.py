@@ -64,11 +64,20 @@ from .perception.lie_detector import LieDetector
 from .perception.lie_shadow import LieShadow, board_box
 from .perception.lie_detector_watch import LieDetectorWatcher
 from .perception.lie_recorder import LieRecorder, LieLog, client_cursor
+from .perception.minimap_locator import MinimapLocator
+from .perception.exp_meter import ExpMeter
+from .execution.star_restock import StarRestock
+from .execution.channel_switch import (
+    ChannelSwitcher, ChannelTimer, MAX_IDLE_RUNS, RETRY_SECONDS,
+)
 from .execution.action_executor import ActionExecutor
 from .decision.context import Context, DecisionEngine
 from .utils.config_loader import (
     Config, resolve_model_path, resolve_asset_path, APP_DIR,
 )
+
+RESTOCK_RETRY_SECONDS = 300
+"""自动补飞镖没补成时，多久后再试（秒）：5 分钟"""
 
 
 # =============================================================================
@@ -239,6 +248,30 @@ class Automation:
         self._buff_open_time = 0.0    # 本轮窗口打开的时间戳
         self._buff_last_press = 0.0   # 本轮上次按键的时间戳
 
+        # ---- 活动范围：小地图黄点（镜头跟着角色走，只有小地图能看出自己在地图哪里）----
+        self._minimap = MinimapLocator()
+        self._minimap_dot: Optional[Tuple[int, int]] = None  # 黄点在画面里的位置（预览用）
+
+        # ---- 自动补飞镖：每隔 restock_interval_min 分钟暂停打怪，去便捷杂货店充值 ----
+        self._restock = StarRestock(self.capture, self.executor, config, on_log=self.on_log)
+        self._restock.on_frame = self._lie_probe_frame   # 补镖期间也要能认出测谎弹窗
+        self._restock.abort = lambda: self._lie_probe_hit
+        self._last_restock = 0.0
+        self._restock_requested = False  # 「测试补飞镖」按钮：打怪中按下 → 下一帧执行
+        self._restock_busy = threading.Lock()
+        self._lie_probe_hit = False      # 主循环外（补镖/换频道）这一张截图认出了测谎
+
+        # ---- 自动换频道：channel_idle_min 分钟没放过技能（这层没怪了）就换一个频道 ----
+        self._channel = ChannelSwitcher(self.capture, self.executor, config, on_log=self.on_log)
+        self._channel.on_frame = self._lie_probe_frame
+        self._channel.abort = lambda: self._lie_probe_hit
+        self._channel_requested = False  # 「测试换频道」按钮：打怪中按下 → 下一帧执行
+        self._channel_busy = threading.Lock()
+        self._channel_timer = ChannelTimer()
+
+        # ---- 经验记录：定时读状态栏的 EXP，写到 exp_log/日期.csv ----
+        self._exp = ExpMeter(on_log=self.on_log)
+
     # =========================================================================
     # 窗口管理
     # =========================================================================
@@ -329,6 +362,13 @@ class Automation:
         if self._lie_detector is not None:
             self.on_log(f"[测谎] 检测状态：{self._lie_detector.describe()}")
 
+        # ---- 外围自动化状态复位 ----
+        self._last_restock = time.time()  # 开打后过一个间隔再第一次补
+        self._channel_timer.start(time.time())
+        self._exp.read_seconds = float(getattr(self.config, "exp_read_seconds", 5) or 5)
+        self._exp.log_minutes = float(getattr(self.config, "exp_log_minutes", 10) or 0)
+        self._exp.start(time.time())
+
         self._running = True
         # daemon=True: 主线程退出时自动结束，不会卡住进程
         self._thread = threading.Thread(target=self._loop, daemon=True)
@@ -355,7 +395,129 @@ class Automation:
         # 只靠 engine.release_keys() 时，若引擎的 _held_key 与控制器的 _held_keys
         # 不一致（换键/异常路径），停机会漏掉那个键 → 角色停止后仍一直走、一直打。
         self.executor.reset()
+        try:
+            self._exp.stop(time.time())  # 把最后的经验数写进记录
+        except Exception:
+            pass
         self.on_log("[停止] 自动打怪已停止")
+
+    # =========================================================================
+    # 外围自动化（补飞镖 / 换频道 / 经验）
+    # =========================================================================
+
+    def _lie_probe_frame(self, frame):
+        """补飞镖/换频道期间每张截图都喂给测谎检测。
+
+        这两个操作会占住主循环十几秒，期间没有别的地方能发现测谎弹窗。
+        这里只"认出来 + 让操作自己停"（abort），真正的停机/报警交给主循环
+        下一帧的 _handle_lie_detected —— 在那个线程里调 stop() 会等自己结束。
+        """
+        if self._lie_probe_hit:
+            return
+        if self._lie_detector is not None and self._lie_detector.available:
+            hit, _score = self._lie_detector.detect(frame)
+            if hit:
+                self._lie_probe_hit = True
+
+    def _locate_on_minimap(self, frame):
+        """开了活动范围时在框选的小地图区域里找自己，返回 (黄点 x, 区域宽)；没开/没框选/没找到时 x 为 None。"""
+        self._minimap_dot = None
+        if getattr(self.config, "range_limit", "none") not in ("left", "right"):
+            return None, None
+        region = self.config.scale_region(
+            getattr(self.config, "minimap_region", None), frame.shape[1], frame.shape[0]
+        )
+        if region is None:
+            return None, None
+        dot = self._minimap.locate(frame, region)
+        if dot is None:
+            return None, region[2]
+        self._minimap_dot = (region[0] + int(dot[0]), region[1] + int(dot[1]))
+        return dot[0], region[2]
+
+    def restock_now(self):
+        """「测试补飞镖」按钮：打怪中 → 下一帧暂停打怪去补；没在打怪 → 直接在后台线程补一次。"""
+        if not self.capture.locked:
+            self.on_log("[补飞镖] 请先锁定游戏窗口")
+            return
+        if self._running:
+            self._restock_requested = True
+            self.on_log("[补飞镖] 已安排，下一帧暂停打怪去补充")
+        else:
+            threading.Thread(target=self._do_restock, daemon=True).start()
+
+    def _do_restock(self):
+        """暂停一切操作，执行一次补飞镖（在主循环线程里调用时，期间不会有任何别的按键）。"""
+        if not self._restock_busy.acquire(blocking=False):
+            return
+        ok = False
+        try:
+            self._lie_probe_hit = False
+            self.engine.release_keys()
+            time.sleep(0.8)  # 等落地、技能动作做完
+            self._restock.config = self.config  # 界面「开始」时会换成新的配置对象
+            ok = self._restock.run()
+        finally:
+            self._last_restock = time.time()
+            interval = float(getattr(self.config, "restock_interval_min", 30) or 0) * 60
+            if not ok and not self._lie_probe_hit and self._running \
+                    and interval > RESTOCK_RETRY_SECONDS:
+                # 没补成（没找到窗口/按钮）→ 5 分钟后再试，不用等满一个间隔
+                self._last_restock -= interval - RESTOCK_RETRY_SECONDS
+                self.on_log(f"[补飞镖] 本次没补成，{RESTOCK_RETRY_SECONDS} 秒后再试")
+            if self._lie_probe_hit:
+                self.on_log("[补飞镖] 检测到测谎弹窗，已中止；窗口等测谎结束后再关")
+            self._channel_timer.restart(time.time())
+            self.engine.reset()
+            self._restock_busy.release()
+
+    def exp_summary(self) -> str:
+        """界面显示的一行经验信息。"""
+        return self._exp.summary(time.time())
+
+    def channel_switch_now(self):
+        """「测试换频道」按钮：打怪中 → 下一帧暂停打怪去换；没在打怪 → 直接在后台线程换一次。"""
+        if not self.capture.locked:
+            self.on_log("[换频道] 请先锁定游戏窗口")
+            return
+        if self._running:
+            self._channel_requested = True
+            self.on_log("[换频道] 已安排，下一帧暂停打怪去换频道")
+        else:
+            threading.Thread(target=self._do_channel_switch, daemon=True).start()
+
+    def _channel_due(self) -> bool:
+        """该自动换频道了吗（channel_idle_min 分钟没放过技能）。"""
+        if not getattr(self.config, "channel_enabled", False):
+            return False
+        idle = float(getattr(self.config, "channel_idle_min", 3) or 0) * 60
+        return self._channel_timer.due(time.time(), self.engine.last_cast_at, idle)
+
+    def _do_channel_switch(self):
+        """暂停一切操作，换一次频道（在主循环线程里调用时，期间不会有任何别的按键）。"""
+        if not self._channel_busy.acquire(blocking=False):
+            return
+        in_loop = self._running
+        ok = False
+        try:
+            self._lie_probe_hit = False
+            self.engine.release_keys()
+            time.sleep(0.8)  # 等落地、技能动作做完
+            self._channel.config = self.config  # 界面「开始」时会换成新的配置对象
+            self._channel.abort = lambda: (in_loop and not self._running) or self._lie_probe_hit
+            ok = self._channel.run()
+        finally:
+            idle = float(getattr(self.config, "channel_idle_min", 3) or 0) * 60
+            self._channel_timer.finished(time.time(), ok, idle)
+            if in_loop and not ok and self._running and not self._lie_probe_hit:
+                self.on_log(f"[换频道] 本次没换成，{RETRY_SECONDS} 秒后再试")
+            if in_loop and self._channel_timer.runs == MAX_IDLE_RUNS:
+                self.on_log(f"[换频道] 连着换了 {MAX_IDLE_RUNS} 次都没打到怪，先不自动换了"
+                            "（检查角色是不是在打怪的地方、怪认不认得出）；打到怪后恢复")
+            if self._lie_probe_hit:
+                self.on_log("[换频道] 检测到测谎弹窗，已中止；菜单等测谎结束后再关")
+            self.engine.reset()
+            self._channel_busy.release()
 
     # =========================================================================
     # 测谎弹窗（反外挂）
@@ -558,6 +720,11 @@ class Automation:
         """测谎通过后恢复打怪（与 start() 相同的状态复位，但不重复锁窗）。"""
         self._lie_latched = False
         self._stop_lie_game("恢复打怪")
+        # 测谎打断了补飞镖/换频道：商店、菜单、频道窗口可能还开着，收尾关掉
+        self._restock.close_after_abort()
+        self._channel.close_after_abort()
+        self._lie_probe_hit = False
+        self._channel_timer.restart(time.time())
         self._running = True
         self._thread = threading.Thread(target=self._loop, daemon=True)
         self._thread.start()
@@ -686,6 +853,30 @@ class Automation:
                 self._handle_lie_detected(frame, lie_score)
                 return
 
+        # ---- 1.6 经验记录：定时读状态栏的 EXP（后台线程，不占本帧）----
+        if getattr(self.config, "exp_enabled", True):
+            self._exp.feed(frame, time.time())
+
+        # ---- 1.7 自动补飞镖：到时间（或按了「测试补飞镖」）就停下一切操作去充值 ----
+        # 注意别叫 interval：那是本帧的帧间隔，后面补齐 FPS 的 sleep 要用
+        restock_every = float(getattr(self.config, "restock_interval_min", 30) or 0) * 60
+        if self._restock_requested or (
+                getattr(self.config, "restock_enabled", False) and restock_every > 0
+                and time.time() - self._last_restock >= restock_every):
+            self._restock_requested = False
+            self._do_restock()
+            return
+
+        # ---- 1.8 自动换频道：这层好几分钟没打到怪（或按了测试按钮）就换一个频道 ----
+        if self._channel_requested or self._channel_due():
+            if not self._channel_requested:
+                self.on_log(f"[换频道] 已经 "
+                            f"{float(getattr(self.config, 'channel_idle_min', 3)):g} "
+                            f"分钟没攻击，这层应该没怪了")
+            self._channel_requested = False
+            self._do_channel_switch()
+            return
+
         # ---- 2~5. 感知流水线：YOLO 检测 → HP/MP → 自身定位 ----
         detections, hp_ratio, mp_ratio, self_pos = self._run_perception(frame)
 
@@ -750,6 +941,8 @@ class Automation:
                 self.on_log(f"[状态] HP={hp_str} MP={mp_str} 自身未定位{lie_str}")
 
         # ---- 6. 决策与执行 ----
+        # 活动范围：小地图上找自己的黄点（只有开了 range_limit 才跑，开销很小）
+        minimap_x, minimap_width = self._locate_on_minimap(frame)
         # Context 是感知层 → 决策层的数据载体
         ctx = Context(
             monsters=monsters,
@@ -760,6 +953,10 @@ class Automation:
             hp_ratio=hp_ratio,          # 0.0~1.0
             mp_ratio=mp_ratio,          # 0.0~1.0
             detections=detections,      # 全部检测结果（供调试/日志用）
+            frame_height=frame.shape[0],  # 像素参数缩放用
+            frame_width=frame.shape[1],
+            minimap_x=minimap_x,        # 小地图黄点 x（相对框选区域左边）
+            minimap_width=minimap_width,
         )
         self.engine.decide(ctx)  # 决策引擎根据上下文执行动作
 
@@ -842,6 +1039,8 @@ class Automation:
             return time.perf_counter() - t0
 
         detections, hp_ratio, mp_ratio, self_pos = self._run_perception(frame)
+        # 单帧预览也认一次小地图黄点：框选/调分界线时能立刻在预览里看到绿圈
+        self._locate_on_minimap(frame)
         self.on_frame(frame, detections, hp_ratio, mp_ratio, None)
 
         # 输出自身坐标（脚底 + 角色中心）到日志，供调试

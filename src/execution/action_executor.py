@@ -155,6 +155,25 @@ class ActionExecutor:
         """
         self._mouse.move_to(x, y)
 
+    def real_click(self, x: int, y: int) -> bool:
+        """真实鼠标点击窗口客户区 (x, y)（先把游戏窗口激活到前台）。
+
+        游戏内界面按钮（商店、会员窗口、频道窗口）只认系统全局输入，
+        PostMessage 的后台点击常常无效。
+        """
+        self._kb._activate_window()
+        return self._mouse.real_click(x, y)
+
+    def real_double_click(self, x: int, y: int) -> bool:
+        """真实鼠标双击窗口客户区 (x, y)（先把游戏窗口激活到前台）。"""
+        self._kb._activate_window()
+        return self._mouse.real_double_click(x, y)
+
+    def real_move(self, x: int, y: int) -> bool:
+        """真实地把光标移到窗口客户区 (x, y)，不点击、不激活窗口；
+        游戏窗口不在前台返回 False。"""
+        return self._mouse.real_move(x, y)
+
     # =========================================================================
     # 重置
     # =========================================================================
