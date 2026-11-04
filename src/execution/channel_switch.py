@@ -84,9 +84,29 @@ def _boxes(mask: np.ndarray, min_area: int) -> List[Tuple[int, int, int, int]]:
     return [tuple(int(v) for v in stats[i][:4]) for i in range(1, n) if stats[i][4] >= min_area]
 
 
+def _scales(frame: np.ndarray) -> List[float]:
+    """UI 的两种可能缩放：随画面等比缩放，或保持固定像素大小。
+
+    常量是按 1920×1080 量的。老客户端（含不少怀旧服）的 UI 是固定像素，
+    换分辨率只改变可视范围、按钮/菜单尺寸不变；也有的客户端会整体缩放。
+    两种都试一遍，谁认出来用谁——不然 1366×768 下会按 0.711 去量固定的 UI，
+    怎么都对不上（实测 2026-11-04 换频道一直卡在"按 Esc 后认不出菜单"）。
+    """
+    s = frame.shape[0] / REF_H
+    return [s] if abs(s - 1.0) <= 0.02 else [s, 1.0]
+
+
 def find_menu(frame: np.ndarray) -> Optional[Tuple[int, int]]:
     """游戏菜单开着 → 返回最上面一行「切换频道」的中心；没开返回 None。"""
-    s = frame.shape[0] / REF_H
+    for s in _scales(frame):
+        pos = _find_menu_at(frame, s)
+        if pos is not None:
+            return pos
+    return None
+
+
+def _find_menu_at(frame: np.ndarray, s: float) -> Optional[Tuple[int, int]]:
+    """按缩放倍数 s 找菜单（实现见 find_menu）。"""
     w, h = MENU_ROW[0] * s, MENU_ROW[1] * s
     rows = sorted((b for b in _boxes(_cyan_mask(frame), int(w * h * 0.4))
                    if abs(b[2] - w) <= 14 * s and abs(b[3] - h) <= 6 * s), key=lambda b: b[1])
@@ -118,7 +138,15 @@ class ChannelDialog:
 
 def find_dialog(frame: np.ndarray) -> Optional[ChannelDialog]:
     """频道窗口开着 → 返回 ChannelDialog；没开返回 None。"""
-    s = frame.shape[0] / REF_H
+    for s in _scales(frame):
+        dialog = _find_dialog_at(frame, s)
+        if dialog is not None:
+            return dialog
+    return None
+
+
+def _find_dialog_at(frame: np.ndarray, s: float) -> Optional[ChannelDialog]:
+    """按缩放倍数 s 找频道窗口（实现见 find_dialog）。"""
     w, h = DIALOG_BAR[0] * s, DIALOG_BAR[1] * s
     cyan = _cyan_mask(frame)
     for x, y, bw, bh in _boxes(cyan, int(w * h * 0.5)):
@@ -290,7 +318,20 @@ class ChannelSwitcher:
             if pos is None:
                 self._log("[换频道] 按 Esc 打开游戏菜单")
                 self.executor.press_key("esc")
+                # 先等一下让菜单画出来，并把这一帧存下来：
+                # 认不出菜单时，看这张图就能分清"Esc 没打开菜单"还是"菜单开了但没认出来"
+                self._sleep(0.4)
+                probe = self._grab()
                 if not self._wait(lambda f: find_menu(f) is not None, STEP_TIMEOUT):
+                    if probe is not None:
+                        self._save(probe, "按Esc后没认出菜单")
+                        hgt = probe.shape[0]
+                        self._log(
+                            f"[换频道] 按 Esc 后没认出菜单（画面 {probe.shape[1]}x{hgt}，"
+                            f"期望菜单行 {MENU_ROW[0]}x{MENU_ROW[1]}（固定像素）或 "
+                            f"{int(MENU_ROW[0] * hgt / REF_H)}x"
+                            f"{int(MENU_ROW[1] * hgt / REF_H)}（按高度缩放））"
+                        )
                     continue
                 frame = self._frame
                 pos = find_menu(frame)
