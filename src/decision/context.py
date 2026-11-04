@@ -230,12 +230,14 @@ NEARER_CROSS_SIDE_EXTRA_X = 150
 避免为了两只距离接近的怪反复转身；真正贴身的怪仍会抢占。"""
 
 SAMESIDE_PREFER_X = 300
-"""选怪时的"同侧优先"距离（像素）。
+"""选怪时的"同侧优先"距离优势（像素）。
 
-朝向已知时，优先打面朝这一侧的同平台怪；另一侧的怪必须比同侧最近怪
-还近 150px 以上才会被选中——选背后的怪意味着转身（约 0.25~0.4s 停手），
+同侧射程内的怪已经由 _pick_best_target / _pick_nearer_visible 的
+"绝对优先"规则直接选走；这里只在"两边都没有同侧射程内的怪"时生效：
+另一侧的怪必须比同侧最近怪还近这么多（或同侧在射程外、另一侧在射程内）
+才值得转一次身。选背后的怪意味着转身（约 0.25~0.4s 停手），
 远一点的同侧怪用现有朝向直接就能打。朝向未知（_face_dir 为空）时不做
-同侧偏好，保持原来的"最近优先"。"""
+同侧偏好，保持"最近优先"。"""
 
 ROPE_SEARCH_RANGE_X = 200
 """搜索绳索的水平范围（像素）"""
@@ -1182,12 +1184,13 @@ class DecisionEngine:
         #   · 最小射程 ≤ 水平差 ≤ 攻击距离 → 站定攻击（不移动、不乱跑）
         #   · 否则 → 朝怪物直线移动逼近，进入攻击距离后再打
         if self._same_platform(py, monster_foot[1]):
-            # 贴脸判定看"同一层离自己最近的怪"，不只是锁定目标：
-            # 锁定目标可能在射程边缘，而另一只已经贴到脸上。
+            # 贴脸判定只看"面朝那一侧离自己最近的怪"：锁定目标可能在射程边缘，
+            # 而同侧另一只已经贴到脸上；背后的怪不转身去管（见 _nearest_threat）。
             min_range = self._get_min_attack_range()
-            threat = self._nearest_threat(ctx, target) or target
-            tdx = abs(px - threat.center[0])
+            threat = self._nearest_threat(ctx, target)
+            tdx = abs(px - threat.center[0]) if threat is not None else 0
             want_retreat = (min_range > 0 and not self._is_stand_mode()
+                            and threat is not None
                             and self._should_retreat(tdx, min_range))
             if not want_retreat:
                 # 不再需要后撤 → 结束可能还在进行的突围（否则下次后撤会沿用旧突围状态）
@@ -2014,7 +2017,12 @@ class DecisionEngine:
                              locked: Detection) -> Optional[Detection]:
         """锁定目标不合适时，改打"更近 / 真实可见"的同层怪（带防抖）。
 
-        两类情况（都只处理长手；近战贴脸由 _handle_melee 自己判定）：
+        【同侧射程内绝对优先】长手 + 朝向已知时：
+          - 锁定目标已是同侧射程内 → 反侧怪一律不抢（哪怕近很多），
+            只有同侧更近的怪能接；
+          - 锁定目标不是（在反侧 / 同侧射程外）→ 只要同侧有射程内的怪，
+            直接切过去，不需要距离优势（换过去不用转身）。
+        其余情况才按距离/可见性抢（都只处理长手；近战贴脸由 _handle_melee 判定）：
           1. 锁定目标本帧漏检：
              - 最后位置仍在射程内（多半是技能特效遮挡）→ 保持期内先信它，
                只接受明显更近（≥NEARER_GHOST_INRANGE_MARGIN_X）的可见怪；
@@ -2022,7 +2030,8 @@ class DecisionEngine:
                （≤NEARER_TRULY_CLOSE_X）且更近才转。
              - 最后位置在射程外（可能已死/走远）→ 真实可见且在射程内的怪优先。
           2. 锁定目标可见：新怪明显更近才抢；跨侧需要更大优势，只有真正贴身
-             （≤NEARER_TRULY_CLOSE_X）且更近才值得转一次身。
+             （≤NEARER_TRULY_CLOSE_X）且更近才值得转一次身；但如果锁定目标
+             在同侧射程外、反侧有射程内的怪，则按"②反侧最近"直接换。
 
         连续 NEARER_SWITCH_FRAMES 帧指向同一只怪才切换，吸收 YOLO 单帧
         漏检/抖动，避免两个距离接近的怪左右来回换目标。
@@ -2076,13 +2085,31 @@ class DecisionEngine:
                 cross_dist = d
 
         attack_range = self._get_attack_range()
-        if same_best is not None and cross_best is not None:
+        facing = self._face_dir
+        facing_right = facing == "right"
+        locked_same = facing_known and ((locked.center[0] > sx) == facing_right)
+        locked_same_in = locked_same and locked_dist <= attack_range
+
+        # 同侧射程内的怪绝对优先：
+        #   · 锁定目标已经是同侧射程内 → 反侧怪一律不抢（哪怕近很多），
+        #     只有同侧更近的怪能接；
+        #   · 锁定目标不是（在反侧 / 同侧但射程外）→ 只要同侧有射程内的怪，
+        #     就直接切过去，不需要距离优势（换过去不用转身）。
+        priority_switch = False
+        if locked_same_in:
+            if same_best is None:
+                self._nearer_candidate = None
+                self._nearer_frames = 0
+                return None
+            best, best_dist = same_best, same_dist
+        elif facing_known and same_best is not None and same_dist <= attack_range:
+            best, best_dist = same_best, same_dist
+            priority_switch = True
+        elif same_best is not None and cross_best is not None:
             cross_wins = cross_dist + SAMESIDE_PREFER_X < same_dist \
                 or (cross_dist <= attack_range < same_dist)
-            if cross_wins:
-                best, best_dist = cross_best, cross_dist
-            else:
-                best, best_dist = same_best, same_dist
+            best, best_dist = (cross_best, cross_dist) if cross_wins \
+                else (same_best, same_dist)
         elif same_best is not None:
             best, best_dist = same_best, same_dist
         else:
@@ -2097,12 +2124,9 @@ class DecisionEngine:
         # 切过去必须先转身（约 0.25~0.4s 停手）。不额外加门槛的话，两只距离
         # 接近的怪来回抢占会让角色反复转身、技能空窗明显（10/28 实测 315 次
         # 转向/28 分钟）。跨侧只有"真正贴身且更近"或"优势足够大"才转。
-        facing = self._face_dir
         cross_side = False
         if facing in ("left", "right"):
-            facing_right = facing == "right"
-            cross_side = ((best.center[0] > sx) != facing_right) \
-                and ((locked.center[0] > sx) == facing_right)
+            cross_side = ((best.center[0] > sx) != facing_right) and locked_same
 
         locked_in_range = locked_dist <= attack_range
         # 射程内鬼目标保持期内（多半是特效遮挡）→ 先信它，只有明显更近才抢
@@ -2110,7 +2134,10 @@ class DecisionEngine:
                            and self._target_miss_frames
                            < self._frames(TARGET_MISS_RETAIN_INRANGE_SECONDS))
 
-        if ghost_retaining:
+        if priority_switch:
+            # 同侧射程内：绝对优先，不需要距离优势（仍走 3 帧防抖）
+            ok = True
+        elif ghost_retaining:
             if cross_side:
                 ok = ((best_dist <= NEARER_TRULY_CLOSE_X
                        and best_dist < locked_dist)
@@ -2125,7 +2152,11 @@ class DecisionEngine:
             ok = best_dist <= attack_range
         else:
             # 锁定目标可见：只在明显更近时抢；跨侧要求更高
-            if cross_side:
+            if cross_side and not locked_in_range:
+                # 锁定目标在面朝侧但射程外，反侧有射程内的怪 → 按"②反侧最近"
+                # 直接换过去（锁定目标本来就要走，换上能立即打的更划算）
+                ok = best_dist <= attack_range
+            elif cross_side:
                 ok = ((best_dist <= NEARER_TRULY_CLOSE_X
                        and best_dist < locked_dist)
                       or (best_dist <= attack_range
@@ -2343,10 +2374,13 @@ class DecisionEngine:
         跨层怪物直接忽略（不爬绳/不跳跃/不追击），画面里没有同平台怪
         时返回 None，转探索等自己走到那一层再打。
 
-        【同侧优先】朝向已知（_face_dir 非空）时优先打面朝侧的怪：
-        选背后的怪 = 转身停手 0.25~0.4s。另一侧的怪必须比同侧最近怪
-        还近 SAMESIDE_PREFER_X(150px) 才会被选中。朝向未知时退化为
-        "最近优先"。
+        【同侧优先（绝对）】长手模式且朝向已知时，按下面的顺序选：
+          ① 同侧且在攻击距离内 → 一定是它（取最近的一只）；
+             反侧再近也不换（换过去要先转身，停手 0.25~0.4s）
+          ② 没有同侧射程内的怪 → 反侧最近的一只
+          ③ 两边都没有射程内的 → 同侧最近的一只（顺着原朝向追，不无故转身）
+        朝向未知时退化为"最近优先"。短手（近战）要跑过去贴脸，朝向随移动
+        变化，不做同侧优先。
 
         说明：同平台必须用"脚底 vs 脚底"。若用"角色中心y vs 怪物bbox中心y"，
         高大怪物（如 150px 高）的中心点比角色中心高出 40~50px，
@@ -2379,15 +2413,18 @@ class DecisionEngine:
         # 【只打同平台】仅考虑与角色在同一平台的怪物：
         # 脚底垂直差 ≤ 垂直容差（attack_range_y）。
         # 跨层怪物直接忽略——不爬绳不跳跃，等角色自己走到那层再打。
-        # 【同侧优先】长手模式且朝向已知时优先打面朝侧的怪：换边意味着
-        # 转身停手，另一侧的怪必须明显更近（≥SAMESIDE_PREFER_X）才选它。
-        # 短手（近战）要跑过去贴脸，朝向随移动变化，不做同侧偏好。
         facing = self._face_dir \
             if getattr(self.config, "attack_type", "long") == "long" else None
-        same_best = None
-        same_dist = float("inf")
-        cross_best = None
-        cross_dist = float("inf")
+        facing_known = facing in ("left", "right")
+        attack_range = self._get_attack_range()
+        nearest_any = None
+        nearest_any_d = float("inf")
+        same_in = None
+        same_in_d = float("inf")
+        same_out = None
+        same_out_d = float("inf")
+        cross = None
+        cross_d = float("inf")
         for m in monsters:
             mfoot = m.y + m.h  # 怪物脚底（bbox 底部）
             if not self._same_platform(player[1], mfoot):
@@ -2395,26 +2432,28 @@ class DecisionEngine:
             if not self._in_front(m, player[0]):
                 continue  # 站桩模式：只考虑朝向正前方的怪
             dx = abs(player[0] - m.center[0])
-            same_side = (m.center[0] > player[0]) == (facing == "right") \
-                if facing in ("left", "right") else True
+            if not facing_known:
+                if dx < nearest_any_d:
+                    nearest_any, nearest_any_d = m, dx
+                continue
+            same_side = (m.center[0] > player[0]) == (facing == "right")
             if same_side:
-                if dx < same_dist:
-                    same_best = m
-                    same_dist = dx
-            elif dx < cross_dist:
-                cross_best = m
-                cross_dist = dx
+                if dx <= attack_range:
+                    if dx < same_in_d:
+                        same_in, same_in_d = m, dx
+                elif dx < same_out_d:
+                    same_out, same_out_d = m, dx
+            elif dx < cross_d:
+                cross, cross_d = m, dx
 
-        if same_best is not None and cross_best is not None:
-            attack_range = self._get_attack_range()
-            cross_wins = cross_dist + SAMESIDE_PREFER_X < same_dist \
-                or (cross_dist <= attack_range < same_dist)
-            if cross_wins:
-                # 跨侧怪明显更近 / 同侧超出射程而跨侧在射程内 → 值得转一次身
-                return cross_best
-        if same_best is not None:
-            return same_best
-        return cross_best
+        if not facing_known:
+            return nearest_any
+        # ① 同侧射程内 > ② 反侧最近 > ③ 同侧射程外最近
+        if same_in is not None:
+            return same_in
+        if cross is not None:
+            return cross
+        return same_out
 
     # =========================================================================
     # 地板判定
@@ -2881,21 +2920,32 @@ class DecisionEngine:
         self._retreating = True
 
     def _nearest_threat(self, ctx: Context, target: Optional[Detection]) -> Optional[Detection]:
-        """同一层水平距离离自己最近的怪（含锁定目标，不含残影位置）。
+        """同一层、面朝那一侧水平距离离自己最近的怪（含锁定目标，不含残影位置）。
 
-        后撤/贴脸判定要躲的是"离自己最近的那只"，不只是锁定目标：
+        后撤/贴脸判定要躲的是"面朝方向离自己最近的那只"，不只是锁定目标：
         锁定目标可能在射程边缘，而另一只已经贴到脸上——只看锁定目标会以为还安全。
+
+        【不管背后的怪】另一侧贴得再近也不认：处理它要先转身（停手
+        0.25~0.4s），还要走回去，比继续打眼前的亏；背后的怪追过来时
+        自然会出现在面朝侧。朝向未知时退回"同一层最近"。
         """
         foot = self._effective_self_pos(ctx)
         if foot is None:
             return target
         sx, sy = foot
+        facing = self._face_dir
         cands = [m for m in ctx.monsters
                  if self._same_platform(sy, m.y + m.h) and not self._in_ghost_zone(m)]
-        if target is not None:
+        if facing in ("left", "right"):
+            facing_right = facing == "right"
+            cands = [m for m in cands
+                     if (m.center[0] > sx) == facing_right]
+            if target is not None and (target.center[0] > sx) == facing_right:
+                cands.append(target)
+        elif target is not None:
             cands.append(target)
         if not cands:
-            return target
+            return None
         return min(cands, key=lambda m: abs(m.center[0] - sx))
 
     def _start_escape(self, target: Detection, sx: int, why: str):

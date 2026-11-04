@@ -21,6 +21,7 @@ PYTHONPATH=. python -m unittest discover -s tests -t . -v
 | `test_ghost.py` | 残影：出手次数 + 静止判定 + 位置记忆（8→16→…→300s）、跳过与不重锁、活怪 2 倍 |
 | `test_chase_retreat.py` | 追击：刚出手先等怪过来、卡住两次放弃；近身：最近威胁判后撤、撤不动跳过怪；定位丢失不再左右走动 |
 | `test_channel_detect.py` | 换频道界面识别：菜单/频道窗口在"等比缩放"和"固定像素"两种 UI 下都认得出 |
+| `test_target_side.py` | 选怪优先级：同侧射程内 > 反侧最近 > 同侧射程外；反侧近身怪不参与威胁/击退 |
 
 ## 与分享包（share-baseline 分支）测试的关系
 
