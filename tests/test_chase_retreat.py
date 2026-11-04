@@ -1,16 +1,17 @@
-"""追击节奏 / 近身后撤突围 / 定位丢失左右走。
+"""追击节奏 / 近身后撤突围。
 
-对应第 3 批第 3、5、6 点：
+对应第 3 批第 3、5 点：
   3. 刚出过手先等怪过来；追击卡住两次放弃并记残影
   5. 贴脸判定看最近同层威胁；撤不动（没地板/超时）就跳过怪物突围
-  6. 定位丢失：短时沿用最后位置，长时左右走动重新定位
+
+（第 6 点"定位丢失左右走动"已按实机反馈移除：角色会在一直定位不到的地方
+来回走，反而更糟。）
 """
 import unittest
 
 from src.decision import context as ctxmod
 from src.decision.context import (
     Context, DecisionEngine, State, STUCK_FRAMES,
-    CHASE_PATIENCE_SECONDS, SELF_LOST_RELOCATE_SECONDS,
 )
 from src.perception.yolo_detector import Detection
 from src.utils.config_loader import Config
@@ -171,36 +172,19 @@ class RetreatTests(Base):
         self.assertTrue(self.logged("后撤超时仍被贴脸"))
 
 
-class RelocateTests(Base):
-    def test_wiggles_when_self_lost_too_long(self):
+class SelfLostTests(Base):
+    def test_long_loss_does_not_walk_back_and_forth(self):
+        """定位长时间丢失不再左右来回走：方向不会每 0.4 秒翻一次。"""
         e = self.engine()
-        e._self_pos_stale_frames = e._frames(SELF_LOST_RELOCATE_SECONDS) + 1
-        e.decide(Context(frame_width=1920, frame_height=1080))
-        self.assertEqual(e._wiggle_dir, "right")   # 没有历史位置 → 先往画面中间(右)
-        self.assertIn("right", e.executor.held)
-        self.assertTrue(self.logged("认不出自己"))
-
-        self.clock.t += 0.5
-        e.decide(Context(frame_width=1920, frame_height=1080))
-        self.assertEqual(e._wiggle_dir, "left")    # 到点换方向
-
-    def test_resumes_when_self_found_again(self):
-        e = self.engine()
-        e._self_pos_stale_frames = e._frames(SELF_LOST_RELOCATE_SECONDS) + 1
-        e.decide(Context(frame_width=1920, frame_height=1080))
-        self.assertIsNotNone(e._wiggle_dir)
-        e.decide(Context(self_position=(1000, GROUND),
-                         frame_width=1920, frame_height=1080))
-        self.assertIsNone(e._wiggle_dir)
-        self.assertTrue(self.logged("重新认出自己"))
-
-    def test_short_loss_does_not_wiggle(self):
-        e = self.engine()
-        e._self_pos_stale_frames = 5                # 远小于阈值
-        e._last_self_pos = (1000, GROUND)
-        e.decide(Context(monsters=[monster(1200)],
-                         frame_width=1920, frame_height=1080))
-        self.assertIsNone(e._wiggle_dir)
+        e._last_self_pos = (1000, GROUND)          # 曾经定位到过
+        held = []
+        for _ in range(6):
+            e._self_pos_stale_frames = e._frames(10)   # 远超 2.5 秒阈值
+            self.clock.t += 0.5
+            e.decide(Context(monsters=[monster(1200)],
+                             frame_width=1920, frame_height=1080))
+            held.append(tuple(e.executor.held))
+        self.assertEqual(len(set(held)), 1)        # 始终同一方向，不来回切换
         self.assertFalse(self.logged("认不出自己"))
 
 

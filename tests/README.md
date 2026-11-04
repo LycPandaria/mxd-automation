@@ -19,7 +19,7 @@ PYTHONPATH=. python -m unittest discover -s tests -t . -v
 | `test_smoke.py` | 冒烟：加血、射程内出手、无怪探索、空 Context、同平台判定 |
 | `test_range_limit.py` | 活动范围：线外怪过滤、分界线/分界比例、过线走回、无黄点时原地、站桩只过滤 |
 | `test_ghost.py` | 残影：出手次数 + 静止判定 + 位置记忆（8→16→…→300s）、跳过与不重锁、活怪 2 倍 |
-| `test_chase_retreat.py` | 追击：刚出手先等怪过来、卡住两次放弃；近身：最近威胁判后撤、撤不动跳过怪；定位丢失左右走动 |
+| `test_chase_retreat.py` | 追击：刚出手先等怪过来、卡住两次放弃；近身：最近威胁判后撤、撤不动跳过怪；定位丢失不再左右走动 |
 
 ## 与分享包（share-baseline 分支）测试的关系
 
@@ -29,7 +29,7 @@ PYTHONPATH=. python -m unittest discover -s tests -t . -v
 
 - 已移植：`Context.frame_height/frame_width`、`_px()`、`_range_step`（活动范围）、
   `_last_cast_at`、残影 `_in_ghost_zone`、`_monster_nearby`（追击耐心）、
-  后撤突围与定位丢失左右走
+  后撤突围（定位丢失左右走按实机反馈已移除，不移植）
 - 尚未移植：`_jump_by_distance`（跳跃攻击）、`_track_hits` / `_check_drift`
   （击退感知的卡键检测）、`_stand_*` 回位
 

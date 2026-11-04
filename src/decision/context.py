@@ -158,15 +158,6 @@ ESCAPE_MAX_TIME = 2.5
 ESCAPE_STUCK_FRAMES = 15
 """突围时位置连续这么多帧基本不动 → 再跳一次。"""
 
-# ---- 认不出自己（自身定位丢失）----
-SELF_LOST_RELOCATE_SECONDS = 2.5
-"""连续认不出自己超过这么久 → 先不打怪、不探索，左右走动帮助重新定位
-（名字被挡/框分数低/站在画面边上时，走动一下往往就认出来了）。
-短于这个时间的定位丢失仍按原有逻辑用最后已知位置兜底。"""
-
-RELOCATE_STEP_SECONDS = 0.4
-"""左右走动时每个方向按这么久（秒）再换边。"""
-
 OCCLUSION_RETREAT_X = 50
 """长手(远程)遮挡判定阈值（像素）：攻击中锁定目标消失且最后已知水平距离
 < 此值时，判定为"被角色/特效遮挡"(怪贴脸)而非死亡 → 用最后位置后撤。"""
@@ -755,8 +746,6 @@ class DecisionEngine:
         self._escape_retry_at = 0.0               # 突围没成功时，到这个时间才允许再突围
         self._chase_stuck = 0                     # 追当前目标时连续卡住的次数
         self._chase_stuck_target: Optional[Detection] = None
-        self._wiggle_dir: Optional[str] = None    # 认不出自己时左右走动的当前方向，None = 没在走动
-        self._wiggle_switch = 0.0                 # 到这个时间换方向
         self._occluded_retreat_frames = 0         # 长手遮挡后撤的连续帧数（防无限后撤）
         self._prev_hp_ratio: Optional[float] = None  # 上一帧血量（掉血检测）
         self._hp_drop_active_frames = 0           # 掉血信号剩余有效帧数
@@ -845,8 +834,6 @@ class DecisionEngine:
         self._escape_retry_at = 0.0
         self._chase_stuck = 0
         self._chase_stuck_target = None
-        self._wiggle_dir = None
-        self._wiggle_switch = 0.0
         self._occluded_retreat_frames = 0
         self._prev_hp_ratio = None
         self._hp_drop_active_frames = 0
@@ -988,19 +975,6 @@ class DecisionEngine:
         # 微动期间这一帧不攻击（和 buff 施法窗口同一个套路）。
         if self._micro_move_tick(ctx):
             return
-
-        # ---- 认不出自己太久：先不打怪、不探索，左右走动帮助重新定位 ----
-        # 短时丢失（< SELF_LOST_RELOCATE_SECONDS）仍按各分支的"最后已知位置"兜底；
-        # 持续认不出还在按旧坐标打，就是对着空气输出、或者用探索方向键越走越远。
-        if ctx.self_position is None \
-                and not self._is_stand_mode() \
-                and self._self_pos_stale_frames > self._frames(SELF_LOST_RELOCATE_SECONDS):
-            self._relocate_wiggle(ctx)
-            return
-        if self._wiggle_dir is not None:
-            self._wiggle_dir = None
-            self._release_move()
-            self._log("[定位] 重新认出自己，继续打怪")
 
         # ---- 活动范围：去掉线外的怪、走出范围先走回来 ----
         # 放在怪物处理之前：之后选目标/追击/后撤/探索都看不到线外的怪。
@@ -3537,29 +3511,6 @@ class DecisionEngine:
         if self._attack_busy():
             return
         self._cast_attack_skill()
-
-    def _relocate_wiggle(self, ctx: Context):
-        """认不出自己时左右来回走：先往画面中间走（贴着边时名字/框常被挡），
-        每 RELOCATE_STEP_SECONDS 秒换一次方向，直到重新定位。期间不攻击、不探索。
-
-        与"短时定位丢失仍按最后已知位置兜底"的分工：
-        短暂的（< SELF_LOST_RELOCATE_SECONDS）继续用最后位置打；持续认不出才走动找自己，
-        否则会对着过时坐标一直打空气、或用探索方向键把角色越带越远。
-        """
-        now = time.time()
-        if self._wiggle_dir is None:
-            lx = self._last_self_pos[0] if self._last_self_pos else None
-            w = ctx.frame_width or 1920
-            self._wiggle_dir = "right" if lx is None or lx < w / 2 else "left"
-            self._wiggle_switch = now + RELOCATE_STEP_SECONDS
-            self._target_monster = None
-            self._casts_on_target = 0
-            self._fsm.transition(State.IDLE)
-            self._log("[定位] 认不出自己，先不打怪，左右走动一下重新定位")
-        elif now >= self._wiggle_switch:
-            self._wiggle_dir = "left" if self._wiggle_dir == "right" else "right"
-            self._wiggle_switch = now + RELOCATE_STEP_SECONDS
-        self._hold_move(self._wiggle_dir)
 
     def _explore(self, ctx: Context):
         """画面里没怪时，往一个方向走探索。
