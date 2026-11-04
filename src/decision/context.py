@@ -134,6 +134,39 @@ MICRO_MOVE_EDGE_LOOKAHEAD_X = 15
 """防落崖前瞻距离（像素）：只覆盖一次微动的位移量级（几像素），
 所以比后撤用的 RETREAT_EDGE_LOOKAHEAD_X(45) 近得多，不会动不动就跳过。"""
 
+# ---- 追击节奏 ----
+CHASE_PATIENCE_SECONDS = 1.0
+"""刚出过手这么久内，攻击距离外的怪先不追，原地等它过来（有怪进入攻击距离会立刻打）。
+怪多、还有人抢怪时，刚打完一只就跑去追远处的，常常追一半又掉头，来回白跑"""
+
+CHASE_WAIT_MARGIN = 50
+"""只有同一层离攻击距离不到这么远（px）的地方还有怪时才按 CHASE_PATIENCE_SECONDS 原地等。
+再远的怪等也要等好一会儿，走几步过去更快。"""
+
+CHASE_STUCK_GIVEUP = 2
+"""追击中连续卡住这么多次（每次约 STUCK_FRAMES 帧不动，会先跳一下）还没追到 → 放弃该目标，
+把那个位置当残影暂时忽略（地图尽头/墙/怪飘在平台外，走过去也打不到）"""
+
+# ---- 后撤 / 翻越突围 ----
+RETREAT_MAX_SECONDS = 1.5
+"""后撤持续这么久还贴着怪（撞墙、被地形挡住）→ 改为翻越突围：朝怪方向起跳越过它。
+后撤期间不放技能，一直退不动等于白停手。"""
+
+ESCAPE_MAX_TIME = 2.5
+"""翻越突围的最长时间（秒），超时就结束突围。"""
+
+ESCAPE_STUCK_FRAMES = 15
+"""突围时位置连续这么多帧基本不动 → 再跳一次。"""
+
+# ---- 认不出自己（自身定位丢失）----
+SELF_LOST_RELOCATE_SECONDS = 2.5
+"""连续认不出自己超过这么久 → 先不打怪、不探索，左右走动帮助重新定位
+（名字被挡/框分数低/站在画面边上时，走动一下往往就认出来了）。
+短于这个时间的定位丢失仍按原有逻辑用最后已知位置兜底。"""
+
+RELOCATE_STEP_SECONDS = 0.4
+"""左右走动时每个方向按这么久（秒）再换边。"""
+
 OCCLUSION_RETREAT_X = 50
 """长手(远程)遮挡判定阈值（像素）：攻击中锁定目标消失且最后已知水平距离
 < 此值时，判定为"被角色/特效遮挡"(怪贴脸)而非死亡 → 用最后位置后撤。"""
@@ -716,6 +749,14 @@ class DecisionEngine:
         self._nearer_candidate: Optional[Detection] = None  # 更近怪抢占据防抖：候选目标
         self._nearer_frames = 0                   # 该候选连续满足条件的帧数
         self._retreating = False                  # 长手是否正在后撤拉开距离（保持最小射程）
+        self._retreat_started_at = 0.0            # 本次后撤开始时间（超时转突围用）
+        self._escape_started = 0.0                # 本次翻越突围开始时间，0 = 没在突围
+        self._escape_dir: Optional[str] = None    # 突围方向（朝怪物，越过它）
+        self._escape_retry_at = 0.0               # 突围没成功时，到这个时间才允许再突围
+        self._chase_stuck = 0                     # 追当前目标时连续卡住的次数
+        self._chase_stuck_target: Optional[Detection] = None
+        self._wiggle_dir: Optional[str] = None    # 认不出自己时左右走动的当前方向，None = 没在走动
+        self._wiggle_switch = 0.0                 # 到这个时间换方向
         self._occluded_retreat_frames = 0         # 长手遮挡后撤的连续帧数（防无限后撤）
         self._prev_hp_ratio: Optional[float] = None  # 上一帧血量（掉血检测）
         self._hp_drop_active_frames = 0           # 掉血信号剩余有效帧数
@@ -797,6 +838,15 @@ class DecisionEngine:
         self._target_wait_warned = False
         self._nearer_candidate = None
         self._nearer_frames = 0
+        self._retreating = False
+        self._retreat_started_at = 0.0
+        self._escape_started = 0.0
+        self._escape_dir = None
+        self._escape_retry_at = 0.0
+        self._chase_stuck = 0
+        self._chase_stuck_target = None
+        self._wiggle_dir = None
+        self._wiggle_switch = 0.0
         self._occluded_retreat_frames = 0
         self._prev_hp_ratio = None
         self._hp_drop_active_frames = 0
@@ -938,6 +988,19 @@ class DecisionEngine:
         # 微动期间这一帧不攻击（和 buff 施法窗口同一个套路）。
         if self._micro_move_tick(ctx):
             return
+
+        # ---- 认不出自己太久：先不打怪、不探索，左右走动帮助重新定位 ----
+        # 短时丢失（< SELF_LOST_RELOCATE_SECONDS）仍按各分支的"最后已知位置"兜底；
+        # 持续认不出还在按旧坐标打，就是对着空气输出、或者用探索方向键越走越远。
+        if ctx.self_position is None \
+                and not self._is_stand_mode() \
+                and self._self_pos_stale_frames > self._frames(SELF_LOST_RELOCATE_SECONDS):
+            self._relocate_wiggle(ctx)
+            return
+        if self._wiggle_dir is not None:
+            self._wiggle_dir = None
+            self._release_move()
+            self._log("[定位] 重新认出自己，继续打怪")
 
         # ---- 活动范围：去掉线外的怪、走出范围先走回来 ----
         # 放在怪物处理之前：之后选目标/追击/后撤/探索都看不到线外的怪。
@@ -1145,16 +1208,30 @@ class DecisionEngine:
         #   · 最小射程 ≤ 水平差 ≤ 攻击距离 → 站定攻击（不移动、不乱跑）
         #   · 否则 → 朝怪物直线移动逼近，进入攻击距离后再打
         if self._same_platform(py, monster_foot[1]):
-            dx = abs(px - mx)
+            # 贴脸判定看"同一层离自己最近的怪"，不只是锁定目标：
+            # 锁定目标可能在射程边缘，而另一只已经贴到脸上。
             min_range = self._get_min_attack_range()
-            if min_range > 0 and not self._is_stand_mode() \
-                    and self._should_retreat(dx, min_range):
+            threat = self._nearest_threat(ctx, target) or target
+            tdx = abs(px - threat.center[0])
+            want_retreat = (min_range > 0 and not self._is_stand_mode()
+                            and self._should_retreat(tdx, min_range))
+            if not want_retreat:
+                # 不再需要后撤 → 结束可能还在进行的突围（否则下次后撤会沿用旧突围状态）
+                self._escape_started = 0.0
+                self._escape_dir = None
+            if want_retreat:
                 self._fsm.transition(State.CHASING)
-                self._retreat(ctx, target, reason="贴脸挥弓")
+                self._retreat(ctx, threat, reason="贴脸挥弓")
             elif self._can_attack(ctx, target):
                 self._retreating = False
                 self._fsm.transition(State.ATTACKING)
                 self._attack(ctx, target)
+            elif time.time() - self._last_cast_at < CHASE_PATIENCE_SECONDS \
+                    and self._monster_nearby(ctx, px, py):
+                # 刚出过手、附近还有怪：先原地等一下，别马上跑去追远处的
+                # （怪多/有人抢怪时，追一半又掉头，来回白跑）
+                self._retreating = False
+                self._release_move()
             else:
                 self._retreating = False
                 self._fsm.transition(State.CHASING)
@@ -2630,6 +2707,16 @@ class DecisionEngine:
     # 追击（同平台）
     # =========================================================================
 
+    def _monster_nearby(self, ctx: Context, px: int, py: int) -> bool:
+        """同一层离攻击距离不到 CHASE_WAIT_MARGIN 的地方有没有怪（不含残影位置）。
+
+        决定"刚出过手要不要原地等它过来"：只有它真的快到了才值得等，
+        远处的怪等一秒不如走几步过去。
+        """
+        reach = self._get_attack_range() + self._px(CHASE_WAIT_MARGIN)
+        return any(self._same_platform(py, m.y + m.h) and not self._in_ghost_zone(m)
+                   and abs(m.center[0] - px) <= reach for m in ctx.monsters)
+
     def _chase(self, ctx: Context, target: Detection):
         """按住方向键持续走向怪物（同一平台内直线接近）。
 
@@ -2654,11 +2741,28 @@ class DecisionEngine:
         attack_range = self._get_attack_range()
         is_melee = getattr(self.config, "attack_type", "long") == "short"
 
+        # ---- 卡住：先跳一下，连续卡两次就放弃该目标 ----
+        # 地图尽头/墙/怪飘在平台外时，跳也过不去；一直顶着走只会原地空转。
+        if self._chase_stuck_target is None or not self._is_same_monster(self._chase_stuck_target, target):
+            self._chase_stuck = 0
+        self._chase_stuck_target = target
         if self._stuck_counter >= STUCK_FRAMES:
+            self._stuck_counter = 0
+            self._chase_stuck += 1
+            if self._chase_stuck >= CHASE_STUCK_GIVEUP:
+                # 跳了也过不去 → 放弃它，暂时忽略这个位置（避免反复去撞）
+                seconds, count = self._mark_ghost(target)
+                self._log(f"[换目标] 追击卡住 {self._chase_stuck} 次还没追到"
+                          f"（{'右' if tx > sx else '左'}边 {abs(tx - sx)}px），"
+                          f"第 {count} 次判定，{seconds:.0f} 秒内忽略该位置")
+                self._chase_stuck = 0
+                self._target_monster = None
+                self._casts_on_target = 0
+                self._release_move()
+                return
             self._log("[追击] 卡住了，尝试跳跃")
             self._release_move()
-            self.executor.press_key(self.config.jump_key, cooldown=1.0)
-            self._stuck_counter = 0
+            self._press_jump()
             return
 
         # ---- 方向滞回：x 差超过死区才切换方向 ----
@@ -2707,18 +2811,57 @@ class DecisionEngine:
         解决"弓箭手贴脸挥弓"问题：贴脸时先退到最小射程之外再射箭，
         后撤期间不放技能（避免边退边挥弓）。
         边缘安全：后退方向前方没地板时不后退；有目标时原地攻击兜底。
+        撤不动（前方没地板/到地图边缘/退超时还贴脸）→ 翻越突围：朝怪方向起跳越过它，
+        到另一侧再拉开距离（一直退不动等于白停手，后撤期间是不放技能的）。
         """
         foot = self._effective_self_pos(ctx)
         if foot is None:
             self._release_move()
             return
         sx, sy = foot
+        now = time.time()
+        min_range = self._get_min_attack_range()
+        # 只有"开了最小射程 + 有目标 + 长手"才考虑跳过怪物突围：
+        # 短手的目标就是贴脸，跳过去是反效果；掉血兜底没有目标时也无从判断往哪跳。
+        can_escape = (min_range > 0 and target is not None
+                      and getattr(self.config, "attack_type", "long") != "short")
+
+        # ---- 突围中：按住朝怪方向跳过去，越过/超时/到边缘就结束 ----
+        if self._escape_started:
+            if target is None or self._escape_dir is None:
+                # 目标丢了/状态异常：结束突围，别按着方向键继续冲
+                self._escape_started = 0.0
+                self._escape_dir = None
+                self._release_move()
+                return
+            tx = target.center[0]
+            dir_sign = 1 if self._escape_dir == "right" else -1
+            passed = (tx - sx) * dir_sign < 0        # 已经到怪物另一侧
+            dist = abs(tx - sx)
+            if (passed and dist >= min_range) \
+                    or now - self._escape_started >= ESCAPE_MAX_TIME \
+                    or self._at_edge(ctx, self._escape_dir):
+                self._escape_started = 0.0
+                self._escape_dir = None
+                self._stuck_counter = 0
+                self._retreating = False
+                self._release_move()
+                if not passed or dist < min_range:
+                    # 没跳过去 / 跳过去还贴脸：先原地打一会儿，别原地反复跳
+                    self._escape_retry_at = now + 2.0
+                    self._log("[后撤] 突围没拉开距离，先原地打，稍后再试")
+                return
+            if self._stuck_counter >= ESCAPE_STUCK_FRAMES:
+                self._stuck_counter = 0
+                self._escape_jump()
+            self._hold_move(self._escape_dir)
+            return
 
         # 卡住 → 跳（与 _chase 一致）
         if self._stuck_counter >= STUCK_FRAMES:
             self._log("[后撤] 卡住了，尝试跳跃")
             self._release_move()
-            self.executor.press_key(self.config.jump_key, cooldown=1.0)
+            self._press_jump()
             self._stuck_counter = 0
             return
 
@@ -2737,19 +2880,67 @@ class DecisionEngine:
                 else:
                     direction = "right" if self._face_dir == "left" else "left"
 
-        # 边缘安全：前方没地板 → 不后退；有目标时原地攻击兜底
+        # 边缘安全：前方没地板 → 不能后退
         if not self._floor_ahead(ctx, sx, sy, direction):
+            if can_escape and now >= self._escape_retry_at:
+                self._start_escape(target, sx, "前方没地板/已到边缘")
+                return
             self._retreating = False
             if target is not None:
                 self._fsm.transition(State.ATTACKING)
                 self._attack(ctx, target)
             return
 
+        # 退超时还贴着怪（撞墙/被地形挡住）→ 跳过怪物到另一侧
+        if can_escape and self._retreating \
+                and now - self._retreat_started_at >= RETREAT_MAX_SECONDS \
+                and abs(sx - target.center[0]) < min_range \
+                and now >= self._escape_retry_at:
+            self._start_escape(target, sx, "后撤超时仍被贴脸")
+            return
+
         if not self._retreating:
+            self._retreat_started_at = now
             dx_str = f", dx={abs(sx - target.center[0])}px" if target is not None else ""
             self._log(f"[后撤] 触发后撤({reason}){dx_str}，方向={direction}")
         self._hold_move(direction)
         self._retreating = True
+
+    def _nearest_threat(self, ctx: Context, target: Optional[Detection]) -> Optional[Detection]:
+        """同一层水平距离离自己最近的怪（含锁定目标，不含残影位置）。
+
+        后撤/贴脸判定要躲的是"离自己最近的那只"，不只是锁定目标：
+        锁定目标可能在射程边缘，而另一只已经贴到脸上——只看锁定目标会以为还安全。
+        """
+        foot = self._effective_self_pos(ctx)
+        if foot is None:
+            return target
+        sx, sy = foot
+        cands = [m for m in ctx.monsters
+                 if self._same_platform(sy, m.y + m.h) and not self._in_ghost_zone(m)]
+        if target is not None:
+            cands.append(target)
+        if not cands:
+            return target
+        return min(cands, key=lambda m: abs(m.center[0] - sx))
+
+    def _start_escape(self, target: Detection, sx: int, why: str):
+        """开始翻越突围：朝怪物方向起跳，越过它跑到另一侧。"""
+        self._escape_dir = "right" if target.center[0] > sx else "left"
+        self._escape_started = time.time()
+        self._stuck_counter = 0
+        self._retreating = False
+        self._log(f"[后撤] {why}，跳过怪物到另一侧再拉开距离")
+        self._hold_move(self._escape_dir)
+        self._escape_jump()
+
+    def _escape_jump(self):
+        """突围起跳（按住方向键的状态下按跳跃）。"""
+        self._press_jump()
+
+    def _press_jump(self) -> bool:
+        """按跳跃键（1 秒冷却，防止连按被游戏丢）。"""
+        return self.executor.press_key(self.config.jump_key, cooldown=1.0)
 
     def _floor_ahead(self, ctx: Context, sx: int, sy: int, direction: str,
                      lookahead: int = RETREAT_EDGE_LOOKAHEAD_X) -> bool:
@@ -3347,6 +3538,29 @@ class DecisionEngine:
             return
         self._cast_attack_skill()
 
+    def _relocate_wiggle(self, ctx: Context):
+        """认不出自己时左右来回走：先往画面中间走（贴着边时名字/框常被挡），
+        每 RELOCATE_STEP_SECONDS 秒换一次方向，直到重新定位。期间不攻击、不探索。
+
+        与"短时定位丢失仍按最后已知位置兜底"的分工：
+        短暂的（< SELF_LOST_RELOCATE_SECONDS）继续用最后位置打；持续认不出才走动找自己，
+        否则会对着过时坐标一直打空气、或用探索方向键把角色越带越远。
+        """
+        now = time.time()
+        if self._wiggle_dir is None:
+            lx = self._last_self_pos[0] if self._last_self_pos else None
+            w = ctx.frame_width or 1920
+            self._wiggle_dir = "right" if lx is None or lx < w / 2 else "left"
+            self._wiggle_switch = now + RELOCATE_STEP_SECONDS
+            self._target_monster = None
+            self._casts_on_target = 0
+            self._fsm.transition(State.IDLE)
+            self._log("[定位] 认不出自己，先不打怪，左右走动一下重新定位")
+        elif now >= self._wiggle_switch:
+            self._wiggle_dir = "left" if self._wiggle_dir == "right" else "right"
+            self._wiggle_switch = now + RELOCATE_STEP_SECONDS
+        self._hold_move(self._wiggle_dir)
+
     def _explore(self, ctx: Context):
         """画面里没怪时，往一个方向走探索。
 
@@ -3569,7 +3783,9 @@ class DecisionEngine:
         return False
 
     def _at_edge(self, ctx: Context, direction: str) -> bool:
-        """再往 direction 走就贴到画面边缘（地图尽头）了。"""
+        """再往 direction 走就贴到画面边缘（地图尽头）或活动范围的分界线了。"""
+        if self._at_range_line(ctx, direction):
+            return True
         if ctx.self_position is None or not ctx.frame_width:
             return False
         margin = self._px(EDGE_MARGIN)

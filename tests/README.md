@@ -19,6 +19,7 @@ PYTHONPATH=. python -m unittest discover -s tests -t . -v
 | `test_smoke.py` | 冒烟：加血、射程内出手、无怪探索、空 Context、同平台判定 |
 | `test_range_limit.py` | 活动范围：线外怪过滤、分界线/分界比例、过线走回、无黄点时原地、站桩只过滤 |
 | `test_ghost.py` | 残影：出手次数 + 静止判定 + 位置记忆（8→16→…→300s）、跳过与不重锁、活怪 2 倍 |
+| `test_chase_retreat.py` | 追击：刚出手先等怪过来、卡住两次放弃；近身：最近威胁判后撤、撤不动跳过怪；定位丢失左右走动 |
 
 ## 与分享包（share-baseline 分支）测试的关系
 
@@ -27,9 +28,10 @@ PYTHONPATH=. python -m unittest discover -s tests -t . -v
 质量很高。随着移植推进，依赖的接口逐项补齐：
 
 - 已移植：`Context.frame_height/frame_width`、`_px()`、`_range_step`（活动范围）、
-  `_last_cast_at`、残影 `_in_ghost_zone`
-- 尚未移植：`_monster_nearby` / `_jump_by_distance`（跳跃攻击 + 追击耐心）、
-  `_track_hits` / `_check_drift`（击退感知的卡键检测）、`_stand_*` 回位
+  `_last_cast_at`、残影 `_in_ghost_zone`、`_monster_nearby`（追击耐心）、
+  后撤突围与定位丢失左右走
+- 尚未移植：`_jump_by_distance`（跳跃攻击）、`_track_hits` / `_check_drift`
+  （击退感知的卡键检测）、`_stand_*` 回位
 
 分享包里还没搬过来的用例仍留在 `share-baseline` 分支，**随功能一起移植**——
 每移植一个功能，就把对应用例搬到本目录并改成本地接口（例如 `test_range_limit.py`
