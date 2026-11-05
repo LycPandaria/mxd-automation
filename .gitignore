@@ -26,3 +26,4 @@ weights/
 # 运行时输出（换频道诊断截图、经验记录）
 channel_debug/
 exp_log/
+quit_debug/

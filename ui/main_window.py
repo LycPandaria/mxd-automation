@@ -29,9 +29,9 @@ from PyQt5.QtWidgets import (
     QPushButton, QLabel, QLineEdit, QComboBox, QSlider, QGroupBox,
     QGridLayout, QTableWidget, QTableWidgetItem, QHeaderView,
     QPlainTextEdit, QCheckBox, QFileDialog, QMessageBox, QSplitter,
-    QAbstractItemView, QSpinBox, QDoubleSpinBox, QDialog, QSizePolicy,
+    QAbstractItemView, QSpinBox, QDoubleSpinBox, QDialog, QSizePolicy, QTimeEdit,
 )
-from PyQt5.QtCore import Qt, QTimer, pyqtSignal, pyqtSlot, QMetaObject
+from PyQt5.QtCore import Qt, QTime, QTimer, pyqtSignal, pyqtSlot, QMetaObject
 from PyQt5.QtGui import QImage, QPixmap
 
 from src.utils.config_loader import (
@@ -596,6 +596,22 @@ class MainWindow(QMainWindow):
         channel_row.addStretch()
         v.addLayout(channel_row)
 
+        # 定时结束游戏
+        quit_row = QHBoxLayout()
+        self.quit_checkbox = QCheckBox("定时结束游戏")
+        self.quit_checkbox.setToolTip(
+            "点「开始」后，下一次到这个时间就不打了：Esc → 点「退出游戏」→ 有确认框就回车，\n"
+            "回到登录界面后停止打怪、不再按任何键。\n"
+            "现在 23:00、设 06:30 就是明天早上 6:30。测谎中不动，测谎通过后再退"
+        )
+        quit_row.addWidget(self.quit_checkbox)
+        self.quit_time_edit = QTimeEdit()
+        self.quit_time_edit.setDisplayFormat("HH:mm")
+        self.quit_time_edit.setFixedWidth(80)
+        quit_row.addWidget(self.quit_time_edit)
+        quit_row.addStretch()
+        v.addLayout(quit_row)
+
         # 经验记录
         exp_row = QHBoxLayout()
         self.exp_checkbox = QCheckBox("记录经验")
@@ -776,10 +792,13 @@ class MainWindow(QMainWindow):
         self.minimap_region_label.setText(
             "已框选" if getattr(c, "minimap_region", None) else "未框选"
         )
-        # 换频道 / 经验
+        # 换频道 / 定时结束 / 经验
         self.channel_checkbox.setChecked(bool(getattr(c, "channel_enabled", False)))
         self.channel_idle_spin.setValue(int(getattr(c, "channel_idle_min", 3)))
         self.channel_hold_spin.setValue(int(getattr(c, "channel_hold_seconds", 5)))
+        self.quit_checkbox.setChecked(bool(getattr(c, "quit_enabled", False)))
+        quit_time = QTime.fromString(str(getattr(c, "quit_time", "06:00")), "HH:mm")
+        self.quit_time_edit.setTime(quit_time if quit_time.isValid() else QTime(6, 0))
         self.exp_checkbox.setChecked(bool(getattr(c, "exp_enabled", True)))
         # 拾取
         self.pickup_checkbox.setChecked(getattr(c, "pickup_enabled", True))
@@ -846,10 +865,12 @@ class MainWindow(QMainWindow):
         # 活动范围
         c.range_limit = self.range_combo.currentData()
         c.range_split = self.range_split_spin.value() / 100.0
-        # 换频道 / 经验
+        # 换频道 / 定时结束 / 经验
         c.channel_enabled = self.channel_checkbox.isChecked()
         c.channel_idle_min = self.channel_idle_spin.value()
         c.channel_hold_seconds = self.channel_hold_spin.value()
+        c.quit_enabled = self.quit_checkbox.isChecked()
+        c.quit_time = self.quit_time_edit.time().toString("HH:mm")
         c.exp_enabled = self.exp_checkbox.isChecked()
         # 拾取
         c.pickup_enabled = self.pickup_checkbox.isChecked()
@@ -1233,12 +1254,23 @@ class MainWindow(QMainWindow):
     def _stop_run(self):
         """停止自动打怪并复位按钮状态（供手动停止 / 测谎报警共用）。"""
         self.automation.stop()
+        self._show_stopped()
+
+    def _show_stopped(self):
+        """复位"已停止"的界面状态（重复调用无副作用）。
+
+        除了手动点停止，主循环也可能自己停（定时结束游戏、测谎后未自动恢复），
+        那时按钮还停在"⏹ 停止"上；_update_fps 发现没在跑就调这里。
+        """
         self.run_btn.setText("▶ 开始自动打怪")
         self.run_btn.setStyleSheet(
             "padding:10px;font-size:14px;font-weight:bold;"
             "background-color:#27ae60;color:white;"
         )
         self.preview_once_btn.setEnabled(True)
+        if not self.automation.window_locked:
+            self.win_status.setText("未锁定")
+            self.win_status.setStyleSheet("")
 
     def _set_running_ui(self):
         """运行中的按钮/计时器状态（手动启动与测谎自动恢复共用）。"""
@@ -1520,6 +1552,7 @@ class MainWindow(QMainWindow):
                 pass
         if not self.automation.running:
             self._preview_timer.stop()
+            self._show_stopped()  # 也可能是定时结束游戏/测谎自己停的
 
     def _log(self, msg):
         self.log_signal.emit(msg)

@@ -67,7 +67,8 @@ from .perception.lie_recorder import LieRecorder, LieLog, client_cursor
 from .perception.minimap_locator import MinimapLocator
 from .perception.exp_meter import ExpMeter
 from .execution.channel_switch import (
-    ChannelSwitcher, ChannelTimer, MAX_IDLE_RUNS, RETRY_SECONDS,
+    ChannelSwitcher, ChannelTimer, GameQuitter, MAX_IDLE_RUNS, RETRY_SECONDS,
+    next_quit_at,
 )
 from .execution.action_executor import ActionExecutor
 from .decision.context import Context, DecisionEngine
@@ -259,6 +260,12 @@ class Automation:
         self._channel_busy = threading.Lock()
         self._channel_timer = ChannelTimer()
 
+        # ---- 定时结束游戏：到 quit_time 就不打了，按 Esc 点「退出游戏」----
+        self._quitter = GameQuitter(self.capture, self.executor, config, on_log=self.on_log)
+        self._quitter.on_frame = self._lie_probe_frame
+        self._quitter.abort = lambda: self._lie_probe_hit
+        self._quit_at: Optional[float] = None
+
         # ---- 经验记录：定时读状态栏的 EXP，写到 exp_log/日期.csv ----
         self._exp = ExpMeter(on_log=self.on_log)
 
@@ -354,6 +361,7 @@ class Automation:
 
         # ---- 外围自动化状态复位 ----
         self._channel_timer.start(time.time())
+        self._schedule_quit()
         self._exp.read_seconds = float(getattr(self.config, "exp_read_seconds", 5) or 5)
         self._exp.log_minutes = float(getattr(self.config, "exp_log_minutes", 10) or 0)
         self._exp.start(time.time())
@@ -471,6 +479,38 @@ class Automation:
                 self.on_log("[换频道] 检测到测谎弹窗，已中止；菜单等测谎结束后再关")
             self.engine.reset()
             self._channel_busy.release()
+
+    def _schedule_quit(self):
+        """点「开始」时算好这次几点结束游戏：钟点今天已经过了就是明天。"""
+        self._quit_at = None
+        if not getattr(self.config, "quit_enabled", False):
+            return
+        text = getattr(self.config, "quit_time", "")
+        now = time.time()
+        self._quit_at = next_quit_at(text, now)
+        if self._quit_at is None:
+            self.on_log(f"[定时] 结束时间 {text} 写得不对，要写成 06:30 这样，这次不定时")
+            return
+        minutes = int((self._quit_at - now) // 60)
+        self.on_log(f"[定时] {time.strftime('%m-%d %H:%M', time.localtime(self._quit_at))} 结束游戏"
+                    f"（还有 {minutes // 60} 小时 {minutes % 60} 分）")
+
+    def _do_quit(self):
+        """到时间了：松开所有键，退出游戏，然后停止打怪。没退出去也不再打。"""
+        self.on_log("[定时] 到时间了，不打了")
+        self.engine.release_keys()
+        time.sleep(0.8)  # 等落地、技能动作做完
+        self._lie_probe_hit = False
+        self._quitter.abort = lambda: not self._running or self._lie_probe_hit
+        ok = self._quitter.run()
+        if self._quitter.aborted:
+            return  # 点了停止就到此为止；测谎弹出来了就等测谎结束，再回到这里接着退
+        self._quit_at = None
+        self.on_log("[定时] 已离开游戏，不再操作" if ok
+                    else "[定时] 没退出去，打怪已停止，游戏还开着")
+        self.stop()
+        if ok:
+            self.capture.unlock()  # 窗口可能没了，下次点「开始」重新锁定
 
     # =========================================================================
     # 测谎弹窗（反外挂）
@@ -808,6 +848,11 @@ class Automation:
         # ---- 1.6 经验记录：定时读状态栏的 EXP（后台线程，不占本帧）----
         if getattr(self.config, "exp_enabled", True):
             self._exp.feed(frame, time.time())
+
+        # ---- 1.65 定时结束游戏：测谎中走不到这里，测谎结束后再退 ----
+        if self._quit_at is not None and time.time() >= self._quit_at:
+            self._do_quit()
+            return
 
         # ---- 1.7 自动换频道：这层好几分钟没打到怪（或按了测试按钮）就换一个频道 ----
         if self._channel_requested or self._channel_due():

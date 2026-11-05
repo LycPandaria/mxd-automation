@@ -14,6 +14,7 @@
 """
 import os
 import time
+from datetime import datetime, timedelta
 from typing import Callable, List, Optional, Tuple
 
 import cv2
@@ -28,6 +29,8 @@ MENU_ROW_GAP = 29
 """游戏菜单相邻两行的间距（px）"""
 MENU_MIN_ROWS = 4
 """至少这么多行上下对齐才算菜单：切换频道/系统选项/隐私政策/…/退出游戏，一共 6 行"""
+MENU_QUIT_ROW = 5
+"""「退出游戏」是第几行（最上面的「切换频道」是第 0 行）"""
 
 DIALOG_BAR = (432, 22)
 """频道窗口顶部蓝条（写着服务器名）的宽、高（px）：整个窗口按它定位"""
@@ -71,6 +74,17 @@ MAX_IDLE_RUNS = 5
 DEBUG_DIR = "channel_debug"
 """每次换频道的截图存这里：点之前（红圈标出点击位置）和没反应时的画面"""
 
+QUIT_DEBUG_DIR = "quit_debug"
+"""每次定时结束游戏的截图存这里，没退出去时看这些图"""
+QUIT_LEAVE_TIMEOUT = 6.0
+"""点「退出游戏」或按回车后，等这么久还在游戏里就进行下一步（秒）"""
+QUIT_LEFT_FRAMES = 5
+"""连续这么多次看不到游戏画面（底部按钮没了、截不到图）才算离开了游戏"""
+HUD_BUTTON = (67, 24)
+"""游戏画面底部状态栏上青蓝色小按钮的宽、高（px），一直都在；登录界面没有"""
+HUD_AREA = 0.92
+"""这些按钮在画面高度这个比例以下"""
+
 
 def _cyan_mask(frame: np.ndarray) -> np.ndarray:
     """菜单行、频道窗口蓝条、选中的频道格子都是这种青蓝色。"""
@@ -98,10 +112,20 @@ def _scales(frame: np.ndarray) -> List[float]:
 
 def find_menu(frame: np.ndarray) -> Optional[Tuple[int, int]]:
     """游戏菜单开着 → 返回最上面一行「切换频道」的中心；没开返回 None。"""
+    hit = find_menu_scaled(frame)
+    return hit[0] if hit is not None else None
+
+
+def find_menu_scaled(frame: np.ndarray) -> Optional[Tuple[Tuple[int, int], float]]:
+    """菜单位置 + 命中的缩放倍数。
+
+    退出游戏要按"第 6 行"算点击位置，行距必须用**同一个**缩放倍数：
+    固定像素 UI 和等比缩放 UI 的行距差一截，混用会点到别的行去。
+    """
     for s in _scales(frame):
         pos = _find_menu_at(frame, s)
         if pos is not None:
-            return pos
+            return pos, s
     return None
 
 
@@ -173,6 +197,18 @@ def _find_dialog_at(frame: np.ndarray, s: float) -> Optional[ChannelDialog]:
 
 def is_black(frame: np.ndarray) -> bool:
     return float(frame[::4, ::4].mean()) < BLACK_LEVEL
+
+
+def in_game(frame: np.ndarray) -> bool:
+    """画面是不是在游戏里（底部状态栏的按钮还在）。登录界面、黑屏都不是。"""
+    top = int(frame.shape[0] * HUD_AREA)
+    roi = frame[top:]
+    for s in _scales(frame):
+        w, h = HUD_BUTTON[0] * s, HUD_BUTTON[1] * s
+        if any(abs(b[2] - w) <= 14 * s and abs(b[3] - h) <= 8 * s
+               for b in _boxes(_cyan_mask(roi), int(w * h * 0.4))):
+            return True
+    return False
 
 
 class ChannelTimer:
@@ -437,3 +473,104 @@ class ChannelSwitcher:
                 buf.tofile(os.path.join(self._shot_dir, f"{self._shot_n:02d}_{what}.jpg"))
         except Exception:
             pass
+
+
+def next_quit_at(hhmm, now: float) -> Optional[float]:
+    """"06:30" 这个钟点下一次到来的时间戳（今天已经过了就是明天）；写得不对返回 None。"""
+    try:
+        hour, minute = str(hhmm).split(":")
+        t = datetime.fromtimestamp(now).replace(hour=int(hour), minute=int(minute),
+                                                second=0, microsecond=0)
+    except ValueError:
+        return None
+    if t.timestamp() <= now:
+        t += timedelta(days=1)
+    return t.timestamp()
+
+
+class GameQuitter(ChannelSwitcher):
+    """定时结束游戏：按 Esc 弹菜单 → 点「退出游戏」→ 弹了确认框就按回车 → 等离开游戏。
+
+    只要看到已经离开游戏（登录界面、窗口关了）就到此为止，不再按任何键：
+    登录界面按回车会点「连接」，又登录回去。
+    """
+
+    def run(self) -> bool:
+        """离开游戏了返回 True。调用方负责暂停其他操作。"""
+        self._shot_dir = os.path.join(QUIT_DEBUG_DIR, time.strftime("%Y%m%d_%H%M%S"))
+        self._shot_n = 0
+        self.aborted = False
+        self._log(f"[定时] 开始退出游戏（截图存到 {os.path.abspath(self._shot_dir)}）")
+        try:
+            for attempt in range(1, ATTEMPTS + 1):
+                if self.abort():
+                    return False
+                if self._try_quit(attempt):
+                    return True
+            if not self.abort():
+                self._log(f"[定时] 试了 {ATTEMPTS} 次还在游戏里，没退出去，看一下截图")
+            return False
+        except Exception as e:
+            self._log(f"[定时] 退出游戏出错: {e}")
+            return False
+        finally:
+            self.aborted = self.abort()
+
+    def _try_quit(self, attempt: int) -> bool:
+        frame = self._grab()
+        if frame is None or not in_game(frame):
+            self._log("[定时] 画面里看不到游戏（底部状态栏不在），不再按键")
+            self._save(frame, "看不到游戏")
+            return self._wait_left()  # 上一次点的生效了，或者本来就不在游戏里：不碰
+        hit = find_menu_scaled(frame)
+        if hit is None:
+            self._log("[定时] 按 Esc 打开游戏菜单")
+            self.executor.press_key("esc")
+            if not self._wait(lambda f: find_menu(f) is not None, STEP_TIMEOUT):
+                self._log(f"[定时] 第 {attempt} 次：游戏菜单没打开")
+                self._save(self._grab(), "菜单没打开")
+                return False
+            frame = self._frame
+            hit = find_menu_scaled(frame)
+            if hit is None:
+                return False
+        pos, scale = hit
+        # 行距必须用认出菜单时那个缩放倍数（固定像素 UI 与等比缩放 UI 差一截）
+        x = pos[0]
+        y = pos[1] + int(MENU_ROW_GAP * MENU_QUIT_ROW * scale)
+        self._log(f"[定时] 点「退出游戏」({x},{y})")
+        self._save(frame, "点退出之前", (x, y))
+        if self.abort():
+            return False
+        self.executor.real_click(x, y)
+        if self._wait_left():
+            return True
+        # 还在游戏里。菜单还开着 = 没点上，下一轮再点；菜单关了多半是弹了确认框，才按回车。
+        # 已经离开游戏就不能再按：登录界面会点「连接」，窗口没了回车会落到别的程序上
+        frame = self._grab()
+        if frame is None or not in_game(frame):
+            return self._wait_left()
+        if self.abort():
+            return False
+        if find_menu(frame) is not None:
+            self._log("[定时] 点了之后菜单还开着，再点一次")
+            self._save(frame, "点了没反应")
+            return False
+        self._log("[定时] 点了之后还在游戏里，按回车确认")
+        self._save(frame, "点退出之后")
+        self.executor.press_key("enter")
+        if self._wait_left():
+            return True
+        self._save(self._grab(), "按回车之后")
+        return False
+
+    def _wait_left(self) -> bool:
+        """等离开游戏（连续看不到游戏画面）；超时或要停下返回 False。"""
+        end, hits = time.time() + QUIT_LEAVE_TIMEOUT, 0
+        while time.time() < end and not self.abort():
+            frame = self._grab()
+            hits = hits + 1 if frame is None or not in_game(frame) else 0
+            if hits >= QUIT_LEFT_FRAMES:
+                return True
+            time.sleep(POLL_SECONDS)
+        return False

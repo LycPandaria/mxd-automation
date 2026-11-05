@@ -78,6 +78,7 @@ YAML 配置字段说明
   minimap_scale:    小地图 1px 对应画面多少 px（默认 16）
   channel_enabled / channel_idle_min: 自动换频道开关 / 多少分钟没放过技能就换
   channel_hold_key / channel_hold_seconds: 换完按住哪个键 / 按多久（秒）
+  quit_enabled / quit_time: 定时结束游戏：点「开始」后下一次到这个钟点（"06:30"）就不打了，按 Esc 退出游戏
   exp_enabled:      打怪时记录经验（读状态栏的 EXP，每分钟一行写到 exp_log/日期.csv）
   exp_read_seconds / exp_log_minutes: 多少秒读一次 / 多少分钟在日志里报一次（0 = 不报）
 """
@@ -343,6 +344,11 @@ def _defaults() -> Dict[str, Any]:
         "channel_idle_min": 3,         # 多少分钟没攻击就换
         "channel_hold_key": "right",   # 换完按住这个键走一段
         "channel_hold_seconds": 5,
+        # ---- 定时结束游戏 ----
+        # 点「开始」后，下一次到这个钟点就不打了：Esc → 点「退出游戏」→ 有确认框就回车，
+        # 回到登录界面后停止并解除窗口锁定。
+        "quit_enabled": False,
+        "quit_time": "06:00",          # 几点结束（今天过了就是明天）
         # ---- 经验记录 ----
         "exp_enabled": True,           # 读状态栏的 EXP，每分钟一行写到 exp_log/日期.csv
         "exp_read_seconds": 5,         # 多少秒读一次
