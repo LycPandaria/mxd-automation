@@ -30,6 +30,7 @@ from PyQt5.QtWidgets import (
     QGridLayout, QTableWidget, QTableWidgetItem, QHeaderView,
     QPlainTextEdit, QCheckBox, QFileDialog, QMessageBox, QSplitter,
     QAbstractItemView, QSpinBox, QDoubleSpinBox, QDialog, QSizePolicy, QTimeEdit,
+    QScrollArea, QFrame,
 )
 from PyQt5.QtCore import Qt, QTime, QTimer, pyqtSignal, pyqtSlot, QMetaObject
 from PyQt5.QtGui import QImage, QPixmap
@@ -267,7 +268,17 @@ class MainWindow(QMainWindow):
         save_btn = QPushButton("保存配置")
         save_btn.clicked.connect(self._save_config)
         v.addWidget(save_btn)
-        return panel
+
+        # 配置项越加越多，整列已经比 1080p 屏还高（窗口最小高度会到 1100+），
+        # 小屏上底部控件（活动范围/换频道/定时/技能表）会被挤到屏幕外。
+        # 套一层滚动区：窗口可以缩到 760 高，下面的配置项滚一下就能看到。
+        scroll = QScrollArea()
+        scroll.setWidget(panel)
+        scroll.setWidgetResizable(True)
+        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        scroll.setFrameShape(QFrame.NoFrame)
+        scroll.setMinimumWidth(430)
+        return scroll
 
     def _build_detect_group(self):
         box = QGroupBox("检测设置 (YOLO)")
