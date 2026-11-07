@@ -23,6 +23,7 @@ PYTHONPATH=. python -m unittest discover -s tests -t . -v
 | `test_channel_detect.py` | 换频道界面识别：菜单/频道窗口在"等比缩放"和"固定像素"两种 UI 下都认得出 |
 | `test_target_side.py` | 选怪优先级：同侧射程内 > 反侧最近 > 同侧射程外；反侧近身怪不参与威胁/击退 |
 | `test_quit.py` | 定时结束游戏：时间计算、登录界面识别（含 768 固定像素 UI）、退出流程/确认框/中途停止 |
+| `test_turn_hold.py` | 按住转向（turn_mode=hold）：位移确认、最短/最长时长、悬崖/边缘/射程/近身怪提前松键、吞键重试、目标换边放弃 |
 
 ## 与分享包（share-baseline 分支）测试的关系
 

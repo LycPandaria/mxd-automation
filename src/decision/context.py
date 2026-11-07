@@ -345,6 +345,50 @@ TURN_RETRY_MIN_SECONDS = 0.15
 TURN_RETRY_MAX_SECONDS = 0.30
 """自检判定"这次转向没被游戏接收"后的重试间隔上限（秒）。"""
 
+# =============================================================================
+# 转向模式二：按住到确认（turn_mode="hold"，实测小碎步太像脚本的对策）
+# =============================================================================
+#
+# 点按模式（tap）的问题：每次转向只给游戏一个 120~180ms 的采样窗口，被攻击
+# 动画吞掉就要整轮重来（点 10px → 等 0.15s 自检 → 再点 10px → …），表现为
+# "小碎步搓很久"；每 4~6s 的定期重申哪怕朝向正确也要白白走一步。
+#
+# hold 模式：改方向 = 按住方向键**走到确认为止**——
+#   · keydown 持续期间游戏每帧都读到按下状态，不存在"吞一次整轮重来"；
+#   · 冒险岛里按方向键第一帧就转身，之后的位移只是证据：累计走出
+#     TURN_HOLD_CONFIRM_PX 就确认朝向、立即松键出手；
+#   · 按住期间在移动 = 朝向必然生效（_face_note_movement 同款逻辑），
+#     自检/重试状态机整个不需要了；
+#   · 一次 20~60px 的正常走动代替 N 次 5~15px 的碎步，更像人。
+#
+# 安全（按住会走 30~100px，逐帧检查，命中立即松键）：
+#   前方无地板 / 走到画面边缘或活动范围分界线 / 长手进入最小射程或击退距离 /
+#   按住 0.2s 零位移（keydown 本身被吞）→ 强制松开重试一次。
+
+TURN_HOLD_CONFIRM_PX = 25
+"""按住转向的确认位移（px，768 高画面下）：按住方向键后角色朝该方向累计走出
+这么多就确认朝向、松键出手。约 0.2~0.4s 的走动；太小会被检测框抖动误确认
+（单帧可抖 3~10px），太大则白白走远。"""
+
+TURN_HOLD_MIN_SECONDS = 0.25
+"""按住转向的最短时长（秒）：再短和点按没区别；同时给"零位移 = 被吞"的判定
+留出观察窗口。下限到上限之间随机取值，避免每次转向时长一致。"""
+
+TURN_HOLD_MAX_SECONDS = 1.2
+"""按住转向的最长时长（秒）：到点强制松键（正常 0.3~0.6s 就会确认，
+走到上限说明没确认成功，多半是顶墙/顶怪——按住也不会有更多位移）。"""
+
+TURN_HOLD_STALL_SECONDS = 0.2
+"""按住转向的零位移判定（秒）：按住这么久角色一点没朝该方向动 → keydown
+本身没被游戏接收（罕见的动画输入锁），松开重试一次。"""
+
+TURN_HOLD_REASSERT_MIN_SECONDS = 8.0
+"""hold 模式下朝向重申间隔下限（秒）。按住确认写进记忆的朝向不会再脱钩，
+重申只剩兜底意义；每次重申仍是一次走动，间隔放宽到 8~12s。"""
+
+TURN_HOLD_REASSERT_MAX_SECONDS = 12.0
+"""hold 模式下朝向重申间隔上限（秒）。"""
+
 TURN_VERIFY_MIN_MOVE_X = 6
 """转向生效自检：按下方向键后角色朝该方向水平位移 ≥ 此值（像素）视为生效。
 
@@ -718,6 +762,14 @@ class DecisionEngine:
         self._turn_time = 0.0                     # 发出该转向的时间
         self._turn_x0: Optional[int] = None       # 发出转向时的角色 x（位移自检基准）
         self._turn_verify_hits = 0                # 转向自检连续达标帧数（≥2 才确认）
+        # ---- 按住转向（turn_mode="hold"）----
+        self._turn_hold_dir: Optional[str] = None  # 正在按住转向的方向，None = 没在按住
+        self._turn_hold_started = 0.0             # 按住开始的时间
+        self._turn_hold_x0: Optional[int] = None  # 按住开始时的角色 x（确认位移基准）
+        self._turn_hold_confirmed_px = 0          # 按住期间朝该方向的累计位移
+        self._turn_hold_retry_done = False        # 这次纠正是否已经重试过一次（零位移后）
+        self._turn_hold_last_dir: Optional[str] = None  # 上次按住转向的方向（重试标记按方向保留）
+        self._turn_hold_target: Optional[Detection] = None  # 按住转向时的目标（射程/击退安全检查用）
         self._face_verify_fails = 0               # 连续自检失败次数（决定是否提前重试）
         self._face_assert_count = 0               # 本日志窗口内转向次数
         self._face_unverified_count = 0           # 本日志窗口内自检未生效次数
@@ -807,6 +859,13 @@ class DecisionEngine:
         self._turn_time = 0.0
         self._turn_x0 = None
         self._turn_verify_hits = 0
+        self._turn_hold_dir = None
+        self._turn_hold_started = 0.0
+        self._turn_hold_x0 = None
+        self._turn_hold_confirmed_px = 0
+        self._turn_hold_retry_done = False
+        self._turn_hold_last_dir = None
+        self._turn_hold_target = None
         self._face_verify_fails = 0
         self._face_assert_count = 0
         self._face_unverified_count = 0
@@ -858,6 +917,7 @@ class DecisionEngine:
 
     def release_keys(self):
         """释放所有按住的移动键（停止时调用，防止方向键卡住）。"""
+        self._face_clear_hold()   # 按住转向中停止：状态一并清掉
         self._release_move()
         self._climbing = False
         self._climb_exit_frames = 0
@@ -1468,6 +1528,149 @@ class DecisionEngine:
         self._drift_suppress_until = time.time() + 0.5
         return seconds
 
+    # =========================================================================
+    # 按住转向（turn_mode="hold"）：按住方向键走到确认，代替点按+自检+重试
+    # =========================================================================
+
+    def _turn_mode_hold(self) -> bool:
+        """当前是否使用"按住到确认"的转向模式（config.turn_mode，默认 tap = 现状）。"""
+        return getattr(self.config, "turn_mode", "tap") == "hold"
+
+    def _face_clear_hold(self):
+        """结束/清空按住转向状态（不负责松键，松键由调用方按需处理）。"""
+        self._turn_hold_dir = None
+        self._turn_hold_started = 0.0
+        self._turn_hold_x0 = None
+        self._turn_hold_confirmed_px = 0
+
+    def _turn_hold_start(self, direction: str, sx: Optional[int]) -> bool:
+        """开始按住 direction 转向。返回 False 表示 keydown 没发出去。
+
+        直接写 _held_key（不走 _hold_move）：_hold_move 会立刻把朝向记为已确认，
+        而按住转向要等真实位移达标才算；写 _held_key 是为了让卡键兜底
+        （_stuck_direction_guard 看到"自己按着键"就跳过）和 release_keys
+        在停止时能正确松开这颗键。
+
+        零位移重试标记跨"同方向的多次按住"保留：keydown 被吞 → 重试一次，
+        再被吞 → 放弃本轮（记失败日志），而不是无限按下去。
+        """
+        self._force_release_directions()
+        if not self.executor.key_down(direction):
+            return False
+        if direction != self._turn_hold_last_dir:
+            self._turn_hold_retry_done = False   # 换方向纠正：重新给一次重试机会
+        self._turn_hold_last_dir = direction
+        self._held_key = direction
+        self._turn_hold_dir = direction
+        self._turn_hold_started = time.time()
+        self._turn_hold_x0 = sx
+        self._turn_hold_confirmed_px = 0
+        return True
+
+    def _turn_hold_finish(self, confirmed: bool, how: str):
+        """结束按住转向：松键 + 记录。confirmed=True 时朝向已由真实移动验证。"""
+        direction = self._turn_hold_dir
+        self._release_move()
+        self.executor.key_up(direction, force=True)
+        self._drift_suppress_until = time.time() + 0.5
+        if confirmed:
+            # 按住期间角色真的在朝该方向走 → 朝向必然生效（最强证据）
+            self._face_dir = direction
+            self._face_attempt_side = None
+            self._face_verify_fails = 0
+            mode = self._turn_mode_hold()
+            lo, hi = ((TURN_HOLD_REASSERT_MIN_SECONDS, TURN_HOLD_REASSERT_MAX_SECONDS)
+                      if mode else (TURN_REASSERT_MIN_SECONDS, TURN_REASSERT_MAX_SECONDS))
+            self._face_next_assert = time.time() + random.uniform(lo, hi)
+            self._log(f"[朝向] 按住转向 {direction} 已确认（{how}，位移 "
+                      f"{self._turn_hold_confirmed_px}px）")
+        else:
+            self._face_verify_fails += 1
+            self._face_unverified_count += 1
+            self._log(f"[朝向] 按住转向 {direction} 未确认（{how}），稍后重试")
+        self._face_clear_hold()
+        self._face_last_press_at = time.time()
+
+    def _turn_hold_step(self, ctx: Context) -> bool:
+        """按住转向的逐帧推进。返回 True 表示本帧仍在按住（调用方不施法）。
+
+        结束条件（命中即松键）：
+          · 朝该方向累计位移 ≥ TURN_HOLD_CONFIRM_PX → 确认，正常结束
+          · 按住超过 TURN_HOLD_MAX_SECONDS → 到顶没确认（顶墙/顶怪），放弃
+          · 前方无地板 / 到画面边缘或分界线 / 长手进入最小射程或击退距离
+          · TURN_HOLD_STALL_SECONDS 零位移 → keydown 被吞，重试一次
+        """
+        direction = self._turn_hold_dir
+        if direction is None:
+            return False
+        now = time.time()
+        elapsed = now - self._turn_hold_started
+
+        # ---- 位移确认 ----
+        if ctx.self_position is not None and self._turn_hold_x0 is not None:
+            dx = ctx.self_position[0] - self._turn_hold_x0
+            moved = dx if direction == "right" else -dx
+            self._turn_hold_confirmed_px = max(self._turn_hold_confirmed_px, moved)
+            if self._turn_hold_confirmed_px >= self._px(TURN_HOLD_CONFIRM_PX) \
+                    and elapsed >= TURN_HOLD_MIN_SECONDS:
+                self._turn_hold_finish(True, f"位移达标")
+                return False
+        else:
+            moved = 0
+
+        # ---- 零位移：keydown 本身被吞 ----
+        if elapsed >= TURN_HOLD_MIN_SECONDS + TURN_HOLD_STALL_SECONDS \
+                and self._turn_hold_confirmed_px < self._px(3):
+            if not self._turn_hold_retry_done:
+                self._turn_hold_retry_done = True
+                self._log("[朝向] 按住转向没有位移（按键被吞？），松开重试一次")
+                self._release_move()
+                self.executor.key_up(direction, force=True)
+                self._face_clear_hold()
+                return False   # 下一帧 _face_step 会重新发起
+            self._turn_hold_finish(False, "重试后仍无位移")
+            return False
+
+        # ---- 超时 ----
+        if elapsed >= TURN_HOLD_MAX_SECONDS:
+            self._turn_hold_finish(False, "按住到上限仍未达标")
+            return False
+
+        # ---- 安全检查（按住会走几十像素，逐帧确认还能继续走）----
+        foot = self._effective_self_pos(ctx)
+        if foot is not None:
+            sx, sy = foot
+            lookahead = max(RETREAT_EDGE_LOOKAHEAD_X,
+                            int(self._px(TURN_HOLD_CONFIRM_PX) * 2))
+            if not self._floor_ahead(ctx, sx, sy, direction, lookahead):
+                self._turn_hold_finish(self._turn_hold_confirmed_px
+                                       >= self._px(TURN_HOLD_CONFIRM_PX),
+                                       "前方无地板，提前松键")
+                return False
+            if self._at_edge(ctx, direction):
+                self._turn_hold_finish(self._turn_hold_confirmed_px
+                                       >= self._px(TURN_HOLD_CONFIRM_PX),
+                                       "到地图边缘/分界线，提前松键")
+                return False
+            # 长手：走进最小射程 / 击退距离就不该再贴上去
+            t = self._turn_hold_target
+            if t is not None:
+                min_range = self._get_min_attack_range()
+                dx = abs(sx - t.center[0])
+                if min_range > 0 and dx <= min_range:
+                    self._turn_hold_finish(self._turn_hold_confirmed_px
+                                           >= self._px(TURN_HOLD_CONFIRM_PX),
+                                           "已进入最小射程，提前松键")
+                    return False
+                conf = self._knockback_conf()
+                if conf is not None and dx <= conf["range"] \
+                        and self._in_front(t, sx):
+                    self._turn_hold_finish(self._turn_hold_confirmed_px
+                                           >= self._px(TURN_HOLD_CONFIRM_PX),
+                                           "怪已近身，提前松键")
+                    return False
+        return True
+
     def _face_clear_pending(self):
         """清掉"待自检的转向"状态。"""
         self._turn_dir = None
@@ -1649,10 +1852,14 @@ class DecisionEngine:
         """_face_step 的实现体（返回值语义见 _face_step）。"""
         if self._is_stand_mode() or target is None:
             self._face_clear_pending()
+            self._face_clear_hold()
+            self._release_move()   # 按住转向中目标没了：立刻松键，别一直走
             self._face_attempt_side = None
             return False
         if not allow_press:
             self._face_clear_pending()
+            self._face_clear_hold()
+            self._release_move()
             self._face_attempt_side = None
             return False
         foot = self._effective_self_pos(ctx)
@@ -1662,6 +1869,16 @@ class DecisionEngine:
             return True
         sx = foot[0]
         need = self._face_needed(sx, target)
+
+        # ---- 按住转向进行中：逐帧推进，本帧不施法 ----
+        if self._turn_hold_dir is not None:
+            # 目标换边了（按住方向已不再需要）→ 放弃本次按住，走正常逻辑重判
+            if need is not None and need != self._turn_hold_dir:
+                self._log("[朝向] 按住转向中目标换边，放弃本次按住")
+                self._turn_hold_finish(False, "目标换边")
+            else:
+                self._turn_hold_target = target
+                return self._turn_hold_step(ctx)
 
         # ---- 换边防抖：统计"需要的朝向"已连续保持多少帧 ----
         # 群怪分布在角色两侧时最近目标每帧左右翻，每次翻边都转身 = 原地狂转
@@ -1677,8 +1894,9 @@ class DecisionEngine:
 
         now = time.time()
 
-        # ---- 1) 先判定上一轮转向是否生效 ----
-        settling = self._face_settle(ctx)
+        # ---- hold 模式没有"点按→自检"循环，跳过 settle ----
+        hold_mode = self._turn_mode_hold()
+        settling = False if hold_mode else self._face_settle(ctx)
         if need is None:
             return False      # 目标近似正上方/重叠：保持朝向，正常施法
 
@@ -1689,9 +1907,15 @@ class DecisionEngine:
                 if now >= self._face_last_press_at + TURN_MIN_GAP_SECONDS \
                         and self._floor_ahead(ctx, sx, foot[1], need,
                                               MICRO_MOVE_EDGE_LOOKAHEAD_X):
-                    self._turn_tap(need)
-                    self._face_last_press_at = time.time()
-                    self._face_assert_count += 1
+                    if hold_mode and self._turn_hold_start(need, None):
+                        self._face_last_press_at = time.time()
+                        self._face_assert_count += 1
+                        self._face_dir = None   # 盲转：定位恢复后由位移确认
+                        return True
+                    if not hold_mode:
+                        self._turn_tap(need)
+                        self._face_last_press_at = time.time()
+                        self._face_assert_count += 1
                     # 盲点无法自检：实际朝向已不可信 → 标记未知，
                     # 定位恢复后必须重新转向并确认，绝不沿用旧记忆施法。
                     self._face_dir = None
@@ -1724,11 +1948,12 @@ class DecisionEngine:
                 return True
         elif now >= self._face_next_assert:
             if self._nearest_knockback_threat(ctx, foot) is not None:
-                # 有近身威胁时跳过重申：重申点按 = 朝面朝方向走 1~2 步，
-                # 此时面朝方向上就贴着怪，点按等于往怪身上撞。
+                # 有近身威胁时跳过重申：重申 = 朝面朝方向走一步，
+                # 此时面朝方向上就贴着怪，等于往怪身上撞。
                 # 推迟一个完整间隔，避免威胁刚解除（怪刚被推走）就立刻点按。
-                self._face_next_assert = now + random.uniform(
-                    TURN_REASSERT_MIN_SECONDS, TURN_REASSERT_MAX_SECONDS)
+                lo = TURN_HOLD_REASSERT_MIN_SECONDS if hold_mode else TURN_REASSERT_MIN_SECONDS
+                hi = TURN_HOLD_REASSERT_MAX_SECONDS if hold_mode else TURN_REASSERT_MAX_SECONDS
+                self._face_next_assert = now + random.uniform(lo, hi)
                 need_press = False
             else:
                 need_press = True      # 朝向"认为"对 → 到点重申一次（自愈被吞的转向）
@@ -1748,20 +1973,46 @@ class DecisionEngine:
         if not need_press:
             return False
 
-        # ---- 边缘安全：按一下方向键角色会朝那边迈几像素 ----
+        # ---- 边缘安全：按方向键角色会朝那边走 ----
         # 前方很近处没有地板（悬崖/平台边缘）时不按。此时也不施法——
         # 朝向与目标侧不符，放技能等于朝反方向空放（宁可停手等目标移动）。
-        if not self._floor_ahead(ctx, sx, foot[1], need,
-                                 MICRO_MOVE_EDGE_LOOKAHEAD_X):
-            self._face_next_assert = now + random.uniform(
-                TURN_REASSERT_MIN_SECONDS, TURN_REASSERT_MAX_SECONDS)
+        hold_lookahead = max(MICRO_MOVE_EDGE_LOOKAHEAD_X,
+                             self._px(TURN_HOLD_CONFIRM_PX) * 2) if hold_mode \
+            else MICRO_MOVE_EDGE_LOOKAHEAD_X
+        if not self._floor_ahead(ctx, sx, foot[1], need, hold_lookahead):
+            lo = TURN_HOLD_REASSERT_MIN_SECONDS if hold_mode else TURN_REASSERT_MIN_SECONDS
+            hi = TURN_HOLD_REASSERT_MAX_SECONDS if hold_mode else TURN_REASSERT_MAX_SECONDS
+            self._face_next_assert = now + random.uniform(lo, hi)
             if need == self._face_dir:
                 # 只是定期重申，朝向本来就对 → 跳过点按，照常施法
                 return False
             self._log_face_wait(f"{need} 侧前方无地板，跳过转向")
             return True
 
-        # ---- 3) 转向：按住 120~180ms，本帧不施法 ----
+        # ---- 3) 转向：本帧不施法 ----
+        if hold_mode:
+            # 按住到确认：keydown 后每帧由 _turn_hold_step 推进，
+            # 走出确认位移即松键出手；没有"点按→自检→重试"循环。
+            if self._turn_hold_start(need, ctx.self_position[0] if ctx.self_position else None):
+                self._turn_hold_target = target
+                self._face_last_press_at = time.time()
+                self._face_assert_count += 1
+                if need != self._face_dir:
+                    self._face_attempt_side = need
+                    self._log(
+                        f"[朝向] 怪物在{'右' if need == 'right' else '左'}"
+                        f"(dx={target.center[0] - sx:+d}px)，按住 {need} 转向"
+                        f"（走出 {self._px(TURN_HOLD_CONFIRM_PX)}px 确认）"
+                    )
+                return True
+            self._log("[朝向] 转向按键发送失败，保持原朝向")
+            self._face_next_assert = now + random.uniform(
+                TURN_RETRY_MIN_SECONDS, TURN_RETRY_MAX_SECONDS)
+            if need == self._face_dir:
+                return False
+            self._log_face_wait("转向按键发送失败")
+            return True
+
         seconds = self._turn_tap(need)
         if seconds <= 0:
             # 按键根本没发出去（键无效/窗口未锁定）→ 绝不能更新 _face_dir，

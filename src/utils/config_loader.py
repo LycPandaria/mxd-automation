@@ -70,6 +70,8 @@ YAML 配置字段说明
   skills:           技能列表 [{name, key, cooldown}, ...]
   knockback_skill:  近身击退技能 {name, key, cooldown, range}（key 为空=不启用）
   ghost_casts:      对同一目标出手多少次仍未消失就判定为残影/误识别（0=关闭）
+  turn_mode:        转向模式 tap（点按 120~180ms + 自检重试）/ hold（按住方向键走出
+                    确认位移再松键出手，消除"小碎步搓很久"；实测 A/B 后再改默认）
   pixel_base_height: 像素参数（攻击距离/垂直容差/活动范围阈值等）按此画面高度填写，
                     运行时乘以 当前帧高/此值；0 = 不缩放
   range_limit:      活动范围 none（不限制）/ left（只在地图左半边）/ right（只在地图右半边）
@@ -295,6 +297,11 @@ def _defaults() -> Dict[str, Any]:
         # 把该位置记入忽略表（8 秒起，同一位置再次判定翻倍，最长 300 秒）。
         # 目标在这期间动过（活怪）→ 要 2 倍次数/时间才算"打不到"。
         "ghost_casts": 6,         # 0 = 关闭残影判定
+        # ---- 转向模式 ----
+        # tap = 点按 120~180ms + 位移自检 + 失败重试（现状）；
+        # hold = 按住方向键走出 TURN_HOLD_CONFIRM_PX 再松键出手：一次确定性输入
+        # 代替"点按→自检→重试"循环，消除小碎步。turn_hold_* 参数见 context.py。
+        "turn_mode": "tap",       # "tap" / "hold"
         # ---- 站桩模式 ----
         "stand_mode": False,     # 站桩模式：不对角色做任何移动（不移动/不转向/不后撤/不探索），
                                  # 只打朝向正前方射程内的怪；攻击逻辑与普通模式完全一致
