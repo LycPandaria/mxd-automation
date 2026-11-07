@@ -266,7 +266,7 @@ class Automation:
         self._quitter.abort = lambda: self._lie_probe_hit
         self._quit_at: Optional[float] = None
 
-        # ---- 经验记录：定时读状态栏的 EXP，写到 exp_log/日期.csv ----
+        # ---- 经验记录：定时读状态栏的 EXP，写到 logs/exp_log/日期.csv ----
         self._exp = ExpMeter(on_log=self.on_log)
 
     # =========================================================================

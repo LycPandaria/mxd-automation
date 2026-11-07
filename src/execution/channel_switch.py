@@ -13,12 +13,25 @@
 位置和大小按 1920×1080 量的，运行时按画面高度等比换算。
 """
 import os
+import sys
 import time
 from datetime import datetime, timedelta
 from typing import Callable, List, Optional, Tuple
 
 import cv2
 import numpy as np
+
+
+def _app_dir() -> str:
+    """程序数据目录：打包后是 exe 所在目录，开发环境是项目根目录。
+
+    与 logger / config_loader 的算法一致。这里单独算一份是为了让本模块
+    能被测试按文件路径单独加载（tests/test_quit.py），不依赖包结构。
+    """
+    if getattr(sys, "frozen", False):
+        return os.path.dirname(os.path.abspath(sys.executable))
+    return os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
 
 REF_H = 1080
 """下面的像素值按这个画面高度量的"""
@@ -71,10 +84,10 @@ RETRY_SECONDS = 60
 MAX_IDLE_RUNS = 5
 """连着换这么多次都没打到怪就不再自动换：多半不是"这层没怪"，而是角色不在打怪的地方或认不出怪"""
 
-DEBUG_DIR = "channel_debug"
+DEBUG_DIR = os.path.join(_app_dir(), "logs", "channel_debug")
 """每次换频道的截图存这里：点之前（红圈标出点击位置）和没反应时的画面"""
 
-QUIT_DEBUG_DIR = "quit_debug"
+QUIT_DEBUG_DIR = os.path.join(_app_dir(), "logs", "quit_debug")
 """每次定时结束游戏的截图存这里，没退出去时看这些图"""
 QUIT_LEAVE_TIMEOUT = 6.0
 """点「退出游戏」或按回车后，等这么久还在游戏里就进行下一步（秒）"""

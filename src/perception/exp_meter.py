@@ -1,4 +1,4 @@
-"""经验记录：定时读状态栏的 EXP 数字，算出这次打了多少、每小时多少，并按分钟写到 exp_log/日期.csv。
+"""经验记录：定时读状态栏的 EXP 数字，算出这次打了多少、每小时多少，并按分钟写到 logs/exp_log/日期.csv。
 
 状态栏写着 "EXP 436935[23.57%]"，位置随窗口大小变，所以先找 "EXP" 这三个字母（游戏里是固定的白色点阵字），
 再用 OCR 只认它右边那一小块。主循环只把截图交过来，读数在后台线程做，不耽误打怪。
@@ -16,6 +16,8 @@ from typing import Callable, List, Optional, Tuple
 
 import cv2
 import numpy as np
+
+from ..utils.config_loader import APP_DIR
 
 LABEL = [
     "######.#....#..#####.",
@@ -53,7 +55,8 @@ LOST_RETRY_READS = 6
 """连续这么多次没读到数字，就重新找一次 "EXP" 的位置"""
 RATE_WINDOW_SECONDS = 600
 """「每小时」按最近这么久算（秒）"""
-LOG_DIR = "exp_log"
+LOG_DIR = os.path.join(APP_DIR, "logs", "exp_log")
+"""经验记录目录：统一放在 logs/ 下（打包后为 exe 同目录/logs/exp_log）"""
 CSV_HEADER = ["时间", "经验", "百分比", "本次累计获得", "比上一行多", "备注"]
 
 

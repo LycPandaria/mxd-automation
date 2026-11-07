@@ -79,7 +79,7 @@ YAML 配置字段说明
   channel_enabled / channel_idle_min: 自动换频道开关 / 多少分钟没放过技能就换
   channel_hold_key / channel_hold_seconds: 换完按住哪个键 / 按多久（秒）
   quit_enabled / quit_time: 定时结束游戏：点「开始」后下一次到这个钟点（"06:30"）就不打了，按 Esc 退出游戏
-  exp_enabled:      打怪时记录经验（读状态栏的 EXP，每分钟一行写到 exp_log/日期.csv）
+  exp_enabled:      打怪时记录经验（读状态栏的 EXP，每分钟一行写到 logs/exp_log/日期.csv）
   exp_read_seconds / exp_log_minutes: 多少秒读一次 / 多少分钟在日志里报一次（0 = 不报）
 """
 import os
@@ -350,7 +350,7 @@ def _defaults() -> Dict[str, Any]:
         "quit_enabled": False,
         "quit_time": "06:00",          # 几点结束（今天过了就是明天）
         # ---- 经验记录 ----
-        "exp_enabled": True,           # 读状态栏的 EXP，每分钟一行写到 exp_log/日期.csv
+        "exp_enabled": True,           # 读状态栏的 EXP，每分钟一行写到 logs/exp_log/日期.csv
         "exp_read_seconds": 5,         # 多少秒读一次
         "exp_log_minutes": 10,         # 多少分钟在日志里报一次（0 = 不报）
         # ---- 测谎弹窗检测（反外挂）----

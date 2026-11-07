@@ -601,7 +601,7 @@ class MainWindow(QMainWindow):
         channel_row.addWidget(self.channel_hold_spin)
         self.channel_test_btn = QPushButton("测试换频道")
         self.channel_test_btn.setToolTip(
-            "立刻换一次频道（打怪中会先暂停打怪），看日志和 channel_debug 里的截图")
+            "立刻换一次频道（打怪中会先暂停打怪），看日志和 logs\\channel_debug 里的截图")
         self.channel_test_btn.clicked.connect(self._test_channel)
         channel_row.addWidget(self.channel_test_btn)
         channel_row.addStretch()
@@ -628,7 +628,7 @@ class MainWindow(QMainWindow):
         self.exp_checkbox = QCheckBox("记录经验")
         self.exp_checkbox.setToolTip(
             "打怪时每 5 秒读一次状态栏的 EXP，算出这次打了多少、每小时多少；\n"
-            "每分钟记一行到 exp_log\\日期.csv，点「经验记录」可以查某个时间有多少经验"
+            "每分钟记一行到 logs\\exp_log\\日期.csv，点「经验记录」可以查某个时间有多少经验"
         )
         exp_row.addWidget(self.exp_checkbox)
         self.exp_label = QLabel("经验: -")

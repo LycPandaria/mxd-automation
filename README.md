@@ -204,7 +204,7 @@ knockback_skill:
   停止并解除窗口锁定，之后不再按任何键（登录界面按回车会重新登录）。
   测谎中不动作，测谎通过后再退。菜单行距按识别到的 UI 缩放算，
   1366×768 固定像素界面也能点对「退出游戏」那一行。
-- **经验记录**：每 5 秒读一次状态栏 EXP，每分钟写一行到 `exp_log/日期.csv`，
+- **经验记录**：每 5 秒读一次状态栏 EXP，每分钟写一行到 `logs/exp_log/日期.csv`，
   界面显示本次/每小时经验；点「经验记录」按天查看。
 
 ## 配置
@@ -322,7 +322,7 @@ knockback_skill:
 | `channel_hold_key` / `channel_hold_seconds` | `right` / `5` | 换完后按住哪个方向键、按多久（秒） |
 | `quit_enabled` | `false` | 定时结束游戏开关 |
 | `quit_time` | `06:00` | 几点结束（`HH:mm`）；点「开始」后下一次到这个钟点，今天过了算明天 |
-| `exp_enabled` | `true` | 记录经验：读状态栏 EXP，每分钟一行写到 `exp_log/日期.csv` |
+| `exp_enabled` | `true` | 记录经验：读状态栏 EXP，每分钟一行写到 `logs/exp_log/日期.csv` |
 | `exp_read_seconds` | `5` | 多少秒读一次 EXP |
 | `exp_log_minutes` | `10` | 多少分钟在日志里报一次经验（`0`=不报） |
 
@@ -552,6 +552,9 @@ python main.py
 # CLI 模式（无界面）
 python -m src.main
 ```
+
+运行时输出统一放在 `logs/` 下：`mxd.log`（当前日志）、`archive/`（合并后的历史日志）、
+`exp_log/`（经验 CSV）、`channel_debug/`、`quit_debug/`（诊断截图）、`lie_detected/`（测谎取证）。
 
 ## 训练
 
