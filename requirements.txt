@@ -13,3 +13,5 @@ mouse>=0.7.1
 psutil>=7.0.0
 PyYAML>=6.0.2
 ultralytics>=8.0.0
+# 经验条 OCR（ExpMeter 读取状态栏 EXP 数字）
+rapidocr-onnxruntime>=1.4.0

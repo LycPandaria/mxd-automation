@@ -75,6 +75,7 @@ from .decision.context import Context, DecisionEngine
 from .utils.config_loader import (
     Config, resolve_model_path, resolve_asset_path, APP_DIR,
 )
+from .utils.elevation import warn_uipi_mismatch
 
 
 # =============================================================================
@@ -293,6 +294,9 @@ class Automation:
         locked = self.capture.lock(title=title)
         # 把窗口句柄传给执行层，这样按键/鼠标消息会发到游戏中
         self.executor.set_target_window(self.capture.hwnd)
+        # 权限自检: 游戏以管理员运行而本程序不是 → 按键会被 UIPI 静默拦截，
+        # SendInput 看似成功实际全部丢弃（症状: 识别正常但角色不动）
+        warn_uipi_mismatch(self.capture.hwnd, locked, self.on_log)
         return locked
 
     def unlock_window(self):
