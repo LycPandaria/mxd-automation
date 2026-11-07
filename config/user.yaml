@@ -40,7 +40,7 @@ target_key: tab
 jump_key: alt
 attack_type: long
 attack_range: 400
-attack_range_y: 30
+attack_range_y: 29
 attack_min_range: 0
 attack_lock_seconds: 0.4
 knockback_skill:
@@ -48,6 +48,7 @@ knockback_skill:
   key: D
   cooldown: 0.4
   range: 100
+ghost_casts: 6
 stand_mode: false
 stand_facing: right
 stand_default_attack: false
@@ -65,11 +66,29 @@ skills:
 buff_skills:
 - name: 无形箭
   key: '2'
-  cooldown: 300.0
+  cooldown: 290.0
 pickup_enabled: false
 pickup_key: z
 pickup_interval: 0.333
 screenshot_interval: 1
+pixel_base_height: 768
+range_limit: none
+range_split: 0.5
+minimap_region:
+- 0.007320644216691069
+- 0.04296875
+- 0.10468521229868229
+- 0.15885416666666666
+minimap_scale: 16
+channel_enabled: true
+channel_idle_min: 2
+channel_hold_key: right
+channel_hold_seconds: 5
+quit_enabled: true
+quit_time: 03:00
+exp_enabled: true
+exp_read_seconds: 5
+exp_log_minutes: 10
 lie_detect_enabled: true
 lie_detect_template: assets/templates/lie_detector.png
 lie_detect_threshold: 0.78
