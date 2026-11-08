@@ -72,6 +72,8 @@ YAML 配置字段说明
   ghost_casts:      对同一目标出手多少次仍未消失就判定为残影/误识别（0=关闭）
   turn_mode:        转向模式 tap（点按 120~180ms + 自检重试）/ hold（按住方向键走出
                     确认位移再松键出手，消除"小碎步搓很久"；实测 A/B 后再改默认）
+  aoe_mode:         AOE 爆发方式 burst（连发 3 发技能2，现状）/ hold（按住技能键
+                    aoe_hold_seconds 秒，游戏自动连发并跳过后摇）
   pixel_base_height: 像素参数（攻击距离/垂直容差/活动范围阈值等）按此画面高度填写，
                     运行时乘以 当前帧高/此值；0 = 不缩放
   range_limit:      活动范围 none（不限制）/ left（只在地图左半边）/ right（只在地图右半边）
@@ -302,6 +304,14 @@ def _defaults() -> Dict[str, Any]:
         # hold = 按住方向键走出 TURN_HOLD_CONFIRM_PX 再松键出手：一次确定性输入
         # 代替"点按→自检→重试"循环，消除小碎步。turn_hold_* 参数见 context.py。
         "turn_mode": "tap",       # "tap" / "hold"
+        # ---- AOE 爆发方式 ----
+        # burst = 攻击方向怪多时连发 3 发技能2，冷却空档技能1兜底（现状）；
+        # hold = 触发时按住技能键 aoe_hold_seconds 秒：游戏按住期间自动连发
+        # 并跳过后摇，出手更密；近身威胁/怪清空/目标换边会提前松键。
+        "aoe_mode": "burst",      # "burst" / "hold"
+        "aoe_hold_seconds": 2.0,  # 每次按住时长（秒）
+        "aoe_hold_min_seconds": 0.5,  # 提前松键下限（秒）
+        "aoe_hold_cooldown": 3.0,     # 两次按住的最小间隔（秒）
         # ---- 站桩模式 ----
         "stand_mode": False,     # 站桩模式：不对角色做任何移动（不移动/不转向/不后撤/不探索），
                                  # 只打朝向正前方射程内的怪；攻击逻辑与普通模式完全一致

@@ -44,6 +44,7 @@ class GhostTestCase(unittest.TestCase):
     def engine(self, **overrides):
         cfg = Config(overrides={
             "attack_type": "long", "attack_range": 400, "attack_range_y": 60,
+            "turn_mode": "tap", "aoe_mode": "burst",
             "stand_mode": False, "pixel_base_height": 768, "ghost_casts": 6,
             "skills": [{"name": "攻击", "key": "a", "cooldown": 0.5}],
             "hp_threshold": 0, "mp_threshold": 0,

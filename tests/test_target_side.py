@@ -26,6 +26,7 @@ class Base(unittest.TestCase):
     def engine(self, **overrides):
         cfg = Config(overrides={
             "attack_type": "long", "attack_range": 300, "attack_range_y": 60,
+            "turn_mode": "tap", "aoe_mode": "burst",
             "attack_min_range": 0, "stand_mode": False, "pixel_base_height": 768,
             "jump_key": "alt", "ghost_casts": 6, "fps": 20,
             "knockback_skill": {"name": "击退", "key": "D", "cooldown": 0.3, "range": 240},

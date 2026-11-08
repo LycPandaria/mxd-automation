@@ -1,0 +1,243 @@
+"""AOE 按住连发（aoe_mode="hold"）：触发 → 按住技能键 → 游戏自动连发（跳过后摇）→ 松键。
+
+对比 burst 模式（3 次点按 + 技能1兜底）：一次长按出手更密。
+默认仍是 burst，本文件只测 hold；所有用例显式钉死模式，不依赖本机 user.yaml。
+"""
+import unittest
+
+from src.decision import context as ctxmod
+from src.decision.context import Context, DecisionEngine, State, AOE_HOLD_SECONDS
+from src.perception.yolo_detector import Detection
+from src.utils.config_loader import Config, _defaults
+
+from .fake_executor import FakeExecutor
+
+GROUND = 600
+
+
+def monster(cx, foot=GROUND, w=60, h=60):
+    return Detection(cls_name="monster", confidence=0.9,
+                     x=cx - w // 2, y=foot - h, w=w, h=h)
+
+
+class FakeClock:
+    def __init__(self):
+        self.t = 1000.0
+
+    def time(self):
+        return self.t
+
+    def sleep(self, s):
+        self.t += s
+
+
+class AoeHoldTestCase(unittest.TestCase):
+    def setUp(self):
+        self.clock = FakeClock()
+        self._orig = ctxmod.time
+        ctxmod.time = self.clock
+        self.addCleanup(self._restore)
+        self.logs = []
+
+    def _restore(self):
+        ctxmod.time = self._orig
+
+    def engine(self, **overrides):
+        cfg = Config(overrides={
+            "attack_type": "long", "attack_range": 400, "attack_range_y": 60,
+            "attack_min_range": 0, "stand_mode": False, "pixel_base_height": 768,
+            "turn_mode": "tap", "aoe_mode": "hold", "fps": 20,
+            "knockback_skill": {"name": "击退", "key": "", "cooldown": 0.3, "range": 240},
+            "skills": [{"name": "连击", "key": "a", "cooldown": 0.5},
+                       {"name": "爆炸箭", "key": "space", "cooldown": 0.5}],
+            "hp_threshold": 0, "mp_threshold": 0,
+            **overrides,
+        })
+        e = DecisionEngine(cfg, FakeExecutor(), on_log=self.logs.append)
+        e._scale = 1.0
+        # 朝向已确认且近期不重申，让用例聚焦"AOE 触发 → 按住 → 松键"
+        e._face_dir = "right"
+        e._face_need_side = "right"
+        e._face_need_frames = 99
+        e._face_next_assert = self.clock.t + 1000
+        return e
+
+    def ctx(self, *monsters, sx=1000):
+        return Context(monsters=list(monsters), self_position=(sx, GROUND),
+                       frame_width=1920, frame_height=1080)
+
+    def logged(self, text):
+        return any(text in m for m in self.logs)
+
+    def buff_window(self, e, frames=10):
+        e.request_buff_window(frames)
+
+
+class TriggerTests(AoeHoldTestCase):
+    def test_default_mode_is_burst(self):
+        """代码内置默认 burst（本地 user.yaml 可能已开 hold，用 _defaults 断言）。"""
+        self.assertEqual(_defaults()["aoe_mode"], "burst")
+
+    def test_two_monsters_start_hold(self):
+        """攻击方向 ≥2 只怪 → key_down 技能2，不放技能1。"""
+        e = self.engine()
+        m1, m2 = monster(1300), monster(1450)
+        e._target_monster = m1
+        e._attack(self.ctx(m1, m2), m1)
+        self.assertEqual(e._skill_hold_key, "space")
+        self.assertIn("space", e.executor.held)
+        self.assertNotIn("a", e.executor.keys())
+
+    def test_single_monster_keeps_burst_rotation(self):
+        """只有 1 只怪 → 走原轮转（点按技能1），不按住。"""
+        e = self.engine()
+        m = monster(1300)
+        e._target_monster = m
+        e._attack(self.ctx(m), m)
+        self.assertIsNone(e._skill_hold_key)
+        self.assertIn("a", e.executor.keys())
+
+    def test_hold_blocks_other_casts_while_active(self):
+        """按住进行中：每帧只推进 hold，不放技能1/击退。"""
+        e = self.engine()
+        m1, m2 = monster(1300), monster(1450)
+        e._target_monster = m1
+        e._attack(self.ctx(m1, m2), m1)
+        self.assertEqual(e._skill_hold_key, "space")
+        ex = e.executor
+        n_keys = len(ex.keys())
+        self.clock.t += 0.3
+        e._attack(self.ctx(m1, m2), m1)     # 仍在按住中：无新按键
+        self.assertEqual(len(ex.keys()), n_keys)
+        self.assertIn("space", ex.held)     # 技能键还按着
+
+
+class ReleaseTests(AoeHoldTestCase):
+    def test_full_duration_release(self):
+        """按住满 2s → key_up、开动画锁、关间隔门。"""
+        e = self.engine()
+        m1, m2 = monster(1300), monster(1450)
+        e._target_monster = m1
+        e._attack(self.ctx(m1, m2), m1)
+        self.clock.t += AOE_HOLD_SECONDS + 0.05
+        e._attack(self.ctx(m1, m2), m1)
+        self.assertIsNone(e._skill_hold_key)
+        self.assertFalse(e.executor.held)
+        self.assertTrue(self.logged("连发结束"))
+        # 间隔门：刚松手，下一帧不会立刻重新按住
+        self.assertGreater(e._skill_hold_next_at, self.clock.t)
+
+    def test_release_on_knockback_threat(self):
+        """按住中出现近身怪 → 提前松键（下一帧走击退）。"""
+        e = self.engine(knockback_skill={"name": "击退", "key": "D", "cooldown": 0.3, "range": 240})
+        far, far2 = monster(1350), monster(1450)   # 都在击退距离外，先正常发起按住
+        e._target_monster = far
+        e._attack(self.ctx(far, far2), far)
+        self.assertEqual(e._skill_hold_key, "space")
+        near = monster(1150)  # 按住中途出现：击退距离 240 内
+        self.clock.t += 0.3
+        e._attack(self.ctx(far, far2, near), far)
+        self.assertIsNone(e._skill_hold_key)
+        self.assertTrue(self.logged("近身威胁"))
+
+    def test_release_when_monsters_cleared(self):
+        """攻击方向怪清空且超过最短按住时长 → 提前松键。"""
+        e = self.engine()
+        m1, m2 = monster(1300), monster(1450)
+        e._target_monster = m1
+        e._attack(self.ctx(m1, m2), m1)
+        self.clock.t += 0.8                        # 超过 aoe_hold_min_seconds(0.5)
+        e._attack(self.ctx(), m1)                  # 怪全没了
+        self.assertIsNone(e._skill_hold_key)
+        self.assertTrue(self.logged("怪清空"))
+
+    def test_no_early_release_before_min(self):
+        """怪清空但按住不足 0.5s → 继续按住（太短吃不到免后摇收益）。"""
+        e = self.engine()
+        m1, m2 = monster(1300), monster(1450)
+        e._target_monster = m1
+        e._attack(self.ctx(m1, m2), m1)
+        self.clock.t += 0.2
+        e._attack(self.ctx(), m1)                  # 怪没了但按住才 0.2s
+        self.assertEqual(e._skill_hold_key, "space")
+
+    def test_release_on_target_flip(self):
+        """目标换到背后 → 松键（按住方向错了就是空放）。"""
+        e = self.engine()
+        m1, m2 = monster(1300), monster(1450)
+        e._target_monster = m1
+        e._attack(self.ctx(m1, m2), m1)
+        self.assertEqual(e._skill_hold_key, "space")
+        behind = monster(800)
+        e._target_monster = behind
+        self.clock.t += 0.3
+        e._attack(self.ctx(behind), behind)        # need=left != face_dir=right
+        self.assertIsNone(e._skill_hold_key)
+        self.assertTrue(self.logged("目标换边"))
+
+    def test_release_for_buff_window(self):
+        """buff 施法窗口被请求 → 松键让路。"""
+        e = self.engine()
+        m1, m2 = monster(1300), monster(1450)
+        e._target_monster = m1
+        e._attack(self.ctx(m1, m2), m1)
+        self.assertEqual(e._skill_hold_key, "space")
+        self.buff_window(e)
+        self.clock.t += 0.3
+        e._attack(self.ctx(m1, m2), m1)
+        self.assertIsNone(e._skill_hold_key)
+        self.assertTrue(self.logged("buff 施法窗口让路"))
+
+
+class GateTests(AoeHoldTestCase):
+    def test_no_retrigger_within_cooldown_gate(self):
+        """松手后间隔门内：怪还多也不重新按住，走普通轮转。"""
+        e = self.engine()
+        m1, m2 = monster(1300), monster(1450)
+        e._target_monster = m1
+        e._attack(self.ctx(m1, m2), m1)
+        self.clock.t += AOE_HOLD_SECONDS + 0.05
+        e._attack(self.ctx(m1, m2), m1)            # 满时长松手
+        self.assertIsNone(e._skill_hold_key)
+        e.executor.clear()
+        self.clock.t += 0.7                        # 动画锁(0.6s)已过、间隔门(3s)内
+        e._attack(self.ctx(m1, m2), m1)
+        self.assertIsNone(e._skill_hold_key)
+        self.assertIn("a", e.executor.keys())      # 普通轮转（技能1点按）
+
+    def test_retrigger_after_gate(self):
+        """间隔门过后、怪还多 → 再次按住。"""
+        e = self.engine()
+        m1, m2 = monster(1300), monster(1450)
+        e._target_monster = m1
+        e._attack(self.ctx(m1, m2), m1)
+        self.clock.t += AOE_HOLD_SECONDS + 0.05
+        e._attack(self.ctx(m1, m2), m1)
+        self.clock.t += 3.1                        # 门(3s)过
+        e._attack(self.ctx(m1, m2), m1)
+        self.assertEqual(e._skill_hold_key, "space")
+
+    def test_stop_releases_skill_key(self):
+        """运行中停止：release_keys 松掉按住的技能键。"""
+        e = self.engine()
+        m1, m2 = monster(1300), monster(1450)
+        e._target_monster = m1
+        e._attack(self.ctx(m1, m2), m1)
+        self.assertIn("space", e.executor.held)
+        e.release_keys()
+        self.assertIsNone(e._skill_hold_key)
+        self.assertFalse(e.executor.held)
+
+    def test_no_monster_cleanup_releases(self):
+        """画面没怪清锁路径：按住的技能键同步松开。"""
+        e = self.engine()
+        m1, m2 = monster(1300), monster(1450)
+        e._target_monster = m1
+        e._attack(self.ctx(m1, m2), m1)
+        self.assertEqual(e._skill_hold_key, "space")
+        e._skill_hold_release("测试清锁")
+        self.assertIsNone(e._skill_hold_key)
+
+
+if __name__ == "__main__":
+    unittest.main()

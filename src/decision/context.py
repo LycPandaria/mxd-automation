@@ -118,6 +118,24 @@ AOE_BURST_COUNT = 3
 """AOE 连发次数：每次判定放技能2(爆炸箭)时，连发此数量的爆炸箭
 （隔冷却逐发补满，成功放出一发才递减）。"""
 
+# ---- AOE 按住连发（aoe_mode="hold"）----
+# 游戏里按住 AOE 技能键角色会连续释放该技能，且按住期间跳过后摇——
+# 实际出手间隔 ≈ 动画时长，比"每 0.5s 点一发"的 burst 更密。
+# 实现：某帧 key_down，逐帧检查（同转向 hold 的骨架），到时长 key_up；
+# 按住期间游戏自己按内部冷却连发，我们不数发、不干预节奏。
+
+AOE_HOLD_SECONDS = 2.0
+"""按住 AOE 技能键的时长（秒）：按住期间游戏自动连发并跳过后摇。"""
+
+AOE_HOLD_MIN_SECONDS = 0.5
+"""提前松键的下限（秒）：按住不足这么久不提前松（太短等于一次点按，
+省略后摇的收益还没吃到）。"""
+
+AOE_HOLD_COOLDOWN = 3.0
+"""两次按住之间的最小间隔（秒）：略大于 按住时长 + 技能真实冷却，
+防止松手后每帧重新按住、变成永久只放技能2。key_down/key_up 绕过
+press_key 的冷却记账，这个门是唯一的节奏控制。"""
+
 # ---- 站桩定时微动（反"定点一动不动"的机器特征）----
 # 每过 N 秒做一次"很短的左/右点按"即可，不做位置闭环（不关心挪了几像素）。
 
@@ -805,6 +823,10 @@ class DecisionEngine:
         self._hp_drop_active_frames = 0           # 掉血信号剩余有效帧数
         self._hp_retreat_hold_frames = 0          # 掉血触发后撤的剩余持续帧数
         self._aoe_burst_left = 0                  # AOE连发剩余次数（爆炸箭二连发）
+        # ---- AOE 按住连发（aoe_mode="hold"）----
+        self._skill_hold_key: Optional[str] = None  # 正在按住的技能键，None = 没在按住
+        self._skill_hold_started = 0.0            # 按住开始的时间
+        self._skill_hold_next_at = 0.0            # 下次允许发起按住的时间（间隔门）
         self._target_miss_frames = 0              # 锁定目标连续漏检帧数（特效遮挡保持）
         self._buff_hold_frames = 0                # >0 时暂停攻击/移动，给 buff 让路（主循环请求）
         # ---- 站桩定时微动 ----
@@ -900,6 +922,7 @@ class DecisionEngine:
         self._hp_drop_active_frames = 0
         self._hp_retreat_hold_frames = 0
         self._aoe_burst_left = 0
+        self._skill_hold_release("reset")
         self._target_miss_frames = 0
         self._buff_hold_frames = 0
         self._hp_react_frames = -1
@@ -918,6 +941,7 @@ class DecisionEngine:
     def release_keys(self):
         """释放所有按住的移动键（停止时调用，防止方向键卡住）。"""
         self._face_clear_hold()   # 按住转向中停止：状态一并清掉
+        self._skill_hold_release("停止")
         self._release_move()
         self._climbing = False
         self._climb_exit_frames = 0
@@ -1073,6 +1097,7 @@ class DecisionEngine:
             self._casts_on_target = 0
             self._occluded_retreat_frames = 0
             self._aoe_burst_left = 0
+            self._skill_hold_release("无怪清锁")
             self._target_miss_frames = 0
             self._climbing = False
             self._climb_exit_frames = 0
@@ -1089,6 +1114,7 @@ class DecisionEngine:
             self._casts_on_target = 0
             self._occluded_retreat_frames = 0
             self._aoe_burst_left = 0
+            self._skill_hold_release("无怪清锁")
             self._target_miss_frames = 0
             self._climbing = False
             self._climb_exit_frames = 0
@@ -3362,6 +3388,14 @@ class DecisionEngine:
         """
         self._release_move()  # 攻击时保持不动
 
+        # ---- AOE 按住连发进行中：先推进（松键判定/满时长结束），本帧不放别的 ----
+        # 必须在动画锁之前：发起按住时 _mark_attack_pressed 开了锁，
+        # 若被锁挡住，hold 就永远没有机会逐帧推进和松键。
+        if self._skill_hold_key is not None:
+            if self._skill_hold_step(ctx):
+                return
+            # 刚松键：本帧继续往下走（可能立刻触发击退等）
+
         # ---- 攻击动画锁：上次攻击还在动画中 → 本帧不发攻击/击退/转向键 ----
         # 游戏会忽略动画期间的按键，此时硬发只会被吞（白按还挤掉能生效的输入）。
         if self._attack_busy():
@@ -3411,11 +3445,22 @@ class DecisionEngine:
             self._cast_attack_skill()
             return
 
+        # ---- AOE 按住连发（aoe_mode="hold"）----
+        # 按住的推进在 _attack 开头（动画锁之前）；这里只负责发起。
+
         # 普通模式：攻击方向怪数 ≥ 阈值 → 连发 AOE_BURST_COUNT 发技能2(爆炸箭)，
         #      爆炸箭冷却空档用技能1兜底；否则只放技能1
+        # aoe_mode="hold" 时改为按住技能2 连发（游戏自动补发并跳过后摇），
+        # 间隔门 aoe_hold_cooldown 之外 + 动画锁外才发起
+        now = time.time()
         if self._aoe_burst_left == 0 \
                 and self._count_attack_dir_monsters(ctx, target) >= AOE_MONSTER_COUNT_THRESHOLD:
-            self._aoe_burst_left = AOE_BURST_COUNT
+            if self._aoe_hold_mode():
+                if now >= self._skill_hold_next_at and not self._attack_busy() \
+                        and self._skill_hold_start(ctx, target):
+                    return
+            else:
+                self._aoe_burst_left = AOE_BURST_COUNT
 
         if self._aoe_burst_left > 0:
             # 爆炸箭连发中：成功放出一发才递减；冷却空档连击兜底
@@ -4086,6 +4131,99 @@ class DecisionEngine:
         lock = self._attack_lock_seconds()
         if lock > 0:
             self._attack_busy_until = time.time() + lock
+
+    # =========================================================================
+    # AOE 按住连发（aoe_mode="hold"）：按住技能键，游戏自动连发并跳过后摇
+    # =========================================================================
+
+    def _aoe_hold_mode(self) -> bool:
+        """当前是否使用"按住连发"的 AOE 爆发（config.aoe_mode，默认 burst = 现状）。"""
+        return getattr(self.config, "aoe_mode", "burst") == "hold"
+
+    def _skill_hold_release(self, why: str, confirmed: bool = False):
+        """结束按住技能键：松键 + 关间隔门。没在按住时什么都不做。"""
+        key = self._skill_hold_key
+        if key is None:
+            return
+        self._skill_hold_key = None
+        self.executor.key_up(key, force=True)
+        self._drift_suppress_until = time.time() + 0.5
+        elapsed = time.time() - self._skill_hold_started
+        if confirmed:
+            self._log(f"[AOE] 按住 {key} {elapsed:.1f}s 连发结束（{why}）")
+        else:
+            self._log(f"[AOE] 按住 {key} {elapsed:.1f}s 提前松键（{why}）")
+        # 松手后开动画锁：松开瞬间游戏还有一次出手/收尾动作
+        self._mark_attack_pressed()
+        # 间隔门：key_down/key_up 绕过了 press_key 的冷却记账，这里是唯一节奏控制
+        gate = float(getattr(self.config, "aoe_hold_cooldown", AOE_HOLD_COOLDOWN) or 0)
+        self._skill_hold_next_at = time.time() + max(0.0, gate - elapsed)
+
+    def _skill_hold_step(self, ctx: Context) -> bool:
+        """按住连发的逐帧推进。返回 True 表示本帧仍在按住（调用方不再放别的技能）。
+
+        提前松键条件（保命优先 / 不空放）：
+          · 近身威胁出现（面朝侧、击退距离内）→ 下一帧走击退
+          · 攻击方向怪数掉到 0 且超过最短按住时长 → 不对空气继续连发
+          · buff 施法窗口被请求 → 让路（buff 键和技能键同按会被吞）
+          · 目标换到背后（need != _face_dir）→ 按住方向错了就是空放
+          · 按住满 aoe_hold_seconds → 正常结束
+        """
+        key = self._skill_hold_key
+        if key is None:
+            return False
+        now = time.time()
+        elapsed = now - self._skill_hold_started
+        hold_s = float(getattr(self.config, "aoe_hold_seconds", AOE_HOLD_SECONDS) or 0)
+        min_s = float(getattr(self.config, "aoe_hold_min_seconds", AOE_HOLD_MIN_SECONDS) or 0)
+
+        # buff 优先：松键让路（buff 窗口分支在 decide() 里更早，松了键下一帧就能进）
+        if self._buff_hold_frames > 0:
+            self._skill_hold_release("buff 施法窗口让路")
+            return False
+
+        # 近身威胁：立即松键，下一帧走正常击退逻辑
+        foot = self._effective_self_pos(ctx)
+        if foot is not None and self._nearest_knockback_threat(ctx, foot) is not None:
+            self._skill_hold_release("近身威胁，让位击退")
+            return False
+
+        # 目标换边：按住方向已经不对，继续按就是朝旧方向空放
+        if foot is not None:
+            need = self._face_needed(foot[0], self._target_monster) \
+                if self._target_monster is not None else None
+            if need is not None and self._face_dir is not None and need != self._face_dir:
+                self._skill_hold_release("目标换边")
+                return False
+
+        # 攻击方向没怪了：超过最短按住时长就不对空气继续连发
+        if elapsed >= min_s and self._count_attack_dir_monsters(ctx, self._target_monster) == 0:
+            self._skill_hold_release("攻击方向怪清空")
+            return False
+
+        # 按住满时长：正常结束
+        if elapsed >= hold_s:
+            self._skill_hold_release("满时长", confirmed=True)
+            return False
+        return True
+
+    def _skill_hold_start(self, ctx: Context, target: Optional[Detection]) -> bool:
+        """攻击方向怪够多、间隔门已过 → 按住技能2 开始连发。返回 True 表示已发起。"""
+        skills = self.config.skills or []
+        if len(skills) < 2:
+            return False
+        key = str(skills[1].get("key", "") or "").strip()
+        if not key or not self.executor.can_press(key, 0.0):
+            return False
+        if not self.executor.key_down(key):
+            return False
+        self._skill_hold_key = key
+        self._skill_hold_started = time.time()
+        self._casts_on_target += 1   # 残影计数：一次按住记一次（游戏实际连发更多）
+        self._mark_attack_pressed()
+        self._log(f"[AOE] 攻击方向 {self._count_attack_dir_monsters(ctx, target)} 只怪，"
+                  f"按住 {skills[1]['name']} ({key}) 连发")
+        return True
 
     def _knockback_conf(self) -> Optional[dict]:
         """读取击退技能配置；未配置（按键为空）→ None（功能关闭）。

@@ -53,6 +53,7 @@ class HoldTestCase(unittest.TestCase):
     def engine(self, **overrides):
         cfg = Config(overrides={
             "attack_type": "long", "attack_range": 400, "attack_range_y": 60,
+            "turn_mode": "tap", "aoe_mode": "burst",
             "attack_min_range": 0, "stand_mode": False, "pixel_base_height": 768,
             "turn_mode": "hold", "fps": 20,
             "knockback_skill": {"name": "击退", "key": "D", "cooldown": 0.3, "range": 240},
@@ -76,9 +77,13 @@ class HoldTestCase(unittest.TestCase):
 
 class HoldBasicTests(HoldTestCase):
     def test_default_mode_is_tap(self):
-        """默认（未配置 turn_mode）走点按：不出现按住转向状态。"""
+        """代码内置默认是 tap（_defaults 层面）；本地 user.yaml 可能已开 hold，
+        所以运行值用显式覆盖断言，不依赖本机配置。"""
+        from src.utils.config_loader import _defaults
+        self.assertEqual(_defaults()["turn_mode"], "tap")
         cfg = Config(overrides={
             "attack_type": "long", "attack_range": 400, "attack_range_y": 60,
+            "turn_mode": "tap",
             "skills": [{"name": "攻击", "key": "a", "cooldown": 0.5}],
             "hp_threshold": 0, "mp_threshold": 0,
         })
