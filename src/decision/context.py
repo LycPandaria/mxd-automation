@@ -195,7 +195,7 @@ HP_RETREAT_HOLD_SECONDS = 1.0
 """掉血触发后撤的持续秒数：触发后持续后撤此时间，避免只退一帧就停、又被打。
 （按 fps 换算成帧）"""
 
-TARGET_MISS_RETAIN_SECONDS = 0.5
+TARGET_MISS_RETAIN_SECONDS = 0.4
 """长手(远程)目标漏检保持秒数（射程外）：攻击中锁定目标因技能特效被遮挡而
 短时漏检时，沿用最后位置继续攻击此时间，避免"换目标/乱跑"；超过才重选。
 （按 fps 换算成帧）
@@ -203,11 +203,22 @@ TARGET_MISS_RETAIN_SECONDS = 0.5
 射程内的目标用更长的 TARGET_MISS_RETAIN_INRANGE_SECONDS（特效盖住时目标
 通常还在原地，保持更久可以少换目标/少转身）。"""
 
-TARGET_MISS_RETAIN_INRANGE_SECONDS = 1.0
+TARGET_MISS_RETAIN_INRANGE_SECONDS = 0.7
 """射程内目标漏检保持秒数：目标最后位置仍在攻击距离内时，多半是技能特效/
-角色遮挡导致 YOLO 置信度掉下去，目标本身没消失。保持 1.0s 让特效过去，
+角色遮挡导致 YOLO 置信度掉下去，目标本身没消失。保持 0.7s 让特效过去，
 期间不换目标；只有明显更近（≥NEARER_GHOST_INRANGE_MARGIN_X）的可见怪
-才会抢占（见 _pick_nearer_visible）。（按 fps 换算成帧）"""
+才会抢占（见 _pick_nearer_visible）。（按 fps 换算成帧）
+
+0.7 而不是 1.0：沿用期间每段最多打一击（见 _attack 的 _retain_casted），
+保留太久只是对着"影子位置"站桩，2026-11-08 视频里命中率低。"""
+
+TARGET_SWITCH_MIN_GAP_SECONDS = 1.5
+"""两次"更近的可见怪抢占"之间的最小间隔（秒）。
+
+怪群夹住时两侧都有怪，抢占条件每隔几帧就成立一次，目标左右横跳 →
+每次横跳触发换边等待 + 转向 + AOE 松键（2026-11-08 日志：30 秒内
+"更近的可见怪优先"14 次）。冷却期内不抢占（当前目标死亡/消失的
+正常重选不受影响），把转身次数压到人类水平。"""
 
 SELECT_FALLBACK_SECONDS = 3.0
 """自身定位失败时，选怪允许使用"最后已知位置"的最大时效（秒）。
@@ -384,21 +395,19 @@ TURN_RETRY_MAX_SECONDS = 0.30
 #   按住 0.2s 零位移（keydown 本身被吞）→ 强制松开重试一次。
 
 TURN_HOLD_CONFIRM_PX = 25
-"""按住转向的确认位移（px，768 高画面下）：按住方向键后角色朝该方向累计走出
-这么多就确认朝向、松键出手。约 0.2~0.4s 的走动；太小会被检测框抖动误确认
-（单帧可抖 3~10px），太大则白白走远。"""
+"""按住转向的快速确认位移（px，768 高画面下）：按住方向键后角色朝该方向累计走出
+这么多就提前确认、松键出手（自由走位时的快速路径）。这只是**快速确认**，
+不是必要条件——怪群夹住走不动时按"乐观确认"兜底（见 TURN_HOLD_MIN/MAX）。"""
 
-TURN_HOLD_MIN_SECONDS = 0.25
-"""按住转向的最短时长（秒）：再短和点按没区别；同时给"零位移 = 被吞"的判定
-留出观察窗口。下限到上限之间随机取值，避免每次转向时长一致。"""
+TURN_HOLD_MIN_SECONDS = 0.3
+"""按住转向的最短时长（秒）：满此时长即"乐观确认"——冒险岛按方向键第一帧就
+转身，按住横跨多个游戏帧必然被采样，位移没达标只是被怪群挡住走不动
+（位移是"锦上添花"的证据，不是前提）。实测按"位移确认"在怪群夹住时
+永远确认不了 → 站着不动错失输出（2026-11-08 视频/日志）。"""
 
-TURN_HOLD_MAX_SECONDS = 1.2
-"""按住转向的最长时长（秒）：到点强制松键（正常 0.3~0.6s 就会确认，
-走到上限说明没确认成功，多半是顶墙/顶怪——按住也不会有更多位移）。"""
-
-TURN_HOLD_STALL_SECONDS = 0.2
-"""按住转向的零位移判定（秒）：按住这么久角色一点没朝该方向动 → keydown
-本身没被游戏接收（罕见的动画输入锁），松开重试一次。"""
+TURN_HOLD_MAX_SECONDS = 0.8
+"""按住转向的最长时长（秒）：到点乐观确认并松键出手。旧值 1.2s + 重试
+会造成长时间原地等待（错失攻击时机），收紧到一次人类式的短按住。"""
 
 TURN_HOLD_REASSERT_MIN_SECONDS = 8.0
 """hold 模式下朝向重申间隔下限（秒）。按住确认写进记忆的朝向不会再脱钩，
@@ -785,8 +794,9 @@ class DecisionEngine:
         self._turn_hold_started = 0.0             # 按住开始的时间
         self._turn_hold_x0: Optional[int] = None  # 按住开始时的角色 x（确认位移基准）
         self._turn_hold_confirmed_px = 0          # 按住期间朝该方向的累计位移
-        self._turn_hold_retry_done = False        # 这次纠正是否已经重试过一次（零位移后）
-        self._turn_hold_last_dir: Optional[str] = None  # 上次按住转向的方向（重试标记按方向保留）
+        self._turn_hold_planned = 0.0             # 本次按住转向的计划时长（发起时随机）
+        self._last_target_switch_at = 0.0         # 上次切换锁定目标的时间（抢占冷却用）
+        self._retain_casted = False               # 本次"漏检沿用"段是否已经出过手
         self._turn_hold_target: Optional[Detection] = None  # 按住转向时的目标（射程/击退安全检查用）
         self._face_verify_fails = 0               # 连续自检失败次数（决定是否提前重试）
         self._face_assert_count = 0               # 本日志窗口内转向次数
@@ -885,8 +895,9 @@ class DecisionEngine:
         self._turn_hold_started = 0.0
         self._turn_hold_x0 = None
         self._turn_hold_confirmed_px = 0
-        self._turn_hold_retry_done = False
-        self._turn_hold_last_dir = None
+        self._turn_hold_planned = 0.0
+        self._last_target_switch_at = 0.0
+        self._retain_casted = False
         self._turn_hold_target = None
         self._face_verify_fails = 0
         self._face_assert_count = 0
@@ -1573,34 +1584,35 @@ class DecisionEngine:
         """开始按住 direction 转向。返回 False 表示 keydown 没发出去。
 
         直接写 _held_key（不走 _hold_move）：_hold_move 会立刻把朝向记为已确认，
-        而按住转向要等真实位移达标才算；写 _held_key 是为了让卡键兜底
-        （_stuck_direction_guard 看到"自己按着键"就跳过）和 release_keys
+        而按住转向的位移在这里只是"快速确认"的加分证据；写 _held_key 是为了让
+        卡键兜底（_stuck_direction_guard 看到"自己按着键"就跳过）和 release_keys
         在停止时能正确松开这颗键。
 
-        零位移重试标记跨"同方向的多次按住"保留：keydown 被吞 → 重试一次，
-        再被吞 → 放弃本轮（记失败日志），而不是无限按下去。
+        本次按住的时长在发起时随机定好（_turn_hold_planned，0.3~0.8s），
+        到点乐观确认——冒险岛按方向键第一帧就转身，按住横跨多个游戏帧
+        必然被采样；位移没达标多半是怪群夹住走不动（2026-11-08 视频实测），
+        不再因此无限等待/重试（旧逻辑在怪群中永远确认不了 → 站着不动）。
         """
         self._force_release_directions()
         if not self.executor.key_down(direction):
             return False
-        if direction != self._turn_hold_last_dir:
-            self._turn_hold_retry_done = False   # 换方向纠正：重新给一次重试机会
-        self._turn_hold_last_dir = direction
         self._held_key = direction
         self._turn_hold_dir = direction
         self._turn_hold_started = time.time()
+        self._turn_hold_planned = random.uniform(TURN_HOLD_MIN_SECONDS, TURN_HOLD_MAX_SECONDS)
         self._turn_hold_x0 = sx
         self._turn_hold_confirmed_px = 0
         return True
 
     def _turn_hold_finish(self, confirmed: bool, how: str):
-        """结束按住转向：松键 + 记录。confirmed=True 时朝向已由真实移动验证。"""
+        """结束按住转向：松键 + 记录。confirmed=True 时写入朝向记忆并放行施法。"""
         direction = self._turn_hold_dir
         self._release_move()
         self.executor.key_up(direction, force=True)
         self._drift_suppress_until = time.time() + 0.5
         if confirmed:
-            # 按住期间角色真的在朝该方向走 → 朝向必然生效（最强证据）
+            # 位移达标 = 最强证据；乐观确认 = 按住 ≥ 最短时长，键盘状态必然被
+            # 游戏采样过（朝向在按下方向键的瞬间就变了，被怪挡住只是走不动）
             self._face_dir = direction
             self._face_attempt_side = None
             self._face_verify_fails = 0
@@ -1613,18 +1625,18 @@ class DecisionEngine:
         else:
             self._face_verify_fails += 1
             self._face_unverified_count += 1
-            self._log(f"[朝向] 按住转向 {direction} 未确认（{how}），稍后重试")
+            self._log(f"[朝向] 按住转向 {direction} 未确认（{how}）")
         self._face_clear_hold()
         self._face_last_press_at = time.time()
 
     def _turn_hold_step(self, ctx: Context) -> bool:
         """按住转向的逐帧推进。返回 True 表示本帧仍在按住（调用方不施法）。
 
-        结束条件（命中即松键）：
-          · 朝该方向累计位移 ≥ TURN_HOLD_CONFIRM_PX → 确认，正常结束
-          · 按住超过 TURN_HOLD_MAX_SECONDS → 到顶没确认（顶墙/顶怪），放弃
-          · 前方无地板 / 到画面边缘或分界线 / 长手进入最小射程或击退距离
-          · TURN_HOLD_STALL_SECONDS 零位移 → keydown 被吞，重试一次
+        结束条件（到点一律乐观确认，不再有"未确认就反复重试"的空转）：
+          · 朝该方向累计位移 ≥ TURN_HOLD_CONFIRM_PX 且超过最短时长 → 提前确认
+          · 按住满本次计划时长（0.3~0.8s 随机） → 乐观确认
+          · 前方无地板 / 到画面边缘或分界线 → 提前松键
+            （按住 ≥ 最短时长也确认——转向在按下瞬间已生效，只是没走动）
         """
         direction = self._turn_hold_dir
         if direction is None:
@@ -1632,69 +1644,42 @@ class DecisionEngine:
         now = time.time()
         elapsed = now - self._turn_hold_started
 
-        # ---- 位移确认 ----
+        # ---- 快速确认：走出确认位移（自由走位时的快速路径）----
         if ctx.self_position is not None and self._turn_hold_x0 is not None:
             dx = ctx.self_position[0] - self._turn_hold_x0
             moved = dx if direction == "right" else -dx
             self._turn_hold_confirmed_px = max(self._turn_hold_confirmed_px, moved)
             if self._turn_hold_confirmed_px >= self._px(TURN_HOLD_CONFIRM_PX) \
-                    and elapsed >= TURN_HOLD_MIN_SECONDS:
-                self._turn_hold_finish(True, f"位移达标")
+                    and elapsed >= TURN_HOLD_MIN_SECONDS - 1e-6:
+                self._turn_hold_finish(True, "位移达标")
                 return False
-        else:
-            moved = 0
 
-        # ---- 零位移：keydown 本身被吞 ----
-        if elapsed >= TURN_HOLD_MIN_SECONDS + TURN_HOLD_STALL_SECONDS \
-                and self._turn_hold_confirmed_px < self._px(3):
-            if not self._turn_hold_retry_done:
-                self._turn_hold_retry_done = True
-                self._log("[朝向] 按住转向没有位移（按键被吞？），松开重试一次")
-                self._release_move()
-                self.executor.key_up(direction, force=True)
-                self._face_clear_hold()
-                return False   # 下一帧 _face_step 会重新发起
-            self._turn_hold_finish(False, "重试后仍无位移")
-            return False
-
-        # ---- 超时 ----
-        if elapsed >= TURN_HOLD_MAX_SECONDS:
-            self._turn_hold_finish(False, "按住到上限仍未达标")
-            return False
-
-        # ---- 安全检查（按住会走几十像素，逐帧确认还能继续走）----
+        # ---- 安全检查：按住会走几十像素，命中即提前松键 ----
         foot = self._effective_self_pos(ctx)
+        confirmed = elapsed >= TURN_HOLD_MIN_SECONDS - 1e-6
         if foot is not None:
             sx, sy = foot
             lookahead = max(RETREAT_EDGE_LOOKAHEAD_X,
                             int(self._px(TURN_HOLD_CONFIRM_PX) * 2))
             if not self._floor_ahead(ctx, sx, sy, direction, lookahead):
-                self._turn_hold_finish(self._turn_hold_confirmed_px
-                                       >= self._px(TURN_HOLD_CONFIRM_PX),
-                                       "前方无地板，提前松键")
+                self._turn_hold_finish(confirmed, "前方无地板，提前松键")
                 return False
             if self._at_edge(ctx, direction):
-                self._turn_hold_finish(self._turn_hold_confirmed_px
-                                       >= self._px(TURN_HOLD_CONFIRM_PX),
-                                       "到地图边缘/分界线，提前松键")
+                self._turn_hold_finish(confirmed, "到地图边缘/分界线，提前松键")
                 return False
-            # 长手：走进最小射程 / 击退距离就不该再贴上去
+            # 长手：走进最小射程就不该再贴上去（提前收，朝向照常确认）
             t = self._turn_hold_target
             if t is not None:
                 min_range = self._get_min_attack_range()
-                dx = abs(sx - t.center[0])
-                if min_range > 0 and dx <= min_range:
-                    self._turn_hold_finish(self._turn_hold_confirmed_px
-                                           >= self._px(TURN_HOLD_CONFIRM_PX),
-                                           "已进入最小射程，提前松键")
+                if min_range > 0 and abs(sx - t.center[0]) <= min_range:
+                    self._turn_hold_finish(confirmed, "已进入最小射程，提前松键")
                     return False
-                conf = self._knockback_conf()
-                if conf is not None and dx <= conf["range"] \
-                        and self._in_front(t, sx):
-                    self._turn_hold_finish(self._turn_hold_confirmed_px
-                                           >= self._px(TURN_HOLD_CONFIRM_PX),
-                                           "怪已近身，提前松键")
-                    return False
+
+        # ---- 满计划时长：乐观确认（怪群挡住走不动时也到此为止，绝不多等）----
+        if elapsed >= self._turn_hold_planned:
+            self._turn_hold_finish(True, "按住到期"
+                                   + ("" if self._turn_hold_confirmed_px else "（被挡无位移）"))
+            return False
         return True
 
     def _face_clear_pending(self):
@@ -1895,16 +1880,26 @@ class DecisionEngine:
             return True
         sx = foot[0]
         need = self._face_needed(sx, target)
+        now = time.time()
 
         # ---- 按住转向进行中：逐帧推进，本帧不施法 ----
         if self._turn_hold_dir is not None:
-            # 目标换边了（按住方向已不再需要）→ 放弃本次按住，走正常逻辑重判
+            # 目标换边了（按住方向已不再需要）→ 提前收（按住 ≥ 最短时长仍确认——
+            # 角色确实转到了按住方向，这是物理事实；下一帧会为新的 need 重新按住）
             if need is not None and need != self._turn_hold_dir:
-                self._log("[朝向] 按住转向中目标换边，放弃本次按住")
-                self._turn_hold_finish(False, "目标换边")
+                elapsed = now - self._turn_hold_started
+                self._turn_hold_finish(elapsed >= TURN_HOLD_MIN_SECONDS - 1e-6, "目标换边，提前收")
+                # 此时 _face_dir 可能仍 ≠ need：不许直接施法，落到底部重判
             else:
                 self._turn_hold_target = target
-                return self._turn_hold_step(ctx)
+                still = self._turn_hold_step(ctx)
+                if still:
+                    return True
+                # 按住结束：只有朝向已确认 == need 才放行施法，
+                # 否则落到底部按"需要朝向 vs 已确认朝向"重判（绝不朝旧方向空放）
+                if need is None or self._face_dir == need:
+                    return False
+                return True
 
         # ---- 换边防抖：统计"需要的朝向"已连续保持多少帧 ----
         # 群怪分布在角色两侧时最近目标每帧左右翻，每次翻边都转身 = 原地狂转
@@ -1917,8 +1912,6 @@ class DecisionEngine:
             self._face_need_frames = 1
 
         self._face_diag(ctx, target, sx)
-
-        now = time.time()
 
         # ---- hold 模式没有"点按→自检"循环，跳过 settle ----
         hold_mode = self._turn_mode_hold()
@@ -2267,8 +2260,10 @@ class DecisionEngine:
         self._target_miss_frames += 1
         # 漏检保持是"继续对着最后位置打"，日志缺失时完全看不出角色在打空气
         # （本次朝向问题排查时就是因为这条被注释掉而绕了远路）→ 每个漏检
-        # 片段只打一次，不刷屏。
+        # 片段只打一次，不刷屏。新段开始时重置"本段已出手段"标记：
+        # 沿用期间最多打一击（见 _attack），避免整段对着影子位置连放。
         if self._target_miss_frames == 1:
+            self._retain_casted = False
             self._log(
                 f"[目标] 锁定目标本帧漏检（技能特效遮挡/检测波动？）"
                 f"→ 沿用最后位置继续攻击"
@@ -2312,11 +2307,20 @@ class DecisionEngine:
 
         连续 NEARER_SWITCH_FRAMES 帧指向同一只怪才切换，吸收 YOLO 单帧
         漏检/抖动，避免两个距离接近的怪左右来回换目标。
+        两次抢占之间还有 TARGET_SWITCH_MIN_GAP_SECONDS 的冷却：怪群夹住时
+        两侧都有怪，不冷却会每秒换几次目标（2026-11-08 日志实测 14 次/30s），
+        每次换目标都要换边等待 + 转向 + AOE 松键，角色光忙转向了。
 
         Returns:
             更该打的怪物；不满足条件时返回 None（维持原锁定）。
         """
         if getattr(self.config, "attack_type", "long") == "short":
+            return None
+
+        # 抢占冷却：刚换过目标就不抢（当前目标死亡/消失走 _pick_best_target，不受此限）
+        if time.time() - self._last_target_switch_at < TARGET_SWITCH_MIN_GAP_SECONDS:
+            self._nearer_candidate = None
+            self._nearer_frames = 0
             return None
 
         foot = ctx.self_position
@@ -2582,6 +2586,7 @@ class DecisionEngine:
         self._target_monster = target
         if old is not None and self._is_same_monster(old, target):
             return
+        self._last_target_switch_at = time.time()
         cx, cy = target.center
         self._log(
             f"[目标] 锁定新目标 中心=({cx},{cy}) "
@@ -3440,28 +3445,41 @@ class DecisionEngine:
                 return
 
         # ---- 技能选择 ----
+        # 漏检沿用（影子位置）期间最多打一击：目标看不见时打的是"最后已知位置"，
+        # 怪真死了/走了就是纯空放。第一击是"桥过特效遮挡"的合理赌注，之后
+        # 本段停手等目标重新可见（或保持期结束重选）。
+        retaining = self._target_miss_frames > 0
+        if retaining and self._retain_casted:
+            return
+
         # 站桩模式：只放技能2(群攻)，冷却中就等下一帧（见 _cast_attack_skill）
         if self._stand_skill2_only():
+            self._retain_casted = retaining or self._retain_casted
             self._cast_attack_skill()
             return
 
         # ---- AOE 按住连发（aoe_mode="hold"）----
         # 按住的推进在 _attack 开头（动画锁之前）；这里只负责发起。
+        # 漏检沿用期间不按住 2 秒——目标是影子位置，满时长连发是最贵的空放。
 
         # 普通模式：攻击方向怪数 ≥ 阈值 → 连发 AOE_BURST_COUNT 发技能2(爆炸箭)，
         #      爆炸箭冷却空档用技能1兜底；否则只放技能1
         # aoe_mode="hold" 时改为按住技能2 连发（游戏自动补发并跳过后摇），
         # 间隔门 aoe_hold_cooldown 之外 + 动画锁外才发起
         now = time.time()
-        if self._aoe_burst_left == 0 \
+        if self._aoe_burst_left == 0 and not retaining \
                 and self._count_attack_dir_monsters(ctx, target) >= AOE_MONSTER_COUNT_THRESHOLD:
             if self._aoe_hold_mode():
                 if now >= self._skill_hold_next_at and not self._attack_busy() \
                         and self._skill_hold_start(ctx, target):
+                    self._retain_casted = True if retaining else self._retain_casted
                     return
             else:
                 self._aoe_burst_left = AOE_BURST_COUNT
 
+        # 漏检沿用期间允许的"第一击"从这里出去：出手过就标记，本段不再打
+        if retaining:
+            self._retain_casted = True
         if self._aoe_burst_left > 0:
             # 爆炸箭连发中：成功放出一发才递减；冷却空档连击兜底
             if self._cast_skill(force_index=1):

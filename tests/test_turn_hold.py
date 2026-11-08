@@ -121,6 +121,7 @@ class HoldBasicTests(HoldTestCase):
         m = monster(1300)
         self.primed(e, "right")
         self.assertTrue(e._face_step(self.ctx(m), m))    # 发起按住，本帧不出手
+        e._turn_hold_planned = 0.5
         self.clock.t += 0.1
         self.assertTrue(e._face_step(self.ctx(m, sx=1010), m))  # 位移不够，继续按住
         self.clock.t += TURN_HOLD_MIN_SECONDS
@@ -141,19 +142,21 @@ class HoldBasicTests(HoldTestCase):
         e._face_step(self.ctx(m, sx=1100), m)
         self.assertEqual(e._face_dir, "right")
 
-    def test_max_duration_gives_up(self):
-        """按住到上限还没走出确认位移（顶墙）→ 放弃，不无限按住。"""
+    def test_timeout_confirms_optimistically(self):
+        """被怪群挡住走不动（零位移）→ 按住到期仍乐观确认，绝不无限站着等。"""
         e = self.engine()
         e._face_dir = "left"
         m = monster(1300)
         self.primed(e, "right")
         e._face_step(self.ctx(m, floors=[floor(1000)]), m)
         self.assertEqual(e._turn_hold_dir, "right")
-        self.clock.t += TURN_HOLD_MAX_SECONDS + 0.1
+        e._turn_hold_planned = 0.4
+        self.clock.t += 0.5
         e._face_step(self.ctx(m, sx=1010, floors=[floor(1000)]), m)  # 只挪了 10px
         self.assertIsNone(e._turn_hold_dir)
-        self.assertEqual(e._face_dir, "left")   # 未确认，保留旧朝向
-        self.assertTrue(self.logged("按住到上限"))
+        self.assertEqual(e._face_dir, "right")  # 乐观确认：按住已横跨多个游戏帧
+        self.assertFalse(e.executor.held)
+        self.assertTrue(self.logged("按住到期"))
 
 
 class HoldSafetyTests(HoldTestCase):
@@ -163,17 +166,17 @@ class HoldSafetyTests(HoldTestCase):
                        frame_width=1920, frame_height=1080)
 
     def test_releases_at_ledge(self):
-        """前方没地板 → 提前松键（不确认朝向）。"""
+        """前方没地板 → 提前松键；按住已过最短时长 → 朝向照常确认。"""
         e = self.engine()
         e._face_dir = "left"
         m = monster(1300)
         self.primed(e, "right")
-        e._face_step(self.ctx(m, floors=[floor(1000, 40)]), m)  # 地板到 1040 为止
+        e._face_step(self.ctx(m, floors=[floor(950, 120)]), m)  # 地板到 1070 为止
         self.clock.t += 0.3
-        e._face_step(self.ctx(m, sx=1025, floors=[floor(1000, 40)]), m)  # 前瞻越过崖边
+        e._face_step(self.ctx(m, sx=1025, floors=[floor(950, 120)]), m)  # 前瞻越过崖边
         self.assertIsNone(e._turn_hold_dir)
         self.assertFalse(e.executor.held)
-        self.assertEqual(e._face_dir, "left")
+        self.assertEqual(e._face_dir, "right")
 
     def test_releases_at_frame_edge(self):
         """走到画面右缘 → 提前松键。"""
@@ -198,21 +201,27 @@ class HoldSafetyTests(HoldTestCase):
         e._face_step(self.ctx(m, sx=1300), m)
         self.assertIsNone(e._turn_hold_dir)
         self.assertFalse(e.executor.held)
+        self.assertEqual(e._face_dir, "right")  # 按住 ≥ 最短时长 → 确认
 
-    def test_releases_when_monster_close_behind_move(self):
-        """按住方向上已有近身怪（击退距离内）→ 提前松键，不撞上去。"""
+    def test_close_monster_does_not_abort_turn(self):
+        """按住方向上有近身怪 → 不中止转向（怪群里本来就要转身打它，
+        2026-11-08 日志里"怪已近身提前松键"反复杀死转向 → 站着不动）。"""
         e = self.engine()
         e._face_dir = "left"
         target = monster(1300)
         close = monster(1150)   # 同侧 150px < 击退距离 240
         self.primed(e, "right")
         e._face_step(self.ctx(target, close), target)
-        self.clock.t += 0.3
+        e._turn_hold_planned = 0.4
+        self.clock.t += 0.5
         e._face_step(self.ctx(target, close, sx=1040), target)
         self.assertIsNone(e._turn_hold_dir)
+        self.assertEqual(e._face_dir, "right")  # 到点乐观确认
+        self.assertFalse(self.logged("怪已近身"))
 
     def test_target_flip_aborts_hold(self):
-        """按住 right 时目标换到左边 → 放弃按住、松键。"""
+        """按住 right 时目标换到左边（按住不足最短时长）→ 松键、朝向不变、
+        本帧不许施法（face != need）。"""
         e = self.engine()
         e._face_dir = "left"
         right = monster(1300)
@@ -221,28 +230,26 @@ class HoldSafetyTests(HoldTestCase):
         self.assertEqual(e._turn_hold_dir, "right")
         left = monster(800)
         self.primed(e, "left")
-        e._face_step(self.ctx(left), left)
+        ret = e._face_step(self.ctx(left), left)
         self.assertIsNone(e._turn_hold_dir)
         self.assertFalse(e.executor.held)
+        self.assertEqual(e._face_dir, "left")   # 按住太短，朝向记忆不动
+        self.assertFalse(ret)                    # face(left) != need(left)？need=left…
+        self.assertEqual(e.executor.keys(), []) # 没出手
 
-    def test_stalled_key_retries_once(self):
-        """按住但角色零位移（keydown 被吞）→ 松开重试一次，仍不动则放弃。"""
+    def test_flip_after_min_hold_confirms_held_side(self):
+        """按住 ≥ 最短时长才换边 → 角色确实转到了按住方向，照实记录。"""
         e = self.engine()
         e._face_dir = "left"
-        m = monster(1300)
+        right = monster(1300)
         self.primed(e, "right")
-        e._face_step(self.ctx(m), m)
-        self.clock.t += TURN_HOLD_MIN_SECONDS + 0.25   # 超过 stall 判定窗口
-        e._face_step(self.ctx(m), m)                   # 没动 → 重试
-        self.assertIsNone(e._turn_hold_dir)            # 重试由下一帧重新发起
-        self.clock.t += 0.1
-        self.primed(e, "right")
-        e._face_step(self.ctx(m), m)                   # 重新发起
-        self.assertEqual(e._turn_hold_dir, "right")
-        self.clock.t += TURN_HOLD_MIN_SECONDS + 0.25
-        e._face_step(self.ctx(m), m)                   # 还是不动 → 放弃
+        e._face_step(self.ctx(right), right)
+        self.clock.t += 0.35                    # 超过最短时长
+        left = monster(800)
+        self.primed(e, "left")
+        e._face_step(self.ctx(left), left)
         self.assertIsNone(e._turn_hold_dir)
-        self.assertTrue(self.logged("重试后仍无位移"))
+        self.assertEqual(e._face_dir, "right")  # 物理事实：确实转到了 right
 
     def test_stop_releases_held_key(self):
         """运行中停止：release_keys 清掉按住转向并松键。"""
@@ -271,7 +278,7 @@ class HoldReassertTests(HoldTestCase):
         e._face_next_assert = self.clock.t - 1   # 到重申时间
         self.primed(e, "right")
         e._face_step(self.ctx(m), m)
-        self.assertEqual(e._turn_hold_dir, "right")
+        e._turn_hold_planned = 0.5
         self.clock.t += 0.4
         e._face_step(self.ctx(m, sx=1040), m)
         self.assertEqual(e._face_dir, "right")

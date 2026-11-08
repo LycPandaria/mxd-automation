@@ -25,6 +25,7 @@ PYTHONPATH=. python -m unittest discover -s tests -t . -v
 | `test_quit.py` | 定时结束游戏：时间计算、登录界面识别（含 768 固定像素 UI）、退出流程/确认框/中途停止 |
 | `test_turn_hold.py` | 按住转向（turn_mode=hold）：位移确认、最短/最长时长、悬崖/边缘/射程/近身怪提前松键、吞键重试、目标换边放弃 |
 | `test_aoe_hold.py` | AOE 按住连发（aoe_mode=hold）：触发/单怪走轮转、满时长松键、近身威胁/怪清空/目标换边/buff 窗口提前松、间隔门与再触发、停止松键 |
+| `test_phantom.py` | 目标横跳冷却（1.5s 抢占间隔）+ 影子位置限一击（漏检沿用抑制/AOE hold 不对影子开/可见恢复） |
 
 ## 与分享包（share-baseline 分支）测试的关系
 
