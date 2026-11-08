@@ -1,32 +1,48 @@
 @echo off
-chcp 65001 >nul
 setlocal
-title MXD æ¸¸æˆè¾…åŠ©
+title MXD ÓÎÏ·¸¨Öú
 
-rem åˆ‡æ¢åˆ°è„šæœ¬æ‰€åœ¨ç›®å½•ï¼ˆåŒå‡»è¿è¡Œæ—¶å½“å‰ç›®å½•å¯èƒ½ä¸æ˜¯é¡¹ç›®æ ¹ç›®å½•ï¼‰
+rem ==== ¹ÜÀíÔ±È¨ÏÞ×Ô¼ì ====
+rem ÓÎÏ·¿Í»§¶Ë³£ÒÔ¹ÜÀíÔ±Éí·ÝÔËÐÐ£ºÆÕÍ¨È¨ÏÞÆô¶¯µÄ¸¨Öú³ÌÐò£¬°´¼ü»á±» Windows
+rem UIPI »úÖÆ¾²Ä¬À¹½Ø£¨Ä£ÐÍÊ¶±ðÕý³£µ«½ÇÉ«Ò»¶¯²»¶¯£©¡£ÕâÀï×Ô¶¯µ¯ UAC ÌáÈ¨ÖØÆô¡£
+fltmc >nul 2>&1
+if not errorlevel 1 goto :elevated
+
+echo ¼ì²âµ½µ±Ç°²»ÊÇ¹ÜÀíÔ±È¨ÏÞ£¬ÕýÔÚµ¯³ö UAC ÌáÈ¨´°¿Ú£¬ÇëÔÚµ¯´°ÖÐµã"ÊÇ"...
+powershell -NoProfile -Command "Start-Process -FilePath '%~f0' -Verb RunAs"
+if not errorlevel 1 exit /b 0
+
+echo.
+echo [WARN] Î´»ñµÃ¹ÜÀíÔ±È¨ÏÞ£¨UAC ±»È¡Ïû£©£¬½«ÒÔÆÕÍ¨È¨ÏÞ¼ÌÐøÔËÐÐ¡£
+echo        ÈôÓÎÏ·ÒÔ¹ÜÀíÔ±Éí·ÝÔËÐÐ£¬°´¼ü½«ÎÞ·¨ÉúÐ§£¡
+echo.
+pause
+
+:elevated
+rem ÇÐ»»µ½½Å±¾ËùÔÚÄ¿Â¼£¨Ë«»÷ÔËÐÐÊ±µ±Ç°Ä¿Â¼¿ÉÄÜ²»ÊÇÏîÄ¿¸ùÄ¿Â¼£©
 cd /d "%~dp0"
 
 if not exist "%~dp0main.py" (
-    echo [ERROR] æ‰¾ä¸åˆ° main.pyï¼Œè¯·ç¡®è®¤ start.bat ä¸Ž main.py åœ¨åŒä¸€ç›®å½•ã€‚
+    echo [ERROR] ÕÒ²»µ½ main.py£¬ÇëÈ·ÈÏ start.bat Óë main.py ÔÚÍ¬Ò»Ä¿Â¼¡£
     pause
     exit /b 1
 )
 
-rem ä¼˜å…ˆä½¿ç”¨é¡¹ç›®è‡ªå¸¦çš„è™šæ‹ŸçŽ¯å¢ƒï¼Œé¿å…ä¾èµ–ç‰ˆæœ¬ä¸å¯¹ï¼ˆå¦‚ onnxruntime 1.20.1ï¼‰
+rem ÓÅÏÈÊ¹ÓÃÏîÄ¿×Ô´øµÄÐéÄâ»·¾³£¬±ÜÃâÒÀÀµ°æ±¾²»¶Ô£¨Èç onnxruntime 1.20.1£©
 set "PYTHON=%~dp0.venv\Scripts\python.exe"
 if not exist "%PYTHON%" (
-    echo [WARN] æœªæ‰¾åˆ° .venv è™šæ‹ŸçŽ¯å¢ƒï¼Œæ”¹ç”¨ç³»ç»Ÿ Pythonã€‚
+    echo [WARN] Î´ÕÒµ½ .venv ÐéÄâ»·¾³£¬¸ÄÓÃÏµÍ³ Python¡£
     set "PYTHON=python"
 )
 
-echo æ­£åœ¨å¯åŠ¨ MXD æ¸¸æˆè¾…åŠ©...
+echo ÕýÔÚÆô¶¯ MXD ÓÎÏ·¸¨Öú...
 "%PYTHON%" "%~dp0main.py"
 set "EXITCODE=%errorlevel%"
 
-rem æ­£å¸¸å…³é—­çª—å£æ—¶é€€å‡ºç ä¸º 0ï¼Œä¸æ‰“æ‰°ï¼›å¼‚å¸¸é€€å‡ºæ—¶ä¿ç•™çª—å£æ–¹ä¾¿çœ‹é”™è¯¯
+rem Õý³£¹Ø±Õ´°¿ÚÊ±ÍË³öÂëÎª 0£¬²»´òÈÅ£»Òì³£ÍË³öÊ±±£Áô´°¿Ú·½±ã¿´´íÎó
 if not "%EXITCODE%"=="0" (
     echo.
-    echo [ERROR] ç¨‹åºå¼‚å¸¸é€€å‡ºï¼ˆé€€å‡ºç  %EXITCODE%ï¼‰ï¼Œè¯·æŸ¥çœ‹ä¸Šæ–¹é”™è¯¯ä¿¡æ¯ã€‚
+    echo [ERROR] ³ÌÐòÒì³£ÍË³ö£¨ÍË³öÂë %EXITCODE%£©£¬Çë²é¿´ÉÏ·½´íÎóÐÅÏ¢¡£
     pause
 )
 
