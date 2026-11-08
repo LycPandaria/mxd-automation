@@ -88,17 +88,23 @@ class PredictTracker:
 
 
 def board_box(frame) -> Optional[Tuple[int, int]]:
-    """金色画板左上角，没有返回 None（与 tools/lie_recording_eval.py 的 board_box 同一判据）。"""
-    hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
+    """金色画板左上角，没有返回 None（与 tools/lie_recording_eval.py 的 board_box 同一判据）。
+    内部先在半分辨率上找（形状/面积判据都按比例缩，容差足够），坐标 ×2 回乘——单帧 7.5→2.2ms，
+    每步都要跑一次，这是步频预算里的大头之一。"""
+    scale = 2
+    h, w = frame.shape[:2]
+    small = frame if scale == 1 else cv2.resize(frame, (w // scale, h // scale), interpolation=cv2.INTER_AREA)
+    hsv = cv2.cvtColor(small, cv2.COLOR_BGR2HSV)
     gold = np.uint8((hsv[..., 0] >= 10) & (hsv[..., 0] <= 40) & (hsv[..., 1] > 65))
-    gold = cv2.morphologyEx(gold, cv2.MORPH_OPEN, np.ones((9, 9), np.uint8))
+    gold = cv2.morphologyEx(gold, cv2.MORPH_OPEN, np.ones((max(3, 9 // scale),) * 2, np.uint8))
     count, _, stats, _ = cv2.connectedComponentsWithStats(gold)
     if count < 2:
         return None
     x, y, w, h, area = stats[1 + np.argmax(stats[1:, 4])]
-    if abs(w - BOARD_SIZE[0]) > 20 or abs(h - BOARD_SIZE[1]) > 20 or area < .7 * w * h:
+    if (abs(w - BOARD_SIZE[0] // scale) > 20 // scale or abs(h - BOARD_SIZE[1] // scale) > 20 // scale
+            or area < .7 * w * h):
         return None
-    return int(x), int(y)
+    return int(x) * scale, int(y) * scale
 
 
 def white_target(frame: np.ndarray, previous: Optional[np.ndarray] = None):
@@ -475,15 +481,26 @@ WHITE_OVER_S = .5
 MODEL_WAIT_S = .5
 """画板出现后这么久还没认出白色图形，才退回模型。之前白色图形还没淡入，模型的框不可信，鼠标不动。
 量过：9 段自己的录像画板出现后 0~0.13 秒就认出，72 段买来的视频开头 0.2 秒内就认出"""
+SHAPE_SCALE = 1.5
+"""形状匹配（对齐差分、响应、累积、跳变代价、取峰）在 1/1.5 分辨率上算，峰值再局部放大细化。
+实机每步 90~106ms 超出 15Hz 的 66ms 预算，步频掉到 8~9 步/秒，形状匹配按 15 步/秒调的参数接不上，
+20261107 两局测谎因此失败（人工回放标注验收：同一段录像 15Hz 重放 within60 从 55%/56% 回到 98%/97%）。
+降分辨率是砍单步耗时的大头：核的轮廓细节也随分辨率变糊，降太狠反而引入新的诱饵捕获——
+20261107 两段标注录像上扫过 1/1、1/1.25、1/1.5、1/2（within60：98/97 → 98/94 → 98/95 → 97/89，
+单步 45 → 28 → 22 → 13ms），1/1.5 是质量达标的下一档。白图重心、先验记录、抹准星仍是全分辨率。
+验收：15Hz 重放两段标注录像 within60 ≥95%，裸跑单步 ≤25ms（实测 19~24ms）。"""
 
 
-def match_kernel(template, angle: float):
-    """图形转到 angle 度后的匹配核：轮廓线上为正、两边一圈为负，各自加起来是 ±1，平坦的地方响应是 0。"""
+def match_kernel(template, angle: float, scale: int = 1):
+    """图形转到 angle 度后的匹配核：轮廓线上为正、两边一圈为负，各自加起来是 ±1，平坦的地方响应是 0。
+    scale：模板已是 1/scale 分辨率时，形态学参数按比例缩小。"""
     n = template.shape[0]
     turned = cv2.warpAffine(template, cv2.getRotationMatrix2D((n / 2, n / 2), angle, 1.), (n, n), flags=cv2.INTER_LINEAR)
     mask = np.uint8(turned > 127)
-    edge = cv2.morphologyEx(mask, cv2.MORPH_GRADIENT, np.ones((MATCH_EDGE_PX,) * 2, np.uint8)).astype(np.float32)
-    wide = np.ones((MATCH_WIDE_PX,) * 2, np.uint8)
+    edge_px = max(1, round(MATCH_EDGE_PX / scale))
+    wide_px = max(1, round(MATCH_WIDE_PX / scale))
+    edge = cv2.morphologyEx(mask, cv2.MORPH_GRADIENT, np.ones((edge_px,) * 2, np.uint8)).astype(np.float32)
+    wide = np.ones((wide_px,) * 2, np.uint8)
     around = np.clip(cv2.dilate(mask, wide).astype(np.float32) - cv2.erode(mask, wide).astype(np.float32) - edge, 0, 1)
     return edge / max(edge.sum(), 1) - around / max(around.sum(), 1)
 
@@ -497,7 +514,10 @@ class ShapeFinder:
     def __init__(self, fallback: TargetFinder, rng: Optional[random.Random] = None):
         self.fallback = fallback
         self.rng = rng or random.Random()
-        self.spread = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (MATCH_SPREAD_PX,) * 2)
+        spread_small = max(3, round(MATCH_SPREAD_PX / SHAPE_SCALE)) | 1  # 摊开核按分辨率缩，保持奇数
+        self.spread_small = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (spread_small,) * 2)
+        self._tpl_small: Optional[np.ndarray] = None  # 半分辨率的图形模板（记下图形后重建一次）
+        self._ogrid: Optional[Tuple[np.ndarray, np.ndarray]] = None  # 半分辨率坐标网格，画板尺寸变了才重建
         self.reset()
 
     def reset(self):
@@ -509,7 +529,16 @@ class ShapeFinder:
         self.boxes = []
         self.started_at: Optional[float] = None
         self.white_at: Optional[float] = None  # 最后一次看到白色图形的时刻
+        self._tpl_small = None  # 新的一局图形可能变了，重建
         self.source = ""  # 这一步的位置哪来的：wait（还在等白色图形，没有位置）/ white / shape / model
+
+    def _small(self, board, erased):
+        """半分辨率的画板和抹准星掩码（形状匹配专用的差分在这里算；白图/先验/抹准星都用全分辨率原图）。"""
+        h, w = board.shape[:2]
+        dsize = (int(round(w / SHAPE_SCALE)), int(round(h / SHAPE_SCALE)))
+        small = cv2.resize(board, dsize, interpolation=cv2.INTER_AREA)
+        small_erased = None if erased is None else cv2.resize(erased.astype(np.uint8), dsize) > 0
+        return small, small_erased
 
     def step(self, board, aim, t: float):
         """board：裁好的画板图（可能带准星）；aim：准星中心（画板坐标）或 None；t：秒。返回目标位置，还没锁定返回 None。"""
@@ -517,8 +546,9 @@ class ShapeFinder:
         if self.started_at is None:
             self.started_at = t
         board, erased = erase_for_model(board, aim, self.rng, True)
-        image = motion_input(board, [h[0] for h in self.history], [erased] + [h[1] for h in self.history])
-        self.history.appendleft((board, erased))
+        small, erased_small = self._small(board, erased)
+        image = motion_input(small, [h[0] for h in self.history], [erased_small] + [h[1] for h in self.history])
+        self.history.appendleft((small, erased_small))
         white_over = self.white_at is not None and t - self.white_at > WHITE_OVER_S
         seen = None if white_over else white_target(board, self.pos)
         if seen is not None:
@@ -539,17 +569,31 @@ class ShapeFinder:
             self.boxes = self.fallback.boxes
             return found
         self.source = "shape"
+        h, w = image.shape[:2]
+        if self._ogrid is None or self._ogrid[0].shape[0] != h:
+            self._ogrid = np.ogrid[:h, :w]
+        ys, xs = self._ogrid
         diff = cv2.GaussianBlur(np.float32(image[..., 1]) + np.float32(image[..., 2]), (3, 3), 0)
-        kernel = match_kernel(self.shape.template, self.shape.spin * (t - self.shape.taken_at))
+        if self._tpl_small is None:
+            self._tpl_small = cv2.resize(self.shape.template, (0, 0), fx=1. / SHAPE_SCALE, fy=1. / SHAPE_SCALE,
+                                         interpolation=cv2.INTER_AREA)
+        kernel = match_kernel(self._tpl_small, self.shape.spin * (t - self.shape.taken_at), scale=SHAPE_SCALE)
         response = cv2.filter2D(diff, cv2.CV_32F, kernel, borderType=cv2.BORDER_REFLECT)
         response = (response - response.mean()) / (response.std() + 1e-6)
-        self.score = response if self.score is None else cv2.dilate(self.score, self.spread) * MATCH_DECAY + response
+        self.score = response if self.score is None else cv2.dilate(self.score, self.spread_small) * MATCH_DECAY + response
         ranked = self.score
         if self.pos is not None:
-            ys, xs = np.ogrid[:ranked.shape[0], :ranked.shape[1]]
-            ranked = ranked - MATCH_JUMP_COST * np.clip(np.hypot(xs - self.pos[0], ys - self.pos[1]) - MATCH_FREE_PX, 0, None)
+            ranked = ranked - (MATCH_JUMP_COST / SHAPE_SCALE) * np.clip(
+                np.hypot(xs - self.pos[0] / SHAPE_SCALE, ys - self.pos[1] / SHAPE_SCALE) - MATCH_FREE_PX / SHAPE_SCALE, 0, None)
         y, x = np.unravel_index(np.argmax(ranked), ranked.shape)
-        self.pos = np.array([x, y], float)
+        # 半分辨率峰值局部 ×4 放大再取一次：定位精度损失从 2px 降到半像素以内
+        x0, y0 = max(0, x - 2), max(0, y - 2)
+        crop = ranked[y0:y0 + 5, x0:x0 + 5]
+        big = cv2.resize(crop, (crop.shape[1] * 4, crop.shape[0] * 4), interpolation=cv2.INTER_CUBIC)
+        by2, bx2 = np.unravel_index(np.argmax(big), big.shape)
+        fx = (x0 * SHAPE_SCALE + bx2 * SHAPE_SCALE / 4.)
+        fy = (y0 * SHAPE_SCALE + by2 * SHAPE_SCALE / 4.)
+        self.pos = np.array([np.clip(fx, 0, w * SHAPE_SCALE - 1), np.clip(fy, 0, h * SHAPE_SCALE - 1)])
         return self.pos.copy()
 
 
