@@ -5,7 +5,7 @@ reference_height: 800
 fps: 12
 keyboard_mode: sendinput
 confidence: 0.6
-model_path: D:/GAME/mxd-automation/train/scripts/02_train_yolo/model/best.onnx
+model_path: F:/Game/mxd-automation/train/scripts/02_train_yolo/model/best.onnx
 monster_classes: monster
 floor_classes: floor
 rope_classes: rope
@@ -42,18 +42,18 @@ attack_type: long
 attack_range: 350
 attack_range_y: 29
 attack_min_range: 0
-attack_lock_seconds: 0.4
+attack_lock_seconds: 0.5
 knockback_skill:
   name: 击退技能
   key: D
   cooldown: 0.35
-  range: 100
+  range: 150
 ghost_casts: 6
 turn_mode: hold
 aoe_mode: hold
 aoe_hold_seconds: 2.0
 aoe_hold_min_seconds: 0.5
-aoe_hold_cooldown: 3.0
+aoe_hold_cooldown: 0
 stand_mode: false
 stand_facing: right
 stand_default_attack: false
@@ -77,20 +77,20 @@ pickup_key: z
 pickup_interval: 0.333
 screenshot_interval: 1
 pixel_base_height: 768
-range_limit: none
-range_split: 0.49
+range_limit: left
+range_split: 0.8
 minimap_region:
-- 0.007320644216691069
-- 0.04296875
-- 0.10468521229868229
-- 0.15885416666666666
+- 0.0007320644216691069
+- 0.09765625
+- 0.11200585651537336
+- 0.1640625
 minimap_scale: 16
 channel_enabled: true
 channel_idle_min: 2
 channel_hold_key: right
 channel_hold_seconds: 5
 quit_enabled: true
-quit_time: 02:00
+quit_time: 03:00
 exp_enabled: false
 exp_read_seconds: 5
 exp_log_minutes: 10

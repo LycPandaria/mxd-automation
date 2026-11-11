@@ -90,6 +90,12 @@ from .utils.elevation import warn_uipi_mismatch
 BUFF_PRESS_DELAY_SECONDS = 0.4   # 开窗后等这么久再按（让上一次攻击动画收尾）
 BUFF_MULTI_GAP_SECONDS = 0.25    # 多个 buff 依次释放之间的间隔
 BUFF_CAST_TAIL_SECONDS = 0.6     # 按完最后一个 buff 后，留给它施法动画的余量
+BUFF_HOLD_RELEASE_EXTRA_SECONDS = 0.3
+"""AOE 按住连发（aoe_mode="hold"）被 buff 窗口打断时，按键再多等这么久。
+
+按住期间技能键一直按着，游戏在持续出招；request_buff_window() 松键的那一刻
+才刚开始收招，按 BUFF_PRESS_DELAY(0.4s) 就按 buff 仍可能落在攻击动画里被吞。
+比 burst 多等一点，把 hold 模式和 burst 的成功率拉平。"""
 
 LIE_RESULT_WAIT_SECONDS = 5.0
 """画板消失后再录这么久，等 OCR 认出「成功通过」对话框：结果要写进这一局的 meta.json / results.csv。
@@ -245,6 +251,7 @@ class Automation:
         self._buff_queue = []         # 本轮待释放的 buff [{name,key,cd}]
         self._buff_open_time = 0.0    # 本轮窗口打开的时间戳
         self._buff_last_press = 0.0   # 本轮上次按键的时间戳
+        self._buff_press_delay = BUFF_PRESS_DELAY_SECONDS  # 本轮开窗后等多久再按
 
         # ---- 活动范围：小地图黄点（镜头跟着角色走，只有小地图能看出自己在地图哪里）----
         self._minimap = MinimapLocator()
@@ -350,6 +357,7 @@ class Automation:
         self._buff_queue = []
         self._buff_open_time = 0.0
         self._buff_last_press = 0.0
+        self._buff_press_delay = BUFF_PRESS_DELAY_SECONDS
 
         # 测谎锁存复位：若弹窗还挂着就重启，允许再报一次警（然后立刻被再次拦下）
         self._lie_latched = False
@@ -505,10 +513,18 @@ class Automation:
         self.engine.release_keys()
         time.sleep(0.8)  # 等落地、技能动作做完
         self._lie_probe_hit = False
+        # 对齐换频道（_do_channel_switch）：run 前同步配置与 abort 条件
+        self._quitter.config = self.config  # 界面「开始」时会换成新的配置对象
         self._quitter.abort = lambda: not self._running or self._lie_probe_hit
         ok = self._quitter.run()
         if self._quitter.aborted:
-            return  # 点了停止就到此为止；测谎弹出来了就等测谎结束，再回到这里接着退
+            # 点了停止就到此为止；测谎弹出来了就等测谎结束，再回到这里接着退。
+            # _quit_at 特意不清：恢复后下一帧（在 YOLO/决策之前）直接续退。
+            if self._lie_probe_hit:
+                self.on_log("[定时] 检测到测谎弹窗，退出已挂起；测谎结束后接着退")
+            else:
+                self.on_log("[定时] 手动停止打断了退出，这次不退了")
+            return
         self._quit_at = None
         self.on_log("[定时] 已离开游戏，不再操作" if ok
                     else "[定时] 没退出去，打怪已停止，游戏还开着")
@@ -951,6 +967,13 @@ class Automation:
         )
         self.engine.decide(ctx)  # 决策引擎根据上下文执行动作
 
+        # ---- 6.1 角色死亡：直接停机 ----
+        # 死亡后游戏会忽略所有按键，继续跑只会原地按技能/加血（很明显的脚本特征）。
+        # 判定在决策层（HP 连续 0 + 60 秒不动），这里负责停掉主循环。
+        if self.engine.dead:
+            self.stop()
+            return
+
         # ---- 6.5. 自动拾取（定时按拾取键，每秒N次）----
         self._auto_pickup()
 
@@ -1111,16 +1134,23 @@ class Automation:
             self._buff_queue = due
             self._buff_open_time = now
             self._buff_last_press = 0.0
-            window_s = (BUFF_PRESS_DELAY_SECONDS
+            self._buff_press_delay = BUFF_PRESS_DELAY_SECONDS
+            window_s = (self._buff_press_delay
                         + len(due) * BUFF_MULTI_GAP_SECONDS
                         + BUFF_CAST_TAIL_SECONDS)
-            self.engine.request_buff_window(int(round(window_s * fps)))
+            # 若正按着 AOE 技能键，这一步会顺手松键（hold 模式必须，否则游戏
+            # 在施法窗口里继续自动连发，buff 键会被攻击动画吞掉）。
+            released = self.engine.request_buff_window(int(round(window_s * fps)))
+            if released:
+                self._buff_press_delay += BUFF_HOLD_RELEASE_EXTRA_SECONDS
+                window_s += BUFF_HOLD_RELEASE_EXTRA_SECONDS
+                self.engine.request_buff_window(int(round(window_s * fps)))
             names = "、".join(d["name"] for d in due)
             self.on_log(f"[BUFF] {names} 到期 → 暂停攻击 {window_s:.1f}s 腾出施法窗口")
             return
 
         # ---- 2) 队列非空：等攻击动画收尾后逐个按键（此时攻击已被暂停）----
-        if now - self._buff_open_time < BUFF_PRESS_DELAY_SECONDS:
+        if now - self._buff_open_time < self._buff_press_delay:
             return
         if self._buff_last_press and now - self._buff_last_press < BUFF_MULTI_GAP_SECONDS:
             return

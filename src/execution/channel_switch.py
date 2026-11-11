@@ -528,6 +528,10 @@ class GameQuitter(ChannelSwitcher):
             return False
         finally:
             self.aborted = self.abort()
+            if self.aborted:
+                # 对齐换频道的收尾日志：02:00 的退出被测谎/手动停止打断时，
+                # 日志里要能看出"退出流程发生过、被挂起、之后会接着退"
+                self._log("[定时] 中途停下，退出流程挂起（测谎的话，结束后接着退）")
 
     def _try_quit(self, attempt: int) -> bool:
         frame = self._grab()

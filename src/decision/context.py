@@ -27,6 +27,7 @@
 决策流程（优先级从高到低）
 ================================================================================
 
+  0. HP 连续为 0 且自身坐标 60 秒不动 → 判定角色死亡（游戏已忽略按键）→ 停机
   1. HP 低于阈值 → 加血键
   2. MP 低于阈值 → 加蓝键
   3. 检测到怪物:
@@ -314,6 +315,19 @@ STUCK_FRAMES = 60
 
 EXPLORE_DIRECTION_SWITCH_FRAMES = 180
 """探索方向切换帧数：探索状态下持续此帧数没遇到怪就换方向"""
+
+DEATH_STOP_SECONDS = 60.0
+"""HP 连续读 0 且自身坐标几乎不动超过此时间 → 判定角色死亡、停止打怪。
+
+角色死亡后游戏会忽略所有按键，程序却还在不停加血/放技能：既打不到怪，
+也是旁观者眼里最明显的脚本特征（2026-11-09 17:18 那次死亡后原地按了
+10 分钟的加血和技能键）。"""
+
+DEATH_STILL_PX = 60
+"""死亡判定里"自身坐标几乎不动"的容差（px，768 高画面下）。
+
+按"离上次显著移动超过此距离才算动了"判断，而不是逐帧比较：YOLO 玩家框
+本身有 20~40px 抖动，逐帧比会被抖动当成"在动"，永远等不到 60 秒。"""
 
 DISTANCE_LOG_FRAMES = 60
 """距离推算日志输出间隔帧数（避免刷屏）"""
@@ -847,6 +861,10 @@ class DecisionEngine:
         self._mp_react_frames = -1                # 加蓝反应延迟剩余帧数（-1=未触发）
         self._hp_react_ok = 0                     # 血量连续正常帧数（抗单帧读数毛刺）
         self._mp_react_ok = 0                     # 蓝量连续正常帧数（抗单帧读数毛刺）
+        # ---- 角色死亡判定（HP 连续 0 + 长时间不动）----
+        self._dead = False                        # 已判定死亡：主循环据此 stop()
+        self._death_since = 0.0                   # 本轮"HP=0 且不动"的计时起点，0=没在计时
+        self._death_anchor: Optional[Tuple[int, int]] = None  # 起点位置（显著移动才重置计时）
 
         # ---- 像素参数缩放（活动范围等按 768 高画面填的阈值）----
         self._scale = 1.0
@@ -940,6 +958,9 @@ class DecisionEngine:
         self._mp_react_frames = -1
         self._hp_react_ok = 0
         self._mp_react_ok = 0
+        self._dead = False
+        self._death_since = 0.0
+        self._death_anchor = None
         self._last_cast_at = 0.0
         self._scale = 1.0
         self._range_reset()
@@ -972,9 +993,57 @@ class DecisionEngine:
         """
         return self._last_cast_at
 
+    @property
+    def dead(self) -> bool:
+        """是否已判定角色死亡（HP 连续为 0 且长时间不动）。
+
+        一旦置位，引擎不再发任何按键；主循环看到它就 stop()。
+        """
+        return self._dead
+
     # =========================================================================
     # 决策主入口
     # =========================================================================
+
+    def _death_watch(self, ctx: Context) -> bool:
+        """判定角色是否已经死亡：HP 连续读 0 且自身坐标几乎不动超过 DEATH_STOP_SECONDS。
+
+        为什么需要它：角色死亡后游戏会忽略所有按键，而本程序只看画面，
+        会继续"加血/放技能/转向"——打不到怪，还是一眼能看出来的脚本行为
+        （2026-11-09 17:18:19 死亡后，程序在原地按了 10 分钟加血和技能键）。
+
+        判定细节：
+          - 血量读数丢失（None）时不推进、也不打断计时，只跳过本帧；
+          - 血量 >0 立刻清零重新计；
+          - 位置按"离上次显著移动超过 DEATH_STILL_PX"重置计时，避免 YOLO
+            玩家框的 20~40px 抖动被当成"在动"。
+        """
+        if ctx.hp_ratio is None:
+            return False
+        if ctx.hp_ratio > 0.0:
+            self._death_since = 0.0
+            self._death_anchor = None
+            return False
+
+        now = time.time()
+        pos = ctx.self_position
+        if self._death_since == 0.0:
+            self._death_since = now
+            self._death_anchor = pos
+            return False
+        if self._death_anchor is None:
+            # 开始时没定位到，后来定位到了：用当前点重新作基准，不重置计时
+            self._death_anchor = pos
+            return False
+        if pos is not None:
+            dx = abs(pos[0] - self._death_anchor[0])
+            dy = abs(pos[1] - self._death_anchor[1])
+            if dx + dy > self._px(DEATH_STILL_PX):
+                # 位置明显变了：人还活着（血条没读对？）→ 重新计时
+                self._death_anchor = pos
+                self._death_since = now
+                return False
+        return now - self._death_since >= DEATH_STOP_SECONDS
 
     def decide(self, ctx: Context):
         """每帧调用一次，根据画面内容执行动作。
@@ -984,6 +1053,19 @@ class DecisionEngine:
         """
         self._fsm.tick()
         self._update_scale(ctx)
+
+        # ---- 死亡判定：已死就彻底停手，连加血/转向键都不再发 ----
+        if self._dead:
+            self._release_move()
+            return
+        if self._death_watch(ctx):
+            self._dead = True
+            self._release_move()
+            self._log(
+                f"[死亡] 角色死亡（HP=0% 连续 {DEATH_STOP_SECONDS:.0f} 秒"
+                f"且自身坐标几乎不动）→ 停止打怪"
+            )
+            return
 
         # 检测卡住 + 自身定位时效统计
         if ctx.self_position:
@@ -1061,8 +1143,12 @@ class DecisionEngine:
         # ---- buff 施法窗口：暂停攻击/移动，给 buff 让路（加血/加蓝不受影响）----
         # 主循环检测到 buff 到期时，通过 request_buff_window() 打开此窗口，
         # 避免按 buff 键的瞬间角色正在攻击动画中 → 游戏忽略该按键 → buff 加不上。
+        # 窗口里必须松开按住的技能键（aoe_mode="hold"）：只停决策不松键，
+        # 游戏仍在自动连发，buff 键会被攻击动画吞掉。request_buff_window()
+        # 已经松过一次，这里是兜底（例如窗口被其它路径直接置位）。
         if self._buff_hold_frames > 0:
             self._buff_hold_frames -= 1
+            self._skill_hold_release("buff 施法窗口")
             self._release_move()
             return
 
@@ -2096,6 +2182,10 @@ class DecisionEngine:
         也固定错，而决策层 _held_key 为空、完全不知情。实测 12:38:10~12:38:14
         出现过"代码认为站在原地面向右、角色却一直向左走"的漂移。
 
+        【主要成因其实是被击退】2026-11-09 确认：绝大多数"无按键却漂移"
+        是被怪攻击打飞的位移，不是丢键。这里的补发 KEYUP 对击退场景无害
+        （KEYUP 不改变朝向），文案也按此表述，避免误诊成卡键。
+
         两个信号兜底：
           · 快：无按键却连续多帧朝同一方向漂移 → 立刻补发 KEYUP
           · 慢：站定期间每隔 STUCK_KEY_IDLE_SECONDS 补发一次（兜住"卡住但没漂移"）
@@ -2127,7 +2217,7 @@ class DecisionEngine:
                     self._stand_drift_frames = 1
                 if self._stand_drift_frames >= STUCK_KEY_DRIFT_FRAMES:
                     self._force_release_directions(
-                        "无按键却持续漂移（移动键疑似卡住）")
+                        "无按键却持续漂移（疑似被击退，顺带兜底卡键）")
                     return
             else:
                 self._stand_drift_frames = 0
@@ -2925,14 +3015,26 @@ class DecisionEngine:
             return m.center[0] > sx
         return m.center[0] < sx
 
-    def request_buff_window(self, frames: int):
+    def request_buff_window(self, frames: int) -> bool:
         """请求 buff 施法窗口：接下来 frames 帧内决策层不放技能、不移动。
 
         主循环在 buff 到期时调用，让角色先停手，等攻击动画收尾后再按 buff，
         避免攻击动画吞掉 buff 按键导致"buff 加不上"。
         可重复调用，取较大值（多 buff 连放时用来续窗）。加血/加蓝不受影响。
+
+        AOE 按住连发（aoe_mode="hold"）期间技能键一直是按下状态。这里必须
+        立刻松键：否则整个施法窗口游戏都在自动连发，buff 键照样被攻击动画
+        吞掉（2026-11-09 反馈：hold 模式比 burst 更容易漏 buff）。
+
+        Returns:
+            True 表示这次请求顺手松开了按住的技能键。调用方应按 buff 时要
+            多等一会儿——游戏还在收这次攻击动作。
         """
         self._buff_hold_frames = max(self._buff_hold_frames, int(frames))
+        held = self._skill_hold_key is not None
+        if held:
+            self._skill_hold_release("buff 施法窗口")
+        return held
 
     def _melee_edge_x(self, sx: int, target: Detection) -> int:
         """短手贴脸判定用的"怪近侧身体边缘 x"。
@@ -3490,7 +3592,10 @@ class DecisionEngine:
             self._cast_skill(force_index=0)
 
     def _tab_attack(self, ctx: Context, target: Detection = None):
-        """Tab 选怪 + 原地攻击（兜底方案，不移动）。
+        """Tab 选怪 + 原地攻击（兜底方案，不移动）。【当前无调用点，勿直接启用】
+
+        历史遗留：没有朝向纠正（不像 _attack 先走 _face_step 再出手），
+        启用即"朝向与目标方向不一致空放"。要用它必须先补 _face_step 门。
 
         与 _attack 相同的距离守卫：能拿到自身位置和目标时，
         水平差/垂直差超限就停止攻击，防止怪物不在附近空打。
@@ -4159,7 +4264,13 @@ class DecisionEngine:
         return getattr(self.config, "aoe_mode", "burst") == "hold"
 
     def _skill_hold_release(self, why: str, confirmed: bool = False):
-        """结束按住技能键：松键 + 关间隔门。没在按住时什么都不做。"""
+        """结束按住技能键：松键 + 关间隔门。没在按住时什么都不做。
+
+        松键【不】开动画锁（2026-11-10）：松手后下一帧要立刻允许转向/击退
+        补位——按住期间转向和击退都被 hold 挡住，松键后的窗口是它们唯一的
+        出手时机，0.4s 锁会把这窗口整个吃掉。按住的收尾动作由发起时那次
+        _mark_attack_pressed 的锁兜底（按住 ≥ min_s 时早已过期，无实际影响）。
+        """
         key = self._skill_hold_key
         if key is None:
             return
@@ -4171,21 +4282,24 @@ class DecisionEngine:
             self._log(f"[AOE] 按住 {key} {elapsed:.1f}s 连发结束（{why}）")
         else:
             self._log(f"[AOE] 按住 {key} {elapsed:.1f}s 提前松键（{why}）")
-        # 松手后开动画锁：松开瞬间游戏还有一次出手/收尾动作
-        self._mark_attack_pressed()
         # 间隔门：key_down/key_up 绕过了 press_key 的冷却记账，这里是唯一节奏控制
+        # （aoe_hold_cooldown=0 → 松键当帧即可重新按住，配合满时长松键≈连续按住）
         gate = float(getattr(self.config, "aoe_hold_cooldown", AOE_HOLD_COOLDOWN) or 0)
         self._skill_hold_next_at = time.time() + max(0.0, gate - elapsed)
 
     def _skill_hold_step(self, ctx: Context) -> bool:
         """按住连发的逐帧推进。返回 True 表示本帧仍在按住（调用方不再放别的技能）。
 
-        提前松键条件（保命优先 / 不空放）：
-          · 近身威胁出现（面朝侧、击退距离内）→ 下一帧走击退
-          · 攻击方向怪数掉到 0 且超过最短按住时长 → 不对空气继续连发
+        提前松键条件（2026-11-10 收窄）：
           · buff 施法窗口被请求 → 让路（buff 键和技能键同按会被吞）
-          · 目标换到背后（need != _face_dir）→ 按住方向错了就是空放
+          · 攻击方向怪数掉到 0 且超过最短按住时长 → 不对空气继续连发
           · 按住满 aoe_hold_seconds → 正常结束
+
+        【近身威胁 / 目标换边不再松键】用户决定：按住期间继续输出，不为
+        击退让位、不为换边停手。代价与兜底：
+          · 近身怪压脸时按住不放（击退等松键后的窗口再发）；
+          · 目标换边后按住方向暂时不对（朝旧方向空放到满时长），松键后
+            _face_step 会立刻纠正朝向，间隔门 0 时下一拍就转向新方向。
         """
         key = self._skill_hold_key
         if key is None:
@@ -4199,20 +4313,6 @@ class DecisionEngine:
         if self._buff_hold_frames > 0:
             self._skill_hold_release("buff 施法窗口让路")
             return False
-
-        # 近身威胁：立即松键，下一帧走正常击退逻辑
-        foot = self._effective_self_pos(ctx)
-        if foot is not None and self._nearest_knockback_threat(ctx, foot) is not None:
-            self._skill_hold_release("近身威胁，让位击退")
-            return False
-
-        # 目标换边：按住方向已经不对，继续按就是朝旧方向空放
-        if foot is not None:
-            need = self._face_needed(foot[0], self._target_monster) \
-                if self._target_monster is not None else None
-            if need is not None and self._face_dir is not None and need != self._face_dir:
-                self._skill_hold_release("目标换边")
-                return False
 
         # 攻击方向没怪了：超过最短按住时长就不对空气继续连发
         if elapsed >= min_s and self._count_attack_dir_monsters(ctx, self._target_monster) == 0:

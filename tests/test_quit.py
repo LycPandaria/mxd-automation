@@ -261,6 +261,23 @@ class QuitTests(unittest.TestCase):
         self.assertTrue(q.aborted)
         self.assertEqual((g.keys, g.clicks), ([], []))
 
+    def test_abort_leaves_a_log_line(self):
+        """中途停下要在日志里留痕（对齐换频道：事后能看出退出被挂起、会接着退）。"""
+        g = QuitGame(self.clock)
+        q = self.quitter(g)
+        q.abort = lambda: True
+        q.run()
+        self.assertTrue(any("中途停下" in m and "挂起" in m for m in self.logs))
+
+    def test_run_resets_aborted_flag(self):
+        """上一次 abort 留下的标志，下一次 run 开头要清掉（_do_quit 依赖它判断本次）。"""
+        g = QuitGame(self.clock)
+        q = self.quitter(g)
+        q.aborted = True
+        q.abort = lambda: False
+        self.assertTrue(q.run())
+        self.assertFalse(q.aborted)
+
 
 if __name__ == "__main__":
     unittest.main()

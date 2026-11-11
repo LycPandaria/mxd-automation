@@ -47,6 +47,10 @@ class AoeHoldTestCase(unittest.TestCase):
             "attack_type": "long", "attack_range": 400, "attack_range_y": 60,
             "attack_min_range": 0, "stand_mode": False, "pixel_base_height": 768,
             "turn_mode": "tap", "aoe_mode": "hold", "fps": 20,
+            # AOE/动画锁参数显式钉死：Config 会合并本机 user.yaml，
+            # 不钉的话本机改配置（如 aoe_hold_cooldown: 0）会泄漏进测试
+            "aoe_hold_seconds": 2.0, "aoe_hold_min_seconds": 0.5,
+            "aoe_hold_cooldown": 3.0, "attack_lock_seconds": 0.6,
             "knockback_skill": {"name": "击退", "key": "", "cooldown": 0.3, "range": 240},
             "skills": [{"name": "连击", "key": "a", "cooldown": 0.5},
                        {"name": "爆炸箭", "key": "space", "cooldown": 0.5}],
@@ -114,7 +118,7 @@ class TriggerTests(AoeHoldTestCase):
 
 class ReleaseTests(AoeHoldTestCase):
     def test_full_duration_release(self):
-        """按住满 2s → key_up、开动画锁、关间隔门。"""
+        """按住满 2s → key_up、关间隔门（松键不再开动画锁）。"""
         e = self.engine()
         m1, m2 = monster(1300), monster(1450)
         e._target_monster = m1
@@ -127,8 +131,8 @@ class ReleaseTests(AoeHoldTestCase):
         # 间隔门：刚松手，下一帧不会立刻重新按住
         self.assertGreater(e._skill_hold_next_at, self.clock.t)
 
-    def test_release_on_knockback_threat(self):
-        """按住中出现近身怪 → 提前松键（下一帧走击退）。"""
+    def test_hold_continues_on_knockback_threat(self):
+        """按住中出现近身怪 → 不松键（2026-11-10：威胁不再打断按住）。"""
         e = self.engine(knockback_skill={"name": "击退", "key": "D", "cooldown": 0.3, "range": 240})
         far, far2 = monster(1350), monster(1450)   # 都在击退距离外，先正常发起按住
         e._target_monster = far
@@ -137,8 +141,25 @@ class ReleaseTests(AoeHoldTestCase):
         near = monster(1150)  # 按住中途出现：击退距离 240 内
         self.clock.t += 0.3
         e._attack(self.ctx(far, far2, near), far)
-        self.assertIsNone(e._skill_hold_key)
-        self.assertTrue(self.logged("近身威胁"))
+        self.assertEqual(e._skill_hold_key, "space")
+        self.assertFalse(self.logged("近身威胁"))
+
+    def test_hold_continues_on_target_flip(self):
+        """目标换到背后 → 不松键（2026-11-10：换边不再打断按住）。
+
+        代价是按住方向暂时不对；松键后由 _face_step 纠正朝向。
+        """
+        e = self.engine()
+        m1, m2 = monster(1300), monster(1450)
+        e._target_monster = m1
+        e._attack(self.ctx(m1, m2), m1)
+        self.assertEqual(e._skill_hold_key, "space")
+        behind = monster(800)
+        e._target_monster = behind
+        self.clock.t += 0.3
+        e._attack(self.ctx(behind), behind)        # need=left != face_dir=right
+        self.assertEqual(e._skill_hold_key, "space")
+        self.assertFalse(self.logged("目标换边"))
 
     def test_release_when_monsters_cleared(self):
         """攻击方向怪清空且超过最短按住时长 → 提前松键。"""
@@ -161,32 +182,71 @@ class ReleaseTests(AoeHoldTestCase):
         e._attack(self.ctx(), m1)                  # 怪没了但按住才 0.2s
         self.assertEqual(e._skill_hold_key, "space")
 
-    def test_release_on_target_flip(self):
-        """目标换到背后 → 松键（按住方向错了就是空放）。"""
+    def test_release_does_not_open_attack_lock(self):
+        """松键不开动画锁（2026-11-10）：发起时那次锁已过期，松键后 busy 保持 False。"""
         e = self.engine()
         m1, m2 = monster(1300), monster(1450)
         e._target_monster = m1
         e._attack(self.ctx(m1, m2), m1)
-        self.assertEqual(e._skill_hold_key, "space")
-        behind = monster(800)
-        e._target_monster = behind
-        self.clock.t += 0.3
-        e._attack(self.ctx(behind), behind)        # need=left != face_dir=right
+        self.clock.t += 0.8                        # 发起锁(0.6s)过期、超过 min 0.5
+        e._skill_hold_release("测试松键")           # 直接松键，不混入后续施法的开锁
         self.assertIsNone(e._skill_hold_key)
-        self.assertTrue(self.logged("目标换边"))
+        self.assertFalse(e.executor.held)
+        self.assertFalse(e._attack_busy(), "松键不应开动画锁")
+
+    def test_turn_can_start_in_release_frame(self):
+        """松键当帧即可发起转向（旧逻辑被松键动画锁挡住，要等 0.6s）。"""
+        e = self.engine(turn_mode="hold")          # 与本机生产配置一致
+        m1, m2 = monster(1300), monster(1450)
+        e._target_monster = m1
+        e._attack(self.ctx(m1, m2), m1)            # 面朝 right 按住
+        behind = monster(800)                      # 按住期间目标换到背后
+        e._target_monster = behind
+        e._face_need_side = "left"
+        e._face_need_frames = 99                   # 新侧已稳定，免换边防抖
+        self.clock.t += AOE_HOLD_SECONDS + 0.05
+        e._attack(self.ctx(behind), behind)        # 松手 → 同帧走到转向分支
+        self.assertIsNone(e._skill_hold_key)
+        self.assertEqual(e._held_key, "left")      # 转向按住已发起
+        self.assertTrue(self.logged("怪物在左"))
+
+
+    def test_zero_gate_reholds_immediately(self):
+        """aoe_hold_cooldown=0：满时长松键当帧即可重新按住（≈连续按住）。"""
+        e = self.engine(aoe_hold_cooldown=0)
+        m1, m2 = monster(1300), monster(1450)
+        e._target_monster = m1
+        e._attack(self.ctx(m1, m2), m1)
+        self.clock.t += AOE_HOLD_SECONDS + 0.05
+        e._attack(self.ctx(m1, m2), m1)            # 松手 + 同帧重按
+        self.assertEqual(e._skill_hold_key, "space")
+        self.assertIn("space", e.executor.held)
+        self.assertTrue(self.logged("连发结束"))
 
     def test_release_for_buff_window(self):
-        """buff 施法窗口被请求 → 松键让路。"""
+        """buff 施法窗口被请求 → 立刻松键让路（不能等下一帧的攻击流程）。
+
+        按住状态下技能键一直是 down，施法窗口里不松键游戏会继续自动连发，
+        buff 键会被攻击动画吞掉。
+        """
         e = self.engine()
         m1, m2 = monster(1300), monster(1450)
         e._target_monster = m1
         e._attack(self.ctx(m1, m2), m1)
         self.assertEqual(e._skill_hold_key, "space")
         self.buff_window(e)
-        self.clock.t += 0.3
+        self.assertIsNone(e._skill_hold_key)      # 请求当下就松开
+        self.assertFalse(e.executor.held)
+        self.assertTrue(self.logged("buff 施法窗口"))
+
+    def test_buff_window_reports_hold_release(self):
+        """request_buff_window 返回 True = 这次顺手松开了按住的技能键。"""
+        e = self.engine()
+        m1, m2 = monster(1300), monster(1450)
+        e._target_monster = m1
         e._attack(self.ctx(m1, m2), m1)
-        self.assertIsNone(e._skill_hold_key)
-        self.assertTrue(self.logged("buff 施法窗口让路"))
+        self.assertTrue(e.request_buff_window(10))
+        self.assertFalse(e.request_buff_window(10))   # 已经松开，再请求返回 False
 
 
 class GateTests(AoeHoldTestCase):
@@ -200,7 +260,7 @@ class GateTests(AoeHoldTestCase):
         e._attack(self.ctx(m1, m2), m1)            # 满时长松手
         self.assertIsNone(e._skill_hold_key)
         e.executor.clear()
-        self.clock.t += 0.7                        # 动画锁(0.6s)已过、间隔门(3s)内
+        self.clock.t += 0.7                        # 间隔门(3s)内
         e._attack(self.ctx(m1, m2), m1)
         self.assertIsNone(e._skill_hold_key)
         self.assertIn("a", e.executor.keys())      # 普通轮转（技能1点按）
