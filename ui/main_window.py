@@ -126,9 +126,9 @@ class MainWindow(QMainWindow):
         self.stand_facing_combo.currentIndexChanged.connect(self._on_stand_facing_changed)
         self.stand_default_attack_checkbox.toggled.connect(self._on_stand_default_attack_changed)
         self.stand_skill2_checkbox.toggled.connect(self._on_stand_skill2_changed)
-        # 活动范围：改动即写入配置并落盘（运行中框小地图、改分界线立即生效）
-        self.range_combo.currentIndexChanged.connect(self._on_range_changed)
-        self.range_split_spin.valueChanged.connect(self._on_range_changed)
+        # 活动范围：改动即写入配置并落盘（运行中框小地图、改区间立即生效）
+        self.range_start_spin.valueChanged.connect(self._on_range_changed)
+        self.range_end_spin.valueChanged.connect(self._on_range_changed)
 
         self.log_signal.connect(self._on_log)
         self.frame_signal.connect(self._on_frame)
@@ -544,27 +544,31 @@ class MainWindow(QMainWindow):
         micro_row.addStretch()
         v.addLayout(micro_row)
 
-        # 活动范围：只在地图左半边/右半边打怪（同一层有别的玩家时各占一半）
+        # 活动范围：只在地图 start%~end% 区间打怪（同一层有别的玩家时各占一段）
         range_row = QHBoxLayout()
         range_row.addWidget(QLabel("活动范围:"))
-        self.range_combo = QComboBox()
-        self.range_combo.addItem("不限制", "none")
-        self.range_combo.addItem("只在左半边", "left")
-        self.range_combo.addItem("只在右半边", "right")
-        self.range_combo.setToolTip(
-            "同一层有别的玩家时各占一半：分界线另一边的怪不选不追，探索和后撤不过线，\n"
-            "被打退过线会走回来。\n"
+        range_tip = (
+            "地图从左到右算 0%~100%。例如「从 10% 到 80%」= 只在地图 10%~80% 之间活动；\n"
+            "0% 到 100% = 不限制。范围外的怪不选不追，探索和后撤不出去，\n"
+            "被打退出去会自动走回来。\n"
             "要先点「框选小地图」，框住小地图的地图部分（不含标题/地图名）。"
         )
-        self.range_combo.setFixedWidth(110)
-        range_row.addWidget(self.range_combo)
-        range_row.addWidget(QLabel("分界:"))
-        self.range_split_spin = QSpinBox()
-        self.range_split_spin.setRange(5, 95)
-        self.range_split_spin.setSuffix("%")
-        self.range_split_spin.setToolTip("分界线在小地图从左往右的什么位置，50% = 正中间")
-        self.range_split_spin.setFixedWidth(70)
-        range_row.addWidget(self.range_split_spin)
+        range_row.addWidget(QLabel("从"))
+        self.range_start_spin = QSpinBox()
+        self.range_start_spin.setRange(0, 100)
+        self.range_start_spin.setSuffix("%")
+        self.range_start_spin.setValue(0)
+        self.range_start_spin.setToolTip(range_tip)
+        self.range_start_spin.setFixedWidth(70)
+        range_row.addWidget(self.range_start_spin)
+        range_row.addWidget(QLabel("到"))
+        self.range_end_spin = QSpinBox()
+        self.range_end_spin.setRange(0, 100)
+        self.range_end_spin.setSuffix("%")
+        self.range_end_spin.setValue(100)
+        self.range_end_spin.setToolTip(range_tip)
+        self.range_end_spin.setFixedWidth(70)
+        range_row.addWidget(self.range_end_spin)
         self.minimap_pick_btn = QPushButton("框选小地图")
         self.minimap_pick_btn.setToolTip(
             "在预览画面上框住小地图的地图部分（不含上面的标题和地图名）。\n"
@@ -789,17 +793,19 @@ class MainWindow(QMainWindow):
         )
         self._sync_distance_ui()
         # 活动范围
-        # 载入期间屏蔽信号：否则 setCurrentIndex 会先触发 _on_range_changed，
-        # 用旧的分界值覆盖 config.range_split，下面读到的就不是 YAML 里的值了
-        self.range_combo.blockSignals(True)
-        self.range_split_spin.blockSignals(True)
-        idx = self.range_combo.findData(getattr(c, "range_limit", "none"))
-        self.range_combo.setCurrentIndex(idx if idx >= 0 else 0)
-        self.range_split_spin.setValue(
-            int(round(float(getattr(c, "range_split", 0.5)) * 100))
+        # 载入期间屏蔽信号：否则 setValue 会先触发 _on_range_changed，
+        # 用旧的起点/终点覆盖 config，下面读到的就不是 YAML 里的值了
+        self.range_start_spin.blockSignals(True)
+        self.range_end_spin.blockSignals(True)
+        self.range_start_spin.setValue(
+            int(round(float(getattr(c, "range_start", 0.0) or 0.0)))
         )
-        self.range_combo.blockSignals(False)
-        self.range_split_spin.blockSignals(False)
+        _end = getattr(c, "range_end", 100.0)
+        self.range_end_spin.setValue(
+            int(round(float(100.0 if _end is None else _end)))
+        )
+        self.range_start_spin.blockSignals(False)
+        self.range_end_spin.blockSignals(False)
         self.minimap_region_label.setText(
             "已框选" if getattr(c, "minimap_region", None) else "未框选"
         )
@@ -874,8 +880,8 @@ class MainWindow(QMainWindow):
         c.stand_micro_move_interval = float(self.micro_interval_spin.value())
         c.stand_micro_move_tap_ms = self.micro_tap_spin.value()
         # 活动范围
-        c.range_limit = self.range_combo.currentData()
-        c.range_split = self.range_split_spin.value() / 100.0
+        c.range_start = float(self.range_start_spin.value())
+        c.range_end = float(self.range_end_spin.value())
         # 换频道 / 定时结束 / 经验
         c.channel_enabled = self.channel_checkbox.isChecked()
         c.channel_idle_min = self.channel_idle_spin.value()
@@ -990,9 +996,23 @@ class MainWindow(QMainWindow):
         save_user_config(self.config)
 
     def _on_range_changed(self, *_):
-        """活动范围/分界线变化时，实时同步到 config 并保存到 YAML。"""
-        self.config.range_limit = self.range_combo.currentData()
-        self.config.range_split = self.range_split_spin.value() / 100.0
+        """活动范围（起点/终点百分比）变化时，实时同步到 config 并保存到 YAML。"""
+        start = self.range_start_spin.value()
+        end = self.range_end_spin.value()
+        if start > end:
+            # 两个输入框不能交叉：谁被改过头就把另一个推到同值
+            if self.sender() is self.range_start_spin:
+                end = start
+                self.range_end_spin.blockSignals(True)
+                self.range_end_spin.setValue(end)
+                self.range_end_spin.blockSignals(False)
+            else:
+                start = end
+                self.range_start_spin.blockSignals(True)
+                self.range_start_spin.setValue(start)
+                self.range_start_spin.blockSignals(False)
+        self.config.range_start = float(start)
+        self.config.range_end = float(end)
         save_user_config(self.config)
 
     def _on_attack_type_changed(self, index):
@@ -1518,15 +1538,20 @@ class MainWindow(QMainWindow):
         if mp_region:
             rx, ry, rw, rh = mp_region
             cv2.rectangle(disp, (rx, ry), (rx + rw, ry + rh), (255, 128, 0), 1)
-        # 画小地图区域、分界线、认出的黄点（框选过小地图就画，方便调分界线）
+        # 画小地图区域、活动范围两条边界、认出的黄点（框选过小地图就画，方便调区间）
         minimap = self.config.scale_region(
             getattr(self.config, "minimap_region", None), frame.shape[1], frame.shape[0]
         )
         if minimap:
             rx, ry, rw, rh = minimap
             cv2.rectangle(disp, (rx, ry), (rx + rw, ry + rh), (255, 255, 0), 1)
-            lx = rx + int(rw * float(getattr(self.config, "range_split", 0.5)))
-            cv2.line(disp, (lx, ry), (lx, ry + rh), (255, 255, 0), 1)
+            start = float(getattr(self.config, "range_start", 0.0) or 0.0) / 100.0
+            end = getattr(self.config, "range_end", 100.0)
+            end = 1.0 if end is None else float(end) / 100.0
+            if start > 0.0 or end < 1.0:
+                for frac in (start, end):
+                    lx = rx + int(rw * max(0.0, min(1.0, frac)))
+                    cv2.line(disp, (lx, ry), (lx, ry + rh), (255, 255, 0), 1)
             dot = getattr(self.automation, "_minimap_dot", None)
             if dot:
                 cv2.circle(disp, dot, 8, (0, 255, 0), 1)

@@ -47,6 +47,8 @@ class DeathTestCase(unittest.TestCase):
             "stand_mode": False, "pixel_base_height": 768,
             "skills": [{"name": "攻击", "key": "a", "cooldown": 0.5}],
             "hp_threshold": 0, "mp_threshold": 0,
+            # 活动范围钉死为不限制：避免本机 user.yaml 的区间泄漏进用例
+            "range_start": 0.0, "range_end": 100.0,
             **overrides,
         })
         e = DecisionEngine(cfg, FakeExecutor(), on_log=self.logs.append)

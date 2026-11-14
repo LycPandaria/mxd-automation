@@ -431,7 +431,7 @@ class Automation:
     def _locate_on_minimap(self, frame):
         """开了活动范围时在框选的小地图区域里找自己，返回 (黄点 x, 区域宽)；没开/没框选/没找到时 x 为 None。"""
         self._minimap_dot = None
-        if getattr(self.config, "range_limit", "none") not in ("left", "right"):
+        if not self.engine.range_enabled():
             return None, None
         region = self.config.scale_region(
             getattr(self.config, "minimap_region", None), frame.shape[1], frame.shape[0]
@@ -948,7 +948,7 @@ class Automation:
                 self.on_log(f"[状态] HP={hp_str} MP={mp_str} 自身未定位{lie_str}")
 
         # ---- 6. 决策与执行 ----
-        # 活动范围：小地图上找自己的黄点（只有开了 range_limit 才跑，开销很小）
+        # 活动范围：小地图上找自己的黄点（只有设了范围才跑，开销很小）
         minimap_x, minimap_width = self._locate_on_minimap(frame)
         # Context 是感知层 → 决策层的数据载体
         ctx = Context(

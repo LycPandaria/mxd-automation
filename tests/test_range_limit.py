@@ -1,4 +1,4 @@
-"""活动范围：只在地图左半边/右半边活动（移植自分享包 tests/test_range_limit.py）。
+"""活动范围：只在地图 start%~end% 区间内活动（0~100 = 不限制）。
 
 镜头跟着角色走（角色在画面里的 x 不变，地图在动），所以用一个假世界：
 小地图黄点 = 世界 x / 比例。只测范围本身的过滤 / 走回 / 未知位置处理，
@@ -9,7 +9,7 @@ import unittest
 from src.decision import context as ctxmod
 from src.decision.context import Context, DecisionEngine, State
 from src.perception.yolo_detector import Detection
-from src.utils.config_loader import Config, _defaults
+from src.utils.config_loader import Config, _defaults, _migrate_legacy
 
 from .fake_executor import FakeExecutor
 
@@ -19,7 +19,12 @@ SCREEN_X = FRAME_W // 2       # 镜头跟着走：角色一直在画面中间
 SCALE = 16                    # 小地图 1px = 画面 16px
 MAP_W = 3200                  # 地图宽（画面 px）→ 小地图宽 200px
 MINIMAP_W = MAP_W // SCALE
-LINE = MAP_W // 2             # 分界线（世界 x）
+LINE = MAP_W // 2             # 地图中点（世界 x）
+
+
+def pct(p):
+    """地图百分比 → 世界 x。"""
+    return MAP_W * p / 100.0
 
 
 class FakeClock:
@@ -72,7 +77,8 @@ class RangeTestCase(unittest.TestCase):
             "stand_mode": False, "pixel_base_height": 768,
             "skills": [{"name": "攻击", "key": "a", "cooldown": 0.6}],
             "hp_threshold": 0, "mp_threshold": 0,
-            "range_limit": "left", "range_split": 0.5,
+            # 默认 0~50 = 老的"只在地图左半边"，方便逐条对比旧行为
+            "range_start": 0.0, "range_end": 50.0,
             "minimap_region": [0.0, 0.05, 0.1, 0.1], "minimap_scale": SCALE,
             **overrides,
         })
@@ -85,67 +91,88 @@ class RangeTestCase(unittest.TestCase):
 
 
 class FilterTests(RangeTestCase):
-    def test_default_is_no_limit_and_keeps_every_monster(self):
+    def test_full_range_keeps_every_monster(self):
         w = World(LINE - 100, [LINE + 100])
-        e = self.engine(range_limit="none")
+        e = self.engine(range_start=0, range_end=100)
         c = w.ctx()
         self.assertFalse(e._range_step(c))
         self.assertEqual(len(c.monsters), 1)
-        self.assertIsNone(e._range_line_x)
+        self.assertIsNone(e._range_start_x)
+        self.assertIsNone(e._range_end_x)
         self.assertEqual(self.logs, [])
+        self.assertFalse(e.range_enabled())
 
     def test_config_defaults_to_no_limit(self):
-        self.assertEqual(_defaults()["range_limit"], "none")
-        self.assertEqual(_defaults()["range_split"], 0.5)
+        self.assertEqual(_defaults()["range_start"], 0.0)
+        self.assertEqual(_defaults()["range_end"], 100.0)
 
-    def test_left_limit_drops_monsters_past_the_line(self):
+    def test_left_half_drops_monsters_past_the_mid(self):
         w = World(LINE - 300, [LINE - 100, LINE + 200])
-        e = self.engine()
+        e = self.engine()                       # 0~50
         c = w.ctx()
         e._range_step(c)
         self.assertEqual([m.center[0] for m in c.monsters], [SCREEN_X + 200])
-        self.assertEqual(e._range_line_x, SCREEN_X + 300)
+        self.assertAlmostEqual(e._range_end_x, SCREEN_X + 300, delta=1)
 
-    def test_right_limit_is_the_mirror(self):
+    def test_right_half_is_the_mirror(self):
         w = World(LINE + 300, [LINE + 100, LINE - 200])
-        e = self.engine(range_limit="right")
+        e = self.engine(range_start=50, range_end=100)
         c = w.ctx()
         e._range_step(c)
         self.assertEqual([m.center[0] for m in c.monsters], [SCREEN_X - 200])
-        self.assertEqual(e._range_line_x, SCREEN_X - 300)
+        self.assertAlmostEqual(e._range_start_x, SCREEN_X - 300, delta=1)
 
-    def test_split_moves_the_line(self):
-        w = World(MAP_W // 4)
-        e = self.engine(range_split=0.25)
+    def test_middle_band_drops_both_sides(self):
+        w = World(pct(50), [pct(5), pct(30), pct(70), pct(95)])
+        e = self.engine(range_start=10, range_end=90)
         c = w.ctx()
         e._range_step(c)
-        self.assertEqual(e._range_line_x, SCREEN_X)
+        self.assertEqual([m.center[0] for m in c.monsters],
+                         [SCREEN_X + (pct(30) - pct(50)),
+                          SCREEN_X + (pct(70) - pct(50))])
 
-    def test_monster_on_the_line_still_counts(self):
+    def test_percentages_move_the_boundaries(self):
+        w = World(pct(25), [pct(25)])
+        e = self.engine(range_start=25, range_end=100)
+        e._range_step(w.ctx())
+        self.assertAlmostEqual(e._range_start_x, SCREEN_X, delta=1)
+        e = self.engine(range_start=0, range_end=25)
+        e._range_step(w.ctx())
+        self.assertAlmostEqual(e._range_end_x, SCREEN_X, delta=1)
+
+    def test_monster_near_the_boundary_still_counts(self):
         w = World(LINE - 300, [LINE + 10])
         e = self.engine()
         c = w.ctx()
         e._range_step(c)
         self.assertEqual(len(c.monsters), 1)
 
-    def test_locked_monster_walking_past_the_line_is_released_at_once(self):
+    def test_locked_monster_walking_out_is_released_at_once(self):
         w = World(LINE - 300, [LINE - 5])
         e = self.engine()
         c = w.ctx()
         e._range_step(c)
         e._target_monster = c.monsters[0]
-        w.monsters = [LINE + 40]  # 走到线外（还认得出是同一只）
+        w.monsters = [LINE + 40]  # 走到范围外（还认得出是同一只）
         e._range_step(w.ctx())
         self.assertIsNone(e._target_monster)
-        self.assertTrue(self.logged("锁定的怪走到分界线外"))
+        self.assertTrue(self.logged("锁定的怪走到范围外"))
+
+    def test_reversed_config_is_ordered_not_ignored(self):
+        w = World(pct(50), [pct(5), pct(95)])
+        e = self.engine(range_start=90, range_end=10)  # 配反了
+        c = w.ctx()
+        e._range_step(c)
+        self.assertEqual([m.center[0] for m in c.monsters], [])
+        self.assertTrue(e.range_enabled())
 
 
 class WalkBackTests(RangeTestCase):
-    def test_knocked_past_the_line_walks_back_then_keeps_fighting(self):
+    def test_knocked_past_the_end_walks_back_then_keeps_fighting(self):
         w = World(LINE + 300, [LINE - 100])
         e = self.engine()
         ex = e.executor
-        # 前两帧只是确认过线（松键不打），第三帧开始往左走
+        # 前两帧只是确认出界（松键不打），第三帧开始往左走
         for _ in range(3):
             self.clock.t += 0.08
             self.assertTrue(e._range_step(w.ctx()))
@@ -157,15 +184,29 @@ class WalkBackTests(RangeTestCase):
         self.assertFalse(ex.held)
         self.assertTrue(self.logged("回到范围内，继续打怪"))
 
+    def test_knocked_past_the_start_walks_back_right(self):
+        w = World(pct(5), [pct(30)])
+        e = self.engine(range_start=10, range_end=90)
+        ex = e.executor
+        for _ in range(3):
+            self.clock.t += 0.08
+            self.assertTrue(e._range_step(w.ctx()))
+        self.assertIn("right", ex.held)
+        w.x = pct(20)
+        self.clock.t += 0.08
+        self.assertFalse(e._range_step(w.ctx()))
+        self.assertFalse(ex.held)
+        self.assertTrue(self.logged("回到范围内，继续打怪"))
+
     def test_small_overshoot_does_not_trigger_a_walk_back(self):
-        w = World(LINE + 30, [LINE - 100])  # 过线 30px < RANGE_RETURN_START(60)
+        w = World(LINE + 30, [LINE - 100])  # 出界 30px < RANGE_RETURN_START(60)
         e = self.engine()
         self.assertFalse(e._range_step(w.ctx()))
         self.assertFalse(e.executor.held)
 
     def test_stand_mode_filters_but_never_walks(self):
-        w = World(LINE + 300, [LINE - 100, LINE + 400])
-        e = self.engine(stand_mode=True)
+        w = World(pct(5), [pct(30), pct(95)])
+        e = self.engine(stand_mode=True, range_start=10, range_end=90)
         c = w.ctx()
         self.assertFalse(e._range_step(c))
         self.assertEqual(len(c.monsters), 1)
@@ -196,6 +237,43 @@ class WalkBackTests(RangeTestCase):
         self.assertTrue(self.logged("走不回去"))
         self.assertFalse(e.executor.held)
         self.assertEqual(e._fsm.current, State.CHASING)
+
+    def test_at_range_line_detects_both_boundaries(self):
+        e = self.engine(range_start=10, range_end=90)
+        w = World(pct(90))
+        e._range_step(w.ctx())
+        self.assertTrue(e._at_range_line(w.ctx(), "right"))
+        self.assertFalse(e._at_range_line(w.ctx(), "left"))
+        w = World(pct(10))
+        e._range_step(w.ctx())
+        self.assertTrue(e._at_range_line(w.ctx(), "left"))
+        self.assertFalse(e._at_range_line(w.ctx(), "right"))
+
+
+class LegacyMigrationTests(unittest.TestCase):
+    """旧配置 range_limit + range_split → range_start/range_end。"""
+
+    def test_left(self):
+        d = _migrate_legacy({"range_limit": "left", "range_split": 0.8})
+        self.assertEqual((d["range_start"], d["range_end"]), (0.0, 80.0))
+        self.assertNotIn("range_limit", d)
+        self.assertNotIn("range_split", d)
+
+    def test_right(self):
+        d = _migrate_legacy({"range_limit": "right", "range_split": 0.6})
+        self.assertEqual((d["range_start"], d["range_end"]), (60.0, 100.0))
+
+    def test_none(self):
+        d = _migrate_legacy({"range_limit": "none", "range_split": 0.5})
+        self.assertEqual((d["range_start"], d["range_end"]), (0.0, 100.0))
+
+    def test_new_keys_win(self):
+        d = _migrate_legacy({"range_limit": "left", "range_start": 10, "range_end": 20})
+        self.assertEqual((d["range_start"], d["range_end"]), (10, 20))
+
+    def test_no_legacy_keys_untouched(self):
+        d = _migrate_legacy({"range_start": 10, "range_end": 90})
+        self.assertEqual((d["range_start"], d["range_end"]), (10, 90))
 
 
 if __name__ == "__main__":

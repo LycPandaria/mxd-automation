@@ -39,7 +39,7 @@ mp_key: pdn
 target_key: tab
 jump_key: alt
 attack_type: long
-attack_range: 350
+attack_range: 300
 attack_range_y: 29
 attack_min_range: 0
 attack_lock_seconds: 0.5
@@ -77,20 +77,20 @@ pickup_key: z
 pickup_interval: 0.333
 screenshot_interval: 1
 pixel_base_height: 768
-range_limit: left
-range_split: 0.8
+range_start: 10.0
+range_end: 90.0
 minimap_region:
-- 0.0007320644216691069
-- 0.09765625
+- 0.0036603221083455345
+- 0.09635416666666667
 - 0.11200585651537336
-- 0.1640625
+- 0.16666666666666666
 minimap_scale: 16
 channel_enabled: true
 channel_idle_min: 2
 channel_hold_key: right
 channel_hold_seconds: 5
 quit_enabled: true
-quit_time: 03:00
+quit_time: 02:50
 exp_enabled: false
 exp_read_seconds: 5
 exp_log_minutes: 10

@@ -36,6 +36,9 @@ def engine(**overrides):
         "knockback_skill": {},
         "stand_micro_move_enabled": False,
         "pickup_enabled": False,
+        # 活动范围钉死为不限制：Config 会合并本机 user.yaml，
+        # 不钉的话本机设了范围（如 0~80）会泄漏进来，探索/打怪用例会被拦
+        "range_start": 0.0, "range_end": 100.0,
         **overrides,
     })
     ex = FakeExecutor()

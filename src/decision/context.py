@@ -405,7 +405,7 @@ TURN_RETRY_MAX_SECONDS = 0.30
 #   · 一次 20~60px 的正常走动代替 N 次 5~15px 的碎步，更像人。
 #
 # 安全（按住会走 30~100px，逐帧检查，命中立即松键）：
-#   前方无地板 / 走到画面边缘或活动范围分界线 / 长手进入最小射程或击退距离 /
+#   前方无地板 / 走到画面边缘或活动范围边界 / 长手进入最小射程或击退距离 /
 #   按住 0.2s 零位移（keydown 本身被吞）→ 强制松开重试一次。
 
 TURN_HOLD_CONFIRM_PX = 25
@@ -684,23 +684,23 @@ BLIND_CHASE_SECONDS = 2.0
 # =============================================================================
 #
 # 镜头跟着角色走，只看画面不知道自己在地图哪里，所以用小地图上的黄点：
-# 黄点离分界线多远 × minimap_scale = 画面里分界线离自己多远。
-# 比例不准只影响离分界线远时对怪的判断，走到线上时距离是 0，人不会因此过线。
+# 黄点离范围边界多远 × minimap_scale = 画面里边界离自己多远。
+# 比例不准只影响离边界远时对怪的判断，走到边界上时距离是 0，人不会因此出界。
 
 RANGE_LINE_TOLERANCE = 20
-"""活动范围：怪物中心过了分界线这么多（px，768 高画面下）以内还算范围内。
-小地图 1px 就是画面十几 px，分界线本身有这么大的误差，正好骑在线上的怪不用来回判"""
+"""活动范围：怪物中心出了边界这么多（px，768 高画面下）以内还算范围内。
+小地图 1px 就是画面十几 px，边界本身有这么大的误差，正好骑在边界上的怪不用来回判"""
 
 RANGE_EDGE_MARGIN = 40
-"""活动范围：离分界线这么近（px，768 高画面下）就当走到了尽头：探索掉头、后撤不再往那边撤。
-松键后还会滑一段，贴到线上才掉头就过线了"""
+"""活动范围：离边界这么近（px，768 高画面下）就当走到了尽头：探索掉头、后撤不再往那边撤。
+松键后还会滑一段，贴到边界才掉头就出去了"""
 
 RANGE_RETURN_START = 60
-"""活动范围：过线超过这么多（px，768 高画面下）才走回来，比 RANGE_LINE_TOLERANCE 大，
-追线上的怪、滑过一点不会触发。走回到线内 RANGE_EDGE_MARGIN 才停"""
+"""活动范围：出界超过这么多（px，768 高画面下）才走回来，比 RANGE_LINE_TOLERANCE 大，
+追边界上的怪、滑过一点不会触发。走回到范围内 RANGE_EDGE_MARGIN 才停"""
 
 RANGE_RETURN_CONFIRM_FRAMES = 3
-"""活动范围：连续过线这么多帧才走回来，定位跳一两帧不算"""
+"""活动范围：连续出界这么多帧才走回来，定位跳一两帧不算"""
 
 RANGE_RETURN_GIVEUP = 3
 """活动范围：走回时卡住（跳了也过不去）这么多次就先不走，RANGE_RETRY_SECONDS 秒后再试"""
@@ -712,10 +712,10 @@ RANGE_DOT_GRACE_SECONDS = 1.0
 """活动范围：小地图上的黄点这么久内看到过就沿用（被别的点盖住一下），再久就算不知道自己在哪"""
 
 RANGE_STATUS_SECONDS = 10.0
-"""活动范围：每隔这么久写一行当前位置，实机确认分界线对不对"""
+"""活动范围：每隔这么久写一行当前位置，实机确认边界对不对"""
 
 RANGE_NOTE_SECONDS = 5.0
-"""活动范围：线外有怪不打、认不出位置这类日志的最短间隔"""
+"""活动范围：范围外有怪不打、认不出位置这类日志的最短间隔"""
 
 EDGE_MARGIN = 80
 """画面边缘区域宽度（px，768 高画面下）。冒险岛镜头跟随角色，只有走到地图
@@ -873,15 +873,17 @@ class DecisionEngine:
 
     def _range_reset(self):
         """清空活动范围的状态（开始/测谎恢复/补飞镖之后，人可能已经不在原来的位置）。"""
-        self._range_line_x: Optional[float] = None  # 本帧分界线在画面里的 x（可能在画面外），None = 不限制或不知道
+        self._range_start_x: Optional[float] = None  # 本帧左边界在画面里的 x（可能在画面外），None = 不限制或不知道
+        self._range_end_x: Optional[float] = None    # 本帧右边界在画面里的 x
         self._range_dot: Optional[Tuple[float, int]] = None  # 最近看到的 (黄点 x, 小地图宽)
         self._range_dot_at = 0.0                  # 最近看到黄点的时间
         self._range_lost = False                  # 正处于"不知道自己在地图哪里"的状态
         self._range_announced = False             # 开始时那行说明写过了
         self._range_status_at = 0.0               # 上次写当前位置日志的时间
-        self._range_note_at = 0.0                 # 上次写"线外有怪/认不出位置"日志的时间
-        self._range_over_frames = 0               # 连续过线的帧数
+        self._range_note_at = 0.0                 # 上次写"范围外有怪/认不出位置"日志的时间
+        self._range_over_frames = 0               # 连续出界的帧数
         self._range_returning = 0.0               # 开始走回范围的时间，0 = 没在走
+        self._range_return_side: Optional[str] = None  # 从哪条边界出去的（left/right）
         self._range_stuck = 0                     # 这次走回卡住的次数
         self._range_retry_at = 0.0                # 走回被挡住后，到这个时间再试
 
@@ -1159,8 +1161,8 @@ class DecisionEngine:
         if self._micro_move_tick(ctx):
             return
 
-        # ---- 活动范围：去掉线外的怪、走出范围先走回来 ----
-        # 放在怪物处理之前：之后选目标/追击/后撤/探索都看不到线外的怪。
+        # ---- 活动范围：去掉范围外的怪、走出范围先走回来 ----
+        # 放在怪物处理之前：之后选目标/追击/后撤/探索都看不到范围外的怪。
         # 站桩模式只过滤不走动（站位自己选在范围内）。
         if self._range_step(ctx):
             return
@@ -1721,7 +1723,7 @@ class DecisionEngine:
         结束条件（到点一律乐观确认，不再有"未确认就反复重试"的空转）：
           · 朝该方向累计位移 ≥ TURN_HOLD_CONFIRM_PX 且超过最短时长 → 提前确认
           · 按住满本次计划时长（0.3~0.8s 随机） → 乐观确认
-          · 前方无地板 / 到画面边缘或分界线 → 提前松键
+          · 前方无地板 / 到画面边缘或活动范围边界 → 提前松键
             （按住 ≥ 最短时长也确认——转向在按下瞬间已生效，只是没走动）
         """
         direction = self._turn_hold_dir
@@ -1751,7 +1753,7 @@ class DecisionEngine:
                 self._turn_hold_finish(confirmed, "前方无地板，提前松键")
                 return False
             if self._at_edge(ctx, direction):
-                self._turn_hold_finish(confirmed, "到地图边缘/分界线，提前松键")
+                self._turn_hold_finish(confirmed, "到地图边缘/活动范围边界，提前松键")
                 return False
             # 长手：走进最小射程就不该再贴上去（提前收，朝向照常确认）
             t = self._turn_hold_target
@@ -4005,12 +4007,12 @@ class DecisionEngine:
             self._stuck_counter = 0
             return
 
-        # 走到地图尽头（贴近画面边缘）或活动范围的分界线 → 掉头
+        # 走到地图尽头（贴近画面边缘）或活动范围的边界 → 掉头
         if self._at_edge(ctx, self._explore_direction):
             at_line = self._at_range_line(ctx, self._explore_direction)
             self._explore_direction = "left" if self._explore_direction == "right" else "right"
             self._explore_frame_count = 0
-            self._log(f"[探索] 走到{'分界线' if at_line else '地图边缘'}，掉头 → {self._explore_direction}")
+            self._log(f"[探索] 走到{'范围边界' if at_line else '地图边缘'}，掉头 → {self._explore_direction}")
 
         # 长时间探索没遇到怪，换方向
         elif self._explore_frame_count >= EXPLORE_DIRECTION_SWITCH_FRAMES:
@@ -4028,31 +4030,49 @@ class DecisionEngine:
         self._hold_move(self._explore_direction)
 
     # =========================================================================
-    # 活动范围（只在地图左半边 / 右半边）
+    # 活动范围（只在地图 start%~end% 区间内打怪）
     # =========================================================================
 
-    def _range_mode(self) -> Optional[str]:
-        """限制在哪一边："left" / "right"，不限制返回 None。"""
-        mode = getattr(self.config, "range_limit", "none")
-        return mode if mode in ("left", "right") else None
+    def _range_band(self) -> Optional[Tuple[float, float]]:
+        """活动范围 (起点, 终点)，小地图宽度的比例 0.0~1.0；不限制返回 None。
+
+        配置 range_start / range_end 是 0~100 的百分比（界面「从 x% 到 y%」），
+        0~100 = 不限制。旧配置的 range_limit/range_split 由 config_loader 迁移。
+        """
+        raw_start = getattr(self.config, "range_start", 0.0)
+        raw_end = getattr(self.config, "range_end", 100.0)
+        try:
+            start = 0.0 if raw_start is None else float(raw_start) / 100.0
+            end = 1.0 if raw_end is None else float(raw_end) / 100.0
+        except (TypeError, ValueError):
+            return None
+        start = max(0.0, min(1.0, start))
+        end = max(0.0, min(1.0, end))
+        if start > end:                     # 配反了就按有序处理，不静默失效
+            start, end = end, start
+        if start <= 0.0 and end >= 1.0:
+            return None
+        return start, end
 
     def _range_step(self, ctx: Context) -> bool:
-        """每帧算一次分界线、去掉线外的怪、走出范围就走回来。返回 True 表示本帧到此为止。
+        """每帧算一次活动范围的两条边界、去掉范围外的怪、走出范围就走回来。
+
+        返回 True 表示本帧到此为止（在走回或等待确认）。
 
         镜头跟着角色走，只看画面不知道自己在地图哪里，所以用小地图上的黄点：
-        黄点离分界线多远 × 小地图比例（minimap_scale）= 画面里分界线离自己多远。
-        比例不准只影响离分界线远时对怪的判断，走到线上时距离是 0，人不会因此过线。
+        黄点离边界多远 × 小地图比例（minimap_scale）= 画面里边界离自己多远。
+        比例不准只影响离边界远时对怪的判断，走到边界上时距离是 0，人不会因此出界。
         """
-        self._range_line_x = None
-        mode = self._range_mode()
-        if mode is None:
+        self._range_start_x = None
+        self._range_end_x = None
+        band = self._range_band()
+        if band is None:
             return False
         now = time.time()
-        split = max(0.0, min(1.0, float(getattr(self.config, "range_split", 0.5))))
-        side = "左" if mode == "left" else "右"
+        start, end = band
         if not self._range_announced:
             self._range_announced = True
-            self._log(f"[范围] 只在{side}半边活动，分界线在小地图 {split:.0%} 处"
+            self._log(f"[范围] 在地图 {start:.0%}~{end:.0%} 之间活动"
                       f"（小地图 1px 按画面 {self._range_scale():g}px 算）")
         if ctx.minimap_x is not None and ctx.minimap_width:
             # 镜头跟着人走，走路时画面里的 x 也可能不变：黄点动了才说明真的在走，不算卡住
@@ -4069,52 +4089,82 @@ class DecisionEngine:
             return self._range_hold(ctx, foot, now, stand)
 
         dot_x, width = self._range_dot
-        # 过线距离（画面 px）：正 = 在线外，负 = 在线内
-        past = (dot_x - width * split) * self._range_scale() * (1 if mode == "left" else -1)
-        line = foot[0] + past * (-1 if mode == "left" else 1)
-        self._range_line_x = line
+        scale = self._range_scale()
+        frac = dot_x / width
+        # 出界距离（画面 px，正 = 已经在该边界外，负 = 在该边界内）
+        past_left = (start - frac) * width * scale
+        past_right = (frac - end) * width * scale
+        self._range_start_x = foot[0] + past_left
+        self._range_end_x = foot[0] - past_right
 
         if now - self._range_status_at >= RANGE_STATUS_SECONDS:
             self._range_status_at = now
-            where = f"在线外 {int(past)}px" if past > 0 else f"离分界线 {int(-past)}px"
-            self._log(f"[范围] 小地图上你在 {dot_x / width:.0%}（分界 {split:.0%}），{where}")
+            if past_left > 0:
+                where = f"在左边界外 {int(past_left)}px"
+            elif past_right > 0:
+                where = f"在右边界外 {int(past_right)}px"
+            else:
+                where = "范围内"
+            self._log(f"[范围] 小地图上你在 {frac:.0%}（范围 {start:.0%}~{end:.0%}），{where}")
 
-        self._range_filter_monsters(ctx, mode, line, foot, now)
+        self._range_filter_monsters(ctx, self._range_start_x, self._range_end_x, foot, now)
         if stand:
-            return False  # 站撸不走动，只是不打线外的怪；站位自己选在范围内
-        return self._range_walk_back(ctx, mode, past, now)
+            return False  # 站撸不走动，只是不打范围外的怪；站位自己选在范围内
+        # 正在走回：接着朝原来那条边界走，直到回到范围内
+        if self._range_returning:
+            side = self._range_return_side
+            past = past_left if side == "left" else past_right
+            return self._range_walk_back(
+                ctx, "right" if side == "left" else "left", past, now)
+        if past_left > 0:
+            return self._range_walk_back(ctx, "right", past_left, now)
+        if past_right > 0:
+            return self._range_walk_back(ctx, "left", past_right, now)
+        self._range_over_frames = 0
+        return False
+
+    def range_enabled(self) -> bool:
+        """是否启用了活动范围（0%~100% 视为不限制）。
+
+        主循环用它决定要不要每帧找小地图黄点（有开销）。
+        """
+        return self._range_band() is not None
 
     def _range_scale(self) -> float:
         """小地图 1px 对应画面多少 px。游戏窗口整体缩放时小地图和画面一起变，这个比例不随分辨率变。"""
         return max(1.0, float(getattr(self.config, "minimap_scale", 16) or 16))
 
-    def _range_filter_monsters(self, ctx: Context, mode: str, line: float,
+    def _range_filter_monsters(self, ctx: Context, line_start: float, line_end: float,
                                foot: Tuple[int, int], now: float):
-        """把分界线外的怪从这一帧的怪物列表里去掉：之后选目标、追击、后撤就都看不到它们。"""
-        sign = 1 if mode == "right" else -1
+        """把活动范围外的怪从这一帧的怪物列表里去掉：之后选目标、追击、后撤就都看不到它们。"""
         tol = self._px(RANGE_LINE_TOLERANCE)
-        inside = [m for m in ctx.monsters if (m.center[0] - line) * sign >= -tol]
-        if len(inside) == len(ctx.monsters):
+
+        def inside(m: Detection) -> bool:
+            return line_start - tol <= m.center[0] <= line_end + tol
+
+        inside_list = [m for m in ctx.monsters if inside(m)]
+        if len(inside_list) == len(ctx.monsters):
             return
-        outside = [m for m in ctx.monsters if (m.center[0] - line) * sign < -tol]
-        ctx.monsters = inside
+        outside = [m for m in ctx.monsters if not inside(m)]
+        ctx.monsters = inside_list
         # 锁定的怪走出了范围：马上放手，不当成"被挡住/漏检"继续打它最后的位置
         t = self._target_monster
         if t is not None and any(self._is_same_monster(t, m) for m in outside):
             self._target_monster = None
             self._occluded_frames = 0
-            self._log("[范围] 锁定的怪走到分界线外，不打了，换范围内的")
+            self._log("[范围] 锁定的怪走到范围外，不打了，换范围内的")
         if now - self._range_note_at >= RANGE_NOTE_SECONDS:
             self._range_note_at = now
             near = min(outside, key=lambda m: abs(m.center[0] - foot[0]))
             dx = near.center[0] - foot[0]
-            self._log(f"[范围] 分界线外有 {len(outside)} 只怪不打（最近的在{'右' if dx > 0 else '左'}边 "
-                      f"{abs(dx)}px），范围内 {len(inside)} 只")
+            self._log(f"[范围] 范围外有 {len(outside)} 只怪不打（最近的在{'右' if dx > 0 else '左'}边 "
+                      f"{abs(dx)}px），范围内 {len(inside_list)} 只")
 
     def _range_hold(self, ctx: Context, foot: Optional[Tuple[int, int]],
                     now: float, stand: bool) -> bool:
-        """不知道自己在地图哪里：不走动（免得走进对方那一半），只打已经够得着的怪，等黄点回来。"""
+        """不知道自己在地图哪里：不走动（免得走出去/走进别人的范围），只打已经够得着的怪，等黄点回来。"""
         self._range_returning = 0.0
+        self._range_return_side = None
         self._range_over_frames = 0
         if not self._range_lost:
             self._range_lost = True
@@ -4148,12 +4198,18 @@ class DecisionEngine:
             return abs(foot[0] - self._melee_edge_x(foot[0], m)) <= self._get_attack_range()
         return abs(m.center[0] - foot[0]) < self._get_attack_range()
 
-    def _range_walk_back(self, ctx: Context, mode: str, past: float, now: float) -> bool:
-        """走出范围（被击退、开始时就在线外）→ 走回线内。返回 True 表示本帧在走（不打怪）。"""
+    def _range_walk_back(self, ctx: Context, direction: str, past: float, now: float) -> bool:
+        """走出范围（被击退、开始时就在范围外）→ 走回范围内。返回 True 表示本帧在走（不打怪）。
+
+        Args:
+            direction: 走回去的方向（"right" = 从左边出界了要往右走）
+            past: 相对那条边界的出界距离（正 = 还在外面，负 = 已经走进来）
+        """
         margin = self._px(RANGE_EDGE_MARGIN)
         if self._range_returning:
             if past <= -margin:
                 self._range_returning = 0.0
+                self._range_return_side = None
                 self._range_over_frames = 0
                 self._release_move()
                 self._log("[范围] 回到范围内，继续打怪")
@@ -4163,10 +4219,11 @@ class DecisionEngine:
                 self._range_stuck += 1
                 if self._range_stuck >= RANGE_RETURN_GIVEUP:
                     self._range_returning = 0.0
+                    self._range_return_side = None
                     self._range_over_frames = 0
                     self._range_retry_at = now + RANGE_RETRY_SECONDS
                     self._release_move()
-                    self._log(f"[范围] 走不回去（被挡住？还在线外 {int(past)}px），"
+                    self._log(f"[范围] 走不回去（被挡住？还在范围外 {int(past)}px），"
                               f"先打够得着的怪，{RANGE_RETRY_SECONDS:.0f} 秒后再试")
                     return False
                 self._log("[范围] 走回去时卡住了，跳一下")
@@ -4177,33 +4234,34 @@ class DecisionEngine:
                 return False
             self._range_over_frames += 1
             if self._range_over_frames < RANGE_RETURN_CONFIRM_FRAMES:
-                # 确认的这几帧也不打：人在线外，朝里出手会打到挡在中间的线外的怪
+                # 确认的这几帧也不打：人在范围外，朝里出手会打到挡在中间的界外怪
                 self._release_move()
                 return True
             self._range_returning = now
+            self._range_return_side = "left" if direction == "right" else "right"
             self._range_stuck = 0
             self._stuck_counter = 0
             self._target_monster = None
-            self._log(f"[范围] 走出范围了（过线 {int(past)}px），往{'左' if mode == 'left' else '右'}走回去")
+            self._log(f"[范围] 走出范围了（出界 {int(past)}px），"
+                      f"往{'左' if direction == 'left' else '右'}走回去")
         self._fsm.transition(State.CHASING)
-        self._hold_move(mode)
+        self._hold_move(direction)
         return True
 
     def _at_range_line(self, ctx: Context, direction: str) -> bool:
-        """再往 direction 走就要过分界线了。"""
-        line = self._range_line_x
-        if line is None or ctx.self_position is None:
+        """再往 direction 走就要出活动范围了。"""
+        if ctx.self_position is None:
             return False
         margin = self._px(RANGE_EDGE_MARGIN)
-        mode = self._range_mode()
-        if mode == "left" and direction == "right":
-            return ctx.self_position[0] >= line - margin
-        if mode == "right" and direction == "left":
-            return ctx.self_position[0] <= line + margin
+        x = ctx.self_position[0]
+        if direction == "right":
+            return self._range_end_x is not None and x >= self._range_end_x - margin
+        if direction == "left":
+            return self._range_start_x is not None and x <= self._range_start_x + margin
         return False
 
     def _at_edge(self, ctx: Context, direction: str) -> bool:
-        """再往 direction 走就贴到画面边缘（地图尽头）或活动范围的分界线了。"""
+        """再往 direction 走就贴到画面边缘（地图尽头）或活动范围的边界了。"""
         if self._at_range_line(ctx, direction):
             return True
         if ctx.self_position is None or not ctx.frame_width:

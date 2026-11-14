@@ -76,8 +76,8 @@ YAML 配置字段说明
                     aoe_hold_seconds 秒，游戏自动连发并跳过后摇）
   pixel_base_height: 像素参数（攻击距离/垂直容差/活动范围阈值等）按此画面高度填写，
                     运行时乘以 当前帧高/此值；0 = 不缩放
-  range_limit:      活动范围 none（不限制）/ left（只在地图左半边）/ right（只在地图右半边）
-  range_split:      分界线在小地图宽度的什么位置 (0.0~1.0)，默认 0.5 = 正中间
+  range_start:      活动范围起点（小地图从左往右的百分比 0~100）
+  range_end:        活动范围终点（同上）；0~100 = 不限制
   minimap_region:   小地图的地图部分（百分比 [x, y, w, h]，界面「框选小地图」写入）
   minimap_scale:    小地图 1px 对应画面多少 px（默认 16）
   channel_enabled / channel_idle_min: 自动换频道开关 / 多少分钟没放过技能就换
@@ -213,6 +213,29 @@ def _load_user_config() -> Dict[str, Any]:
     data = _load_yaml(config_path())
     if not data:
         data = _load_json(config_path())
+    return _migrate_legacy(data)
+
+
+def _migrate_legacy(data: Dict[str, Any]) -> Dict[str, Any]:
+    """把旧配置项就地迁移成新写法（只处理还带旧键的用户配置）。
+
+    活动范围：range_limit(left/right/none) + range_split(0~1)
+              → range_start / range_end（百分比 0~100）
+    迁移后旧键会被删掉，下次保存就只剩新键。
+    """
+    if "range_start" not in data and "range_end" not in data:
+        mode = data.get("range_limit")
+        if mode is not None:
+            try:
+                split = float(data.get("range_split", 0.5) or 0.5) * 100.0
+            except (TypeError, ValueError):
+                split = 50.0
+            data["range_start"], data["range_end"] = {
+                "left": (0.0, split),
+                "right": (split, 100.0),
+            }.get(mode, (0.0, 100.0))
+    data.pop("range_limit", None)
+    data.pop("range_split", None)
     return data
 
 
@@ -349,11 +372,12 @@ def _defaults() -> Dict[str, Any]:
         # 画面高度填写，运行时乘以 当前帧高/此值。客户端只是"看到更多地图"、
         # 人物大小不变时填 0 关闭缩放。
         "pixel_base_height": 768,
-        # ---- 活动范围（只在地图左半边 / 右半边打怪）----
+        # ---- 活动范围（只在地图某一段区间打怪）----
         # 镜头跟着角色走，只看画面不知道自己在地图哪里，所以用小地图上的黄点：
-        # 黄点离分界线多远 × minimap_scale = 画面里分界线离自己多远。
-        "range_limit": "none",   # none / left / right
-        "range_split": 0.5,      # 分界线在小地图宽度的位置（0.5 = 正中间）
+        # 黄点离边界多远 × minimap_scale = 画面里边界离自己多远。
+        # 0~100 = 不限制；例如 10 / 80 = 只在地图 10%~80% 之间活动。
+        "range_start": 0.0,      # 活动范围起点（小地图百分比 0~100）
+        "range_end": 100.0,      # 活动范围终点（同上）
         "minimap_region": None,  # 小地图的地图部分（百分比 [x, y, w, h]，界面「框选小地图」写入）
         "minimap_scale": 16,     # 小地图 1px 对应画面多少 px
         # ---- 自动换频道 ----
