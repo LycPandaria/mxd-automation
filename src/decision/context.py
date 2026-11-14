@@ -111,8 +111,9 @@ RETREAT_EDGE_LOOKAHEAD_X = 45
 """后撤前检查后退方向前方此距离处脚下是否有地板（防落崖）。"""
 
 AOE_MONSTER_COUNT_THRESHOLD = 2
-"""范围攻击(AOE)触发阈值：攻击方向（朝向正前方）同平台怪物数 ≥ 此值时
-改放第二个技能(技能2, AOE)；否则放第一个技能(技能1)。仅长手(远程)生效。
+"""范围攻击(AOE)触发阈值：角色攻击范围内（中心左右两侧各 attack_range）
+同平台怪物合计 ≥ 此值时改放第二个技能(技能2, AOE)；否则放第一个技能(技能1)。
+AOE 技能两侧都能造成伤害，所以不再按朝向正前方计数。仅长手(远程)生效。
 例外：站桩模式 + stand_skill2_only(默认开) 时不做这个判定，恒定只放技能2。"""
 
 AOE_BURST_COUNT = 3
@@ -3442,38 +3443,30 @@ class DecisionEngine:
     # 攻击
     # =========================================================================
 
-    def _count_attack_dir_monsters(self, ctx: Context,
-                                   target: Optional[Detection]) -> int:
-        """统计"攻击方向"内的同平台怪物数（用于 AOE 技能选择）。
+    def _count_aoe_monsters(self, ctx: Context) -> int:
+        """统计 AOE 攻击范围内的同平台怪物数（左右两侧合计）。
 
-        "攻击方向" = 角色朝向正前方（_face_dir 一侧）。计入条件（全部满足）：
+        AOE 技能（爆炸箭）从角色两侧都能造成伤害，所以不再按朝向正前方计数：
+        角色中心左右各 attack_range（当前生效攻击距离）内的怪全部计入。
+        计入条件（全部满足）：
           1. 与角色同平台（脚底垂直差 ≤ attack_range_y）
-          2. 在角色朝向正前方（怪中心x 在 _face_dir 一侧）
-        朝向未知时回退为"朝锁定目标"方向；仍无法确定则默认向右。
+          2. 水平距离 |怪中心x - 角色x| ≤ 当前生效攻击距离
+        朝向不参与判定（两侧都算）。
         """
         foot = self._effective_self_pos(ctx)
         if foot is None:
             return 0
         sx, sy = foot
 
-        if self._face_dir in ("left", "right"):
-            direction = self._face_dir
-        elif target is not None:
-            direction = "right" if target.center[0] >= sx else "left"
-        else:
-            direction = "right"
-
+        attack_range = self._get_attack_range()
         ry = getattr(self.config, "attack_range_y", 60)
         count = 0
         for m in ctx.monsters:
-            if self._in_ghost_zone(m):              # 残影不算"前方有怪"
+            if self._in_ghost_zone(m):                  # 残影不算活怪
                 continue
-            mx = m.center[0]
-            if abs(sy - (m.y + m.h)) > ry:          # 跨层不计
+            if abs(sy - (m.y + m.h)) > ry:              # 跨层不计
                 continue
-            if direction == "right" and mx <= sx:   # 不在正前方
-                continue
-            if direction == "left" and mx >= sx:
+            if abs(m.center[0] - sx) > attack_range:    # 超出攻击范围（两侧都算）
                 continue
             count += 1
         return count
@@ -3566,16 +3559,16 @@ class DecisionEngine:
         # 按住的推进在 _attack 开头（动画锁之前）；这里只负责发起。
         # 漏检沿用期间不按住 2 秒——目标是影子位置，满时长连发是最贵的空放。
 
-        # 普通模式：攻击方向怪数 ≥ 阈值 → 连发 AOE_BURST_COUNT 发技能2(爆炸箭)，
-        #      爆炸箭冷却空档用技能1兜底；否则只放技能1
+        # 普通模式：攻击范围内两侧怪数合计 ≥ 阈值 → 连发 AOE_BURST_COUNT 发
+        #      技能2(爆炸箭)，爆炸箭冷却空档用技能1兜底；否则只放技能1
         # aoe_mode="hold" 时改为按住技能2 连发（游戏自动补发并跳过后摇），
         # 间隔门 aoe_hold_cooldown 之外 + 动画锁外才发起
         now = time.time()
         if self._aoe_burst_left == 0 and not retaining \
-                and self._count_attack_dir_monsters(ctx, target) >= AOE_MONSTER_COUNT_THRESHOLD:
+                and self._count_aoe_monsters(ctx) >= AOE_MONSTER_COUNT_THRESHOLD:
             if self._aoe_hold_mode():
                 if now >= self._skill_hold_next_at and not self._attack_busy() \
-                        and self._skill_hold_start(ctx, target):
+                        and self._skill_hold_start(ctx):
                     self._retain_casted = True if retaining else self._retain_casted
                     return
             else:
@@ -4350,7 +4343,7 @@ class DecisionEngine:
 
         提前松键条件（2026-11-10 收窄）：
           · buff 施法窗口被请求 → 让路（buff 键和技能键同按会被吞）
-          · 攻击方向怪数掉到 0 且超过最短按住时长 → 不对空气继续连发
+          · AOE 攻击范围内（两侧）怪数掉到 0 且超过最短按住时长 → 不对空气继续连发
           · 按住满 aoe_hold_seconds → 正常结束
 
         【近身威胁 / 目标换边不再松键】用户决定：按住期间继续输出，不为
@@ -4372,9 +4365,9 @@ class DecisionEngine:
             self._skill_hold_release("buff 施法窗口让路")
             return False
 
-        # 攻击方向没怪了：超过最短按住时长就不对空气继续连发
-        if elapsed >= min_s and self._count_attack_dir_monsters(ctx, self._target_monster) == 0:
-            self._skill_hold_release("攻击方向怪清空")
+        # 攻击范围内没怪了：超过最短按住时长就不对空气继续连发
+        if elapsed >= min_s and self._count_aoe_monsters(ctx) == 0:
+            self._skill_hold_release("攻击范围内怪清空")
             return False
 
         # 按住满时长：正常结束
@@ -4383,8 +4376,8 @@ class DecisionEngine:
             return False
         return True
 
-    def _skill_hold_start(self, ctx: Context, target: Optional[Detection]) -> bool:
-        """攻击方向怪够多、间隔门已过 → 按住技能2 开始连发。返回 True 表示已发起。"""
+    def _skill_hold_start(self, ctx: Context) -> bool:
+        """攻击范围内两侧怪够多、间隔门已过 → 按住技能2 开始连发。返回 True 表示已发起。"""
         skills = self.config.skills or []
         if len(skills) < 2:
             return False
@@ -4397,7 +4390,7 @@ class DecisionEngine:
         self._skill_hold_started = time.time()
         self._casts_on_target += 1   # 残影计数：一次按住记一次（游戏实际连发更多）
         self._mark_attack_pressed()
-        self._log(f"[AOE] 攻击方向 {self._count_attack_dir_monsters(ctx, target)} 只怪，"
+        self._log(f"[AOE] 攻击范围两侧 {self._count_aoe_monsters(ctx)} 只怪，"
                   f"按住 {skills[1]['name']} ({key}) 连发")
         return True
 

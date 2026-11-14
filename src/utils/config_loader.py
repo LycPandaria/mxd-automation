@@ -328,9 +328,9 @@ def _defaults() -> Dict[str, Any]:
         # 代替"点按→自检→重试"循环，消除小碎步。turn_hold_* 参数见 context.py。
         "turn_mode": "tap",       # "tap" / "hold"
         # ---- AOE 爆发方式 ----
-        # burst = 攻击方向怪多时连发 3 发技能2，冷却空档技能1兜底（现状）；
+        # burst = 攻击范围内（两侧）怪多时连发 3 发技能2，冷却空档技能1兜底（现状）；
         # hold = 触发时按住技能键 aoe_hold_seconds 秒：游戏按住期间自动连发
-        # 并跳过后摇，出手更密；近身威胁/怪清空/目标换边会提前松键。
+        # 并跳过后摇，出手更密；buff 窗口/攻击范围内怪清空会提前松键。
         "aoe_mode": "burst",      # "burst" / "hold"
         "aoe_hold_seconds": 2.0,  # 每次按住时长（秒）
         "aoe_hold_min_seconds": 0.5,  # 提前松键下限（秒）

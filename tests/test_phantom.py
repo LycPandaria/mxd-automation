@@ -150,7 +150,7 @@ class RetainSuppressTests(Base):
     def test_no_aoe_hold_on_phantom(self):
         """漏检沿用期间：不对影子位置发起 2 秒按住。"""
         e = self.engine()
-        m1, m2 = monster(1300), monster(1450)
+        m1, m2 = monster(1300), monster(1350)
         e._target_monster = m1
         e._target_miss_frames = 2
         e._retain_casted = False
@@ -162,7 +162,7 @@ class RetainSuppressTests(Base):
     def test_casts_resume_when_visible_again(self):
         """目标重新可见（miss_frames=0）→ 恢复正常攻击（AOE hold 可发起）。"""
         e = self.engine()
-        m1, m2 = monster(1300), monster(1450)
+        m1, m2 = monster(1300), monster(1350)
         e._target_monster = m1
         e._target_miss_frames = 0
         e._retain_casted = True                    # 上一段打过：可见后应解除
