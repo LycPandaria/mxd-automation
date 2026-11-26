@@ -23,5 +23,12 @@ bugs/
 **/auto_work/
 weights/
 .tmp/
+# 测谎录制的回放/对比结果（tools/lie_*.py 的运行产物）
+replay_labels/
+# 模型权重（体积大，不入库；train/model/yolov8n.pt 是历史跟踪项，其余 onnx 忽略）
+models/
+train/model/*.onnx
+# 本机快捷方式
+*.lnk
 # 运行时输出统一在 logs/ 下
 logs/
