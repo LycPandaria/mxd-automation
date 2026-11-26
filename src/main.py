@@ -39,7 +39,7 @@
   YOLO player 框（唯一方案，不再用 OCR）
     原理: YOLO 检测出画面中的 player（玩家）框；
           脚底 = bbox 底部中点 (y+h)，角色中心 = bbox 中心点 (y+h//2)。
-          比 OCR 的"名字中心"更贴近真实站位。
+          脚底比框中心更贴近真实站位，距离判定更准。
     多人同屏时区分"自己":
           - 有历史位置 → 取离上一帧脚底最近的 player（位置连续性）
           - 无历史位置（启动/换图）→ 取面积最大的 player（兜底启发式）
@@ -243,9 +243,6 @@ class Automation:
         self._last_hp_ratio: Optional[float] = None
         self._last_mp_ratio: Optional[float] = None
 
-        # ---- 自动拾取 ----
-        self._last_pickup_time = 0.0  # 上次拾取按键的时间戳
-
         # ---- 自动加 buff（施法窗口状态机）----
         self._buff_next_time = {}     # key -> 下次到期时间戳
         self._buff_queue = []         # 本轮待释放的 buff [{name,key,cd}]
@@ -445,8 +442,8 @@ class Automation:
         return dot[0], region[2]
 
     def exp_summary(self) -> str:
-        """界面显示的一行经验信息。"""
-        return self._exp.summary(time.time())
+        """界面显示的近 10 分钟经验（单位：万）。"""
+        return self._exp.summary()
 
     def channel_switch_now(self):
         """「测试换频道」按钮：打怪中 → 下一帧暂停打怪去换；没在打怪 → 直接在后台线程换一次。"""
@@ -865,9 +862,8 @@ class Automation:
                 self._handle_lie_detected(frame, lie_score)
                 return
 
-        # ---- 1.6 经验记录：定时读状态栏的 EXP（后台线程，不占本帧）----
-        if getattr(self.config, "exp_enabled", True):
-            self._exp.feed(frame, time.time())
+        # ---- 1.6 经验记录：定时读状态栏的 EXP（后台线程，不占本帧；无开关，自动统计）----
+        self._exp.feed(frame, time.time())
 
         # ---- 1.65 定时结束游戏：测谎中走不到这里，测谎结束后再退 ----
         if self._quit_at is not None and time.time() >= self._quit_at:
@@ -974,10 +970,7 @@ class Automation:
             self.stop()
             return
 
-        # ---- 6.5. 自动拾取（定时按拾取键，每秒N次）----
-        self._auto_pickup()
-
-        # ---- 6.6. 自动加 buff（定期释放，冷却到就放）----
+        # ---- 6.5. 自动加 buff（定期释放，冷却到就放）----
         self._auto_buff()
 
         # ---- 7. 预览回调 ----
@@ -1075,28 +1068,8 @@ class Automation:
         return elapsed
 
     # =========================================================================
-    # 类别名解析（从配置的逗号分隔字符串 → 列表）
-    # 例如: "monster" → ["monster"]
-    #       "monster,boss" → ["monster", "boss"]
+    # 自动加 buff（定期释放，不看战斗状态）
     # =========================================================================
-
-    def _auto_pickup(self):
-        """自动拾取：按配置的间隔定时触发拾取键。
-
-        仅在 pickup_enabled=True 且已锁定窗口时生效。
-        间隔由 config.pickup_interval 控制（默认 0.333s = 每秒3次）。
-        """
-        enabled = getattr(self.config, "pickup_enabled", False)
-        if not enabled:
-            return
-        if not self.capture.locked:
-            return
-        now = time.time()
-        interval = getattr(self.config, "pickup_interval", 0.333)
-        if now - self._last_pickup_time >= interval:
-            pickup_key = getattr(self.config, "pickup_key", "z")
-            self.executor.press_key(pickup_key, cooldown=0.0)
-            self._last_pickup_time = now
 
     def _auto_buff(self):
         """自动加 buff：到期时先让决策层暂停攻击（施法窗口），再按 buff 键。
@@ -1160,6 +1133,12 @@ class Automation:
         self._buff_last_press = now
         self.on_log(f"[BUFF] 释放 {b['name']} ({b['key']})")
 
+    # =========================================================================
+    # 类别名解析（从配置的逗号分隔字符串 → 列表）
+    # 例如: "monster" → ["monster"]
+    #       "monster,boss" → ["monster", "boss"]
+    # =========================================================================
+
     def _monster_classes(self):
         return [c.strip() for c in self.config.monster_classes.split(",") if c.strip()]
 
@@ -1180,7 +1159,7 @@ class Automation:
         """从 YOLO player 检测框定位自身，返回 (脚底, 角色中心)。
 
         脚底 = player bbox 底部中点 (y+h)；角色中心 = bbox 中心点 (y+h//2)。
-        比 OCR 的"名字中心"更贴近真实站位。
+        脚底比框中心更贴近真实站位，距离判定更准。
 
         多人同屏时的选择策略（区分"自己"和"其他玩家"）：
           - 无历史位置（启动/换图）：取面积最大的 player（兜底启发式）；

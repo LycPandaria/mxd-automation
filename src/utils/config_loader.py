@@ -27,7 +27,7 @@ YAML / JSON 双格式支持
 坐标自适应
 ================================================================================
 
-  问题: 配置文件中的 HP 区域 / 自身偏移 等坐标是参考 1366×768 分辨率
+  问题: 配置文件中的 HP/MP 区域等坐标是参考 1366×768 分辨率
        记录的，但实际运行时窗口可能不同（如 1920×1080）。
 
   解决: scale_region() 和 scale_offset() 根据参考分辨率与当前帧的比例，
@@ -53,8 +53,6 @@ YAML 配置字段说明
   floor_classes:    地板类别名
   rope_classes:    绳索类别名
   player_classes:  玩家类别名（用于自身定位）
-  self_name:        自身角色名字（已废弃，改用 YOLO player 定位）
-  self_offset:      自身 HP 条底部到脚底的偏移像素数
   hp_region:        HP 条参考区域 [x, y, w, h] 或百分比
   hp_color:         HP 条颜色 [R, G, B]
   hp_tolerance:     HP 条颜色容差
@@ -83,7 +81,6 @@ YAML 配置字段说明
   channel_enabled / channel_idle_min: 自动换频道开关 / 多少分钟没放过技能就换
   channel_hold_key / channel_hold_seconds: 换完按住哪个键 / 按多久（秒）
   quit_enabled / quit_time: 定时结束游戏：点「开始」后下一次到这个钟点（"06:30"）就不打了，按 Esc 退出游戏
-  exp_enabled:      打怪时记录经验（读状态栏的 EXP，每分钟一行写到 logs/exp_log/日期.csv）
   exp_read_seconds / exp_log_minutes: 多少秒读一次 / 多少分钟在日志里报一次（0 = 不报）
 """
 import os
@@ -91,6 +88,17 @@ import sys
 from typing import List, Optional, Dict, Any, Tuple
 
 import yaml
+
+
+# 已移除的历史配置项：旧 user.yaml 里的残留载入时丢弃，保存时也不会再写回。
+_REMOVED_KEYS = (
+    "self_name",        # 早期用 OCR 找角色名字定位，已改为 YOLO player 框
+    "self_offset",      # 随 OCR 定位一起废弃
+    "pickup_enabled",   # 自动拾取功能已移除
+    "pickup_key",
+    "pickup_interval",
+    "exp_enabled",      # 经验改为开始打怪后自动统计，无开关
+)
 
 
 # ---- 路径常量 ----
@@ -274,9 +282,6 @@ def _defaults() -> Dict[str, Any]:
         "floor_classes": "floor",
         "rope_classes": "rope",
         "player_classes": "player",
-        # ---- 自身定位 ----
-        "self_name": "",  # 已废弃，改用 YOLO player 定位
-        "self_offset": 85,  # HP 条底部 → 脚底的偏移像素
         # ---- HP 检测 ----
         "hp_region": None,  # [x, y, w, h] 参考分辨率下的 HP 条区域
         "hp_color": [51, 204, 51],  # HP 条绿色 RGB
@@ -312,7 +317,7 @@ def _defaults() -> Dict[str, Any]:
         # 所以击退被游戏吞掉或对怪免疫时普通攻击不会被挡住。
         "knockback_skill": {
             "name": "击退技能",
-            "key": "",        # 击退技能按键，留空=不启用（按键不要与技能/buff/加血/加蓝/拾取键重复）
+            "key": "",        # 击退技能按键，留空=不启用（按键不要与技能/buff/加血/加蓝键重复）
             "cooldown": 0.3,  # 两次击退之间的最小间隔（秒）
             "range": 240,     # 触发距离（px，双方中心x距离）：实测参考帧 224/232px
         },
@@ -361,10 +366,6 @@ def _defaults() -> Dict[str, Any]:
         # 建议填略小于 buff 游戏内持续时间（如 180s 的 buff 填 170）。
         # 开启自动打怪后每帧尝试按，冷却到就放（首帧立即全部释放一次）。
         "buff_skills": [],
-        # ---- 拾取 ----
-        "pickup_enabled": True,   # 是否启用自动拾取
-        "pickup_key": "z",        # 拾取键
-        "pickup_interval": 0.333, # 拾取间隔（秒），默认每秒3次
         # ---- 自动截图 ----
         "screenshot_interval": 5,  # 自动截图间隔（秒）
         # ---- 像素参数基准高度 ----
@@ -390,8 +391,7 @@ def _defaults() -> Dict[str, Any]:
         # 回到登录界面后停止并解除窗口锁定。
         "quit_enabled": False,
         "quit_time": "06:00",          # 几点结束（今天过了就是明天）
-        # ---- 经验记录 ----
-        "exp_enabled": True,           # 读状态栏的 EXP，每分钟一行写到 logs/exp_log/日期.csv
+        # ---- 经验记录（开始打怪后自动记录，无开关）----
         "exp_read_seconds": 5,         # 多少秒读一次
         "exp_log_minutes": 10,         # 多少分钟在日志里报一次（0 = 不报）
         # ---- 测谎弹窗检测（反外挂）----
@@ -459,6 +459,10 @@ class Config:
         # 3. 用运行时覆盖项覆盖
         if overrides:
             data.update(overrides)
+
+        # 4. 丢弃已移除的历史字段（旧配置里的残留不参与运行，也不会写回 YAML）
+        for key in _REMOVED_KEYS:
+            data.pop(key, None)
 
         self._data = data
 

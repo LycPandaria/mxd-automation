@@ -43,7 +43,7 @@ from src.perception.yolo_detector import create_detector
 from src.perception.hp_mp_detector import detect_region_color
 from src.main import Automation
 from src.utils.logger import get_logger
-from src.perception.exp_meter import CSV_HEADER, LOG_DIR, read_history
+from src.perception.exp_meter import CSV_HEADER, LOG_DIR, WINDOW_MINUTES, read_history
 
 from ui.preview_label import PreviewLabel
 from ui.alarm_overlay import AlarmOverlay, flash_taskbar
@@ -190,10 +190,23 @@ class MainWindow(QMainWindow):
         self.preview.region_selected.connect(self._on_region_selected)
         v.addWidget(self.preview, 1)
 
-        # FPS
+        # FPS + 近10分钟经验（经验始终统计，开始打怪即自动开始）
+        stat_row = QHBoxLayout()
         self.fps_label = QLabel("FPS: -")
         self.fps_label.setStyleSheet("color: #27ae60; font-weight:bold;")
-        v.addWidget(self.fps_label)
+        stat_row.addWidget(self.fps_label)
+        self.exp_label = QLabel(f"近{WINDOW_MINUTES}分钟经验: -")
+        self.exp_label.setStyleSheet("color: #f39c12; font-weight:bold;")
+        self.exp_label.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Preferred)
+        self.exp_label.setToolTip(
+            f"开始自动打怪后自动统计最近 {WINDOW_MINUTES} 分钟获得的经验（单位：万），无需开关。\n"
+            "同时每分钟记一行到 logs\\exp_log\\日期.csv，点「经验记录」可查历史"
+        )
+        stat_row.addWidget(self.exp_label, 1)
+        self.exp_history_btn = QPushButton("经验记录")
+        self.exp_history_btn.clicked.connect(self._show_exp_history)
+        stat_row.addWidget(self.exp_history_btn)
+        v.addLayout(stat_row)
 
         # 测谎报警横幅（默认隐藏，命中弹窗时闪烁显示）
         self.alarm_bar = QWidget()
@@ -312,11 +325,6 @@ class MainWindow(QMainWindow):
         self.fps_spin.setRange(1, 30)
         self.fps_spin.setValue(8)
         g.addWidget(self.fps_spin, 3, 1, 1, 2)
-
-        g.addWidget(QLabel("自身名字:"), 4, 0)
-        self.name_edit = QLineEdit()
-        self.name_edit.setPlaceholderText("输入角色名, 如 我是立立")
-        g.addWidget(self.name_edit, 4, 1, 1, 2)
         return box
 
     def _build_hp_group(self):
@@ -473,7 +481,7 @@ class MainWindow(QMainWindow):
             "怪贴到触发距离（双方中心x差）以内时改放击退技能，把它推开后继续站定输出，\n"
             "替代“贴脸就往后走”的移动型后撤（不移动=不落崖、不打断输出，还带伤害）。\n"
             "按键留空 = 不启用。冷却期内会照常放普通技能，所以击退没生效也不会卡住输出。\n"
-            "只对长手(远程)生效；按键不要与技能/buff/加血/加蓝/拾取键重复。\n"
+            "只对长手(远程)生效；按键不要与技能/buff/加血/加蓝键重复。\n"
             "触发距离参考：实测参考帧为 224/232px（精灵框间隙约 115~120px），默认 240。"
         )
         for _w in (self.knockback_name_edit, self.knockback_key_edit,
@@ -627,43 +635,6 @@ class MainWindow(QMainWindow):
         quit_row.addStretch()
         v.addLayout(quit_row)
 
-        # 经验记录
-        exp_row = QHBoxLayout()
-        self.exp_checkbox = QCheckBox("记录经验")
-        self.exp_checkbox.setToolTip(
-            "打怪时每 5 秒读一次状态栏的 EXP，算出这次打了多少、每小时多少；\n"
-            "每分钟记一行到 logs\\exp_log\\日期.csv，点「经验记录」可以查某个时间有多少经验"
-        )
-        exp_row.addWidget(self.exp_checkbox)
-        self.exp_label = QLabel("经验: -")
-        self.exp_label.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Preferred)  # 数字变长也不撑宽窗口
-        exp_row.addWidget(self.exp_label, 1)
-        self.exp_history_btn = QPushButton("经验记录")
-        self.exp_history_btn.clicked.connect(self._show_exp_history)
-        exp_row.addWidget(self.exp_history_btn)
-        v.addLayout(exp_row)
-
-        # 拾取设置
-        pickup_row = QHBoxLayout()
-        self.pickup_checkbox = QCheckBox("自动拾取")
-        self.pickup_checkbox.setToolTip("勾选后自动按拾取键捡东西")
-        pickup_row.addWidget(self.pickup_checkbox)
-        pickup_row.addWidget(QLabel("拾取键:"))
-        self.pickup_key_edit = QLineEdit("z")
-        self.pickup_key_edit.setPlaceholderText("z")
-        self.pickup_key_edit.setFixedWidth(50)
-        pickup_row.addWidget(self.pickup_key_edit)
-        pickup_row.addWidget(QLabel("间隔(ms):"))
-        self.pickup_interval_spin = QSpinBox()
-        self.pickup_interval_spin.setRange(100, 2000)
-        self.pickup_interval_spin.setValue(333)
-        self.pickup_interval_spin.setSuffix("ms")
-        self.pickup_interval_spin.setToolTip("拾取间隔（毫秒），333ms=每秒3次")
-        self.pickup_interval_spin.setFixedWidth(80)
-        pickup_row.addWidget(self.pickup_interval_spin)
-        pickup_row.addStretch()
-        v.addLayout(pickup_row)
-
         # 技能表
         v.addWidget(QLabel("技能列表 (轮转释放):"))
         self.skill_table = QTableWidget(0, 3)
@@ -692,7 +663,7 @@ class MainWindow(QMainWindow):
             "开启自动打怪后定期按这些键（不移动、不看战斗状态）。\n"
             "间隔(秒) = 重新释放间隔，建议填略小于 buff 游戏内持续时间\n"
             "（如 180s 的 buff 填 170）。\n"
-            "注意：按键不要与技能/加血/加蓝/拾取键重复。"
+            "注意：按键不要与技能/加血/加蓝键重复。"
         )
         v.addWidget(self.buff_table)
 
@@ -724,7 +695,6 @@ class MainWindow(QMainWindow):
         self.conf_slider.setValue(int(c.confidence * 100))
         self.classes_edit.setText(c.monster_classes)
         self.fps_spin.setValue(c.fps)
-        self.name_edit.setText(c.self_name)
         self.hp_key_edit.setText(c.hp_key)
         self.hp_thr_spin.setValue(int(c.hp_threshold * 100))
         if c.hp_color:
@@ -809,18 +779,13 @@ class MainWindow(QMainWindow):
         self.minimap_region_label.setText(
             "已框选" if getattr(c, "minimap_region", None) else "未框选"
         )
-        # 换频道 / 定时结束 / 经验
+        # 换频道 / 定时结束
         self.channel_checkbox.setChecked(bool(getattr(c, "channel_enabled", False)))
         self.channel_idle_spin.setValue(int(getattr(c, "channel_idle_min", 3)))
         self.channel_hold_spin.setValue(int(getattr(c, "channel_hold_seconds", 5)))
         self.quit_checkbox.setChecked(bool(getattr(c, "quit_enabled", False)))
         quit_time = QTime.fromString(str(getattr(c, "quit_time", "06:00")), "HH:mm")
         self.quit_time_edit.setTime(quit_time if quit_time.isValid() else QTime(6, 0))
-        self.exp_checkbox.setChecked(bool(getattr(c, "exp_enabled", True)))
-        # 拾取
-        self.pickup_checkbox.setChecked(getattr(c, "pickup_enabled", True))
-        self.pickup_key_edit.setText(getattr(c, "pickup_key", "z"))
-        self.pickup_interval_spin.setValue(int(getattr(c, "pickup_interval", 0.333) * 1000))
         # 自动截图间隔（秒）
         self.screenshot_interval_spin.setValue(int(getattr(c, "screenshot_interval", 5)))
         # 技能表
@@ -849,7 +814,6 @@ class MainWindow(QMainWindow):
         c.confidence = self.conf_slider.value() / 100
         c.monster_classes = self.classes_edit.text().strip() or "monster"
         c.fps = self.fps_spin.value()
-        c.self_name = self.name_edit.text().strip()
         c.hp_key = self.hp_key_edit.text().strip()
         c.hp_threshold = self.hp_thr_spin.value() / 100
         # hp_color / mp_color 由框选区域时自动写入，此处不覆盖
@@ -882,17 +846,12 @@ class MainWindow(QMainWindow):
         # 活动范围
         c.range_start = float(self.range_start_spin.value())
         c.range_end = float(self.range_end_spin.value())
-        # 换频道 / 定时结束 / 经验
+        # 换频道 / 定时结束
         c.channel_enabled = self.channel_checkbox.isChecked()
         c.channel_idle_min = self.channel_idle_spin.value()
         c.channel_hold_seconds = self.channel_hold_spin.value()
         c.quit_enabled = self.quit_checkbox.isChecked()
         c.quit_time = self.quit_time_edit.time().toString("HH:mm")
-        c.exp_enabled = self.exp_checkbox.isChecked()
-        # 拾取
-        c.pickup_enabled = self.pickup_checkbox.isChecked()
-        c.pickup_key = self.pickup_key_edit.text().strip() or "z"
-        c.pickup_interval = self.pickup_interval_spin.value() / 1000.0
         c.screenshot_interval = self.screenshot_interval_spin.value()
         # 技能
         skills = []
@@ -1312,6 +1271,8 @@ class MainWindow(QMainWindow):
         )
         self._preview_timer.start(1000)
         self.preview_once_btn.setEnabled(False)
+        # 每轮开始重新统计，未读到 EXP 前先显示占位符（别留着上一轮的数字）
+        self.exp_label.setText(f"近{WINDOW_MINUTES}分钟经验: -")
 
     @pyqtSlot()
     def _on_lie_resume(self):
@@ -1555,7 +1516,7 @@ class MainWindow(QMainWindow):
             dot = getattr(self.automation, "_minimap_dot", None)
             if dot:
                 cv2.circle(disp, dot, 8, (0, 255, 0), 1)
-        # 自身位置：直接复用主循环已算好的缓存中心点（避免 UI 线程执行 OCR 卡死）
+        # 自身位置：直接复用主循环已算好的缓存中心点（避免 UI 线程重复跑检测）
         center = self.automation._get_last_center()
         if center:
             sx, sy = center
@@ -1581,11 +1542,10 @@ class MainWindow(QMainWindow):
         fps = self._fps_counter[0] / max(0.001, now - self._fps_counter[1])
         self._fps_counter = [0, now]
         self.fps_label.setText(f"FPS: {fps:.1f}")
-        if self.config.exp_enabled:
-            try:
-                self.exp_label.setText(self.automation.exp_summary())
-            except Exception:
-                pass
+        try:
+            self.exp_label.setText(self.automation.exp_summary())
+        except Exception:
+            pass
         if not self.automation.running:
             self._preview_timer.stop()
             self._show_stopped()  # 也可能是定时结束游戏/测谎自己停的

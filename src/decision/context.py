@@ -20,7 +20,7 @@
 
   ┌─────────────┐    ┌─────────────────────┐    ┌──────────────┐
   │  感知层      │ →  │  DecisionEngine     │ →  │ ActionExec   │
-  │ YOLO/OCR/HP │    │  (反应式决策 + FSM)  │    │ (方向键/技能) │
+  │ YOLO/HP/MP  │    │  (反应式决策 + FSM)  │    │ (方向键/技能) │
   └─────────────┘    └─────────────────────┘    └──────────────┘
 
 ================================================================================
@@ -48,7 +48,7 @@ Context 字段说明
   floors:         地板列表
   ropes:          绳索列表
   self_position:  自身脚底坐标 (cx, cy) 或 None
-  self_center:    自身角色中心点坐标 (cx, cy) 或 None（OCR 定位时记录）
+  self_center:    自身角色中心点坐标 (cx, cy) 或 None（YOLO player 框定位时记录）
   hp_ratio:       血量比例 0.0~1.0
   mp_ratio:       蓝量比例 0.0~1.0
   detections:     全部 YOLO 检测结果（含所有类别）
@@ -661,13 +661,12 @@ OCCLUSION_MAX_FRAMES = 300
 """
 
 SELF_POS_STALE_FRAMES = 60
-"""自身定位(OCR)连续失败的帧数上限（约 2 秒 @30fps）。
+"""自身定位连续失败的帧数上限（约 2 秒 @30fps）。
 
-站定攻击中角色位置不变，短时定位失败（技能特效遮挡角色名字/
-怪物名与角色名重叠/OCR 抖动）可用最后已知位置(_last_self_pos)
-继续攻击，避免"特效挡名字 → 放弃目标转探索 → 角色离开 →
-特效消失 → 重新定位"的反复空转；
-超过该帧数仍定位不到 → 判定真丢失，避免用过期坐标乱跑。
+站定攻击中角色位置不变，短时定位失败（技能特效遮挡角色/多人重叠/
+YOLO 抖动）可用最后已知位置(_last_self_pos)继续攻击，
+避免"特效遮挡 → 放弃目标转探索 → 角色离开 → 特效消失 → 重新定位"
+的反复空转；超过该帧数仍定位不到 → 判定真丢失，避免用过期坐标乱跑。
 """
 
 BLIND_CHASE_SECONDS = 2.0
@@ -727,8 +726,8 @@ EDGE_MARGIN = 80
 class Context:
     """感知层 → 决策层的数据载体（每帧一份）。
 
-    self_position 由 OCR 识别得到（窗口内坐标，脚底）。
-    self_center 为角色中心点（名字中心 - 人物高度一半，向上），用于距离推算。
+    self_position 由 YOLO player 框定位得到（窗口内坐标，脚底）。
+    self_center 为 player 框中心点，用于距离推算。
     """
     monsters: List[Detection] = field(default_factory=list)
     floors: List[Detection] = field(default_factory=list)
@@ -1443,10 +1442,10 @@ class DecisionEngine:
         foot = self._effective_self_pos(ctx)
         if foot is None:
             # 无法定位自身 → 默认无法判断贴脸，原地等待下一帧定位，
-            # 不切 IDLE 不转探索，避免 OCR 定位"时有时无"导致的高频抖动。
+            # 不切 IDLE 不转探索，避免自身定位"时有时无"导致的高频抖动。
             # 例外：目标仍在最后已知位置的贴脸范围内（近战贴脸怪基本不动，
             # 角色站定没走远）→ 直接用最后位置继续攻击，避免
-            # "怪已经连上(贴脸)但 OCR 恰好失败 → 角色干等不攻击"。
+            # "怪已经连上(贴脸)但自身恰好定位失败 → 角色干等不攻击"。
             if self._last_self_pos is not None \
                     and self._self_pos_stale_frames <= SELF_POS_STALE_FRAMES \
                     and abs(self._last_self_pos[0]
@@ -2715,9 +2714,9 @@ class DecisionEngine:
             return None
         if not self._in_combat():
             return None
-        # 用"有效位置"而非实时位置：贴脸时角色名字也可能被怪/攻击特效遮挡，
-        # OCR 定位失败 → ctx.self_position 为 None。攻击中角色位置不变，
-        # 用最后已知位置(_last_self_pos)兜底判遮挡，避免"怪被遮 + 名字被遮"
+        # 用"有效位置"而非实时位置：贴脸时 player 框也可能被怪/攻击特效遮挡，
+        # 自身定位失败 → ctx.self_position 为 None。攻击中角色位置不变，
+        # 用最后已知位置(_last_self_pos)兜底判遮挡，避免"怪被遮 + 自身被遮"
         # 同时发生时遮挡判定失败 → 清空锁定 → 转探索乱走的死循环。
         foot = self._effective_self_pos(ctx)
         if foot is None:
@@ -2868,11 +2867,11 @@ class DecisionEngine:
     def _effective_self_pos(self, ctx: Context) -> Optional[Tuple[int, int]]:
         """返回当前帧决策用的自身脚底坐标。
 
-        OCR 定位成功 → 实时坐标。
-        定位暂时失败（技能特效遮挡角色名字 / 怪物名与角色名重叠 /
-        OCR 抖动）但正处于【战斗中】(_in_combat) → 用最后已知位置兜底
+        YOLO 定位成功 → 实时坐标。
+        定位暂时失败（技能特效遮挡角色 / 多人重叠 / YOLO 抖动）
+        但正处于【战斗中】(_in_combat) → 用最后已知位置兜底
         （_last_self_pos，带 SELF_POS_STALE_FRAMES 时效）。
-        战斗中用旧坐标基本准确且安全，避免"特效挡名字 → 放弃目标 →
+        战斗中用旧坐标基本准确且安全，避免"自身被遮挡 → 放弃目标 →
         转探索乱走" 的反复空转。
         其余状态（探索/待命）定位失败 → 返回 None，
         由各调用方按原有逻辑处理（不盲打/不追错方向）。
@@ -3079,7 +3078,7 @@ class DecisionEngine:
         - 规则2: 攻击距离 = 角色x 与 怪物中心x 水平差 ≤ 当前生效攻击距离
           (长手/短手共用 attack_range)
         攻击中（FSM 处于 ATTACKING）且轻微超限时仍允许攻击，
-        避免 OCR/YOLO 帧间几像素抖动导致"攻击刚触发就中断、来回跑"。
+        避免 YOLO 帧间几像素抖动导致"攻击刚触发就中断、来回跑"。
         目标已明显离开（超过滞回窗口）才判定不可攻击。
         """
         foot = self._effective_self_pos(ctx)
@@ -3096,7 +3095,7 @@ class DecisionEngine:
         # 硬阈值：同平台 + 在攻击距离内
         if dx <= attack_range and dy <= ry:
             return True
-        # 滞回：攻击中轻微超出（怪物中心/bbox 波动、OCR 抖动、角色攻击位移）不中断
+        # 滞回：攻击中轻微超出（怪物中心/bbox 波动、YOLO 抖动、角色攻击位移）不中断
         # 滞回窗口: 长手 +60px (近战不走这里)
         if self._fsm.current == State.ATTACKING:
             if dx <= attack_range + 60 and dy <= ry + 40:
@@ -3510,7 +3509,7 @@ class DecisionEngine:
         if target is not None:
             foot = self._effective_self_pos(ctx)
             if foot is None:
-                # OCR 定位失败且不在站定攻击中 → 无法判断距离，放弃攻击
+                # 自身定位失败且不在站定攻击中 → 无法判断距离，放弃攻击
                 self._log("[攻击] 无法定位自身位置，放弃攻击")
                 return
             if not self._can_attack(ctx, target):

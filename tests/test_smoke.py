@@ -35,7 +35,6 @@ def engine(**overrides):
         "buff_skills": [],
         "knockback_skill": {},
         "stand_micro_move_enabled": False,
-        "pickup_enabled": False,
         # 活动范围钉死为不限制：Config 会合并本机 user.yaml，
         # 不钉的话本机设了范围（如 0~80）会泄漏进来，探索/打怪用例会被拦
         "range_start": 0.0, "range_end": 100.0,
@@ -80,6 +79,20 @@ class SmokeTests(unittest.TestCase):
                       self_position=(1000, GROUND))
         e.decide(ctx)
         self.assertNotIn("a", e.executor.keys())
+
+
+class RemovedConfigTests(unittest.TestCase):
+    """已移除的历史配置项（自身名字 / 自动拾取 / 经验开关）不应再进入运行配置。"""
+
+    def test_legacy_keys_are_dropped(self):
+        cfg = Config(overrides={
+            "self_name": "某角色", "self_offset": 85,
+            "pickup_enabled": True, "pickup_key": "z", "pickup_interval": 0.333,
+            "exp_enabled": True,
+        })
+        for key in ("self_name", "self_offset", "pickup_enabled", "pickup_key",
+                    "pickup_interval", "exp_enabled"):
+            self.assertFalse(hasattr(cfg, key), key)
 
 
 if __name__ == "__main__":

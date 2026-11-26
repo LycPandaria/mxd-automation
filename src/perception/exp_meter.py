@@ -1,4 +1,4 @@
-"""经验记录：定时读状态栏的 EXP 数字，算出这次打了多少、每小时多少，并按分钟写到 logs/exp_log/日期.csv。
+"""经验记录：定时读状态栏的 EXP 数字，算出最近 10 分钟获得了多少经验（单位：万），并按分钟写到 logs/exp_log/日期.csv。
 
 状态栏写着 "EXP 436935[23.57%]"，位置随窗口大小变，所以先找 "EXP" 这三个字母（游戏里是固定的白色点阵字），
 再用 OCR 只认它右边那一小块。主循环只把截图交过来，读数在后台线程做，不耽误打怪。
@@ -54,7 +54,9 @@ LOST_MIN_DROP = 0.1
 LOST_RETRY_READS = 6
 """连续这么多次没读到数字，就重新找一次 "EXP" 的位置"""
 RATE_WINDOW_SECONDS = 600
-"""「每小时」按最近这么久算（秒）"""
+"""「近10分钟」与「每小时」按最近这么久算（秒）"""
+WINDOW_MINUTES = RATE_WINDOW_SECONDS // 60
+"""界面显示的经验统计窗口（分钟）"""
 LOG_DIR = os.path.join(APP_DIR, "logs", "exp_log")
 """经验记录目录：统一放在 logs/ 下（打包后为 exe 同目录/logs/exp_log）"""
 CSV_HEADER = ["时间", "经验", "百分比", "本次累计获得", "比上一行多", "备注"]
@@ -145,6 +147,18 @@ class ExpTracker:
             return None
         then, gained = self._samples[0]
         return (self.gained - gained) * 3600 / (now - then)
+
+    def recent_gained(self) -> Optional[int]:
+        """最近 RATE_WINDOW_SECONDS 秒获得的经验；还没有可信读数返回 None。
+
+        样本只保留最近 10 分钟（见 _accept 的裁剪），所以 samples[0] 就在
+        窗口起点附近；运行不足 10 分钟时等于本次开始以来的获得量。
+        """
+        if self.exp is None:
+            return None
+        if not self._samples:
+            return 0
+        return self.gained - self._samples[0][1]
 
     def _confirmed(self, exp: int, pct: float, need: Tuple[float, float]) -> bool:
         if self._pending is None:
@@ -259,14 +273,13 @@ class ExpMeter:
         self._busy = True
         threading.Thread(target=self._read_in_background, args=(frame, now), daemon=True).start()
 
-    def summary(self, now: float) -> str:
+    def summary(self) -> str:
+        """界面显示：近 10 分钟获得的经验，单位「万」；还没读到返回占位符。"""
         with self._lock:
-            t = self.tracker
-            if t.exp is None:
-                return "经验: 还没读到（开始打怪后几秒）"
-            rate = t.rate_per_hour(now)
-            text = f"经验: {t.exp} ({t.pct:.2f}%)  本次 {t.gained:+d}"
-            return text + (f"  每小时 {rate:+.0f}" if rate is not None else "")
+            gained = self.tracker.recent_gained()
+            if gained is None:
+                return f"近{WINDOW_MINUTES}分钟经验: -"
+            return f"近{WINDOW_MINUTES}分钟经验: {gained / 10000:.2f}万"
 
     # ---- 后台读数 ----
 
