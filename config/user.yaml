@@ -4,14 +4,12 @@ reference_width: 1368
 reference_height: 800
 fps: 12
 keyboard_mode: sendinput
-confidence: 0.6
+confidence: 0.7
 model_path: F:/Game/mxd-automation/train/scripts/02_train_yolo/model/best.onnx
 monster_classes: monster
 floor_classes: floor
 rope_classes: rope
 player_classes: player
-self_name: 东乡一二三
-self_offset: 85
 hp_region:
 - 0.3389458272327965
 - 0.9661458333333334
@@ -25,29 +23,29 @@ hp_tolerance: 20
 hp_threshold: 0.01
 hp_key: end
 mp_region:
-- 0.4633967789165447
-- 0.9661458333333334
-- 0.1273792093704246
-- 0.032552083333333336
+- 0.46412884333821375
+- 0.9609375
+- 0.12005856515373353
+- 0.03125
 mp_color:
-- 6
-- 114
-- 201
+- 32
+- 150
+- 239
 mp_tolerance: 20
 mp_threshold: 0.01
-mp_key: pdn
+mp_key: '2'
 target_key: tab
 jump_key: alt
 attack_type: long
-attack_range: 300
+attack_range: 250
 attack_range_y: 29
 attack_min_range: 0
 attack_lock_seconds: 0.5
 knockback_skill:
   name: 击退技能
-  key: D
-  cooldown: 0.35
-  range: 150
+  key: d
+  cooldown: 0.5
+  range: 54
 ghost_casts: 6
 turn_mode: hold
 aoe_mode: hold
@@ -65,33 +63,29 @@ skills:
 - name: 连击
   key: a
   cooldown: 0.5
-- name: 爆炸箭
-  key: space
+- name: 箭雨
+  key: d
   cooldown: 0.5
 buff_skills:
 - name: 无形箭
-  key: '2'
+  key: '3'
   cooldown: 290.0
-pickup_enabled: false
-pickup_key: z
-pickup_interval: 0.333
 screenshot_interval: 1
 pixel_base_height: 768
 range_start: 10.0
 range_end: 90.0
 minimap_region:
-- 0.0036603221083455345
+- 0.0
 - 0.09635416666666667
-- 0.11200585651537336
-- 0.16666666666666666
+- 0.11273792093704246
+- 0.16145833333333334
 minimap_scale: 16
 channel_enabled: true
-channel_idle_min: 2
+channel_idle_min: 1
 channel_hold_key: right
 channel_hold_seconds: 5
 quit_enabled: true
-quit_time: 02:50
-exp_enabled: false
+quit_time: 05:50
 exp_read_seconds: 5
 exp_log_minutes: 10
 lie_detect_enabled: true
