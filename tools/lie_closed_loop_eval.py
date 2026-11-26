@@ -13,6 +13,9 @@
     准星正套在答案上，学会「找准星」的模型这里分数反而最高，不能单看；
   - 自己的录像，程序拿鼠标（同样的 --own）：真准星先补掉（clean_crosshairs），准星画在模型上一步算的位置，答案还是玩家准星。
     这才是接管时的样子；「自己的录像」分高、这里分低，就是模型在找准星。也不算「成功！」字出来之后的时间。
+自己的录像如果 replay_labels/<录像名>/frames.csv 有回放标注（tools/lie_replay_label.py 的输出），
+自动改用回放标注当答案（失败局只能这样评）；没有回放标注的失败局跳过（准星是程序放的，不能当答案）。
+加 --no-border-gate 关掉边界门，可以和改动前做 A/B。
 指标只算淡出以后：
   within_30 / within_60  程序位置离答案 30 / 60px 以内的步数比例
   longest_lost_s         离答案 60px 以上连续最长多少秒
@@ -181,12 +184,45 @@ def clean_recording(recording: Path):
     fps = shadow.RATE * step
     clean_crosshairs(boards, fps)
     last = max(i for i, b in enumerate(boards) if b is not None) - round(RESULT_CUT_S * fps)
-    return boards, aims, rows, step, last
+    return boards, aims, rows, step, last, (bx, by)
 
 
-def run_own_moved(model, cleaned, conf, shape=False):
-    """自己的录像，程序拿鼠标：准星画在模型上一步算的位置，答案是玩家当时的准星。"""
-    boards, aims, rows, step, last = cleaned
+def replay_truth(recording: Path, labels_root: Path, origin):
+    """回放标注当答案（画板坐标）：<labels_root>/<录像名>/frames.csv（tools/lie_replay_label.py 的输出）。
+    没有标注、或不是「记的就是人瞄的位置」的标注，返回 None。"""
+    label_dir = labels_root / recording.name
+    frames_csv, meta_path = label_dir / "frames.csv", label_dir / "meta.json"
+    if not frames_csv.is_file():
+        return None
+    meta = json.loads(meta_path.read_text(encoding="utf-8")) if meta_path.is_file() else {}
+    if meta.get("cursor_is_aim") is not True:
+        return None
+    bx, by = origin
+    truth = {}
+    with open(frames_csv, encoding="utf-8") as f:
+        for r in csv.DictReader(f):
+            if r["video_x"] and r.get("skip") != "1":
+                truth[int(r["frame"])] = (int(r["video_x"]) - bx, int(r["video_y"]) - by)
+    return truth
+
+
+def own_truth(recording: Path, labels_root: Path, origin, aims):
+    """这段录像的答案：有回放标注就用回放标注；否则只有通过局的准星能当答案（失败局的准星是程序放的）。
+    返回 (答案 dict 或 None, 来源)。"""
+    truth = replay_truth(recording, labels_root, origin)
+    if truth is not None:
+        return truth, "replay_label"
+    meta_path = recording / "meta.json"
+    meta = json.loads(meta_path.read_text(encoding="utf-8")) if meta_path.is_file() else {}
+    if "没看到通过" in meta.get("result", ""):
+        return None, "no_truth"  # 失败局的准星是程序放的，不能当答案
+    return aims, "cursor"
+
+
+def run_own_moved(model, cleaned, conf, shape=False, truth=None):
+    """自己的录像，程序拿鼠标：准星画在模型上一步算的位置，答案是 truth（回放标注或玩家准星）。"""
+    boards, aims, rows, step, last, _ = cleaned
+    truth = aims if truth is None else truth
     finder = make_finder(model, conf, shape)
     pred, seen, errors, box_stats = None, False, [], []
     for i in range(0, last + 1, step):
@@ -202,7 +238,7 @@ def run_own_moved(model, cleaned, conf, shape=False):
         spot = None if pred is None else pred.copy()
         drawn = board if spot is None else add_training_crosshair(board, spot)
         pred = finder.step(drawn, None if spot is None else shadow.find_crosshair(drawn, spot), float(rows[i]["seconds"]))
-        aim = aims.get(i)
+        aim = truth.get(i)
         if seen and not visible and aim is not None and pred is not None:
             errors.append(float(np.linalg.norm(pred - aim)))
             box_stats.append((bool(finder.boxes), all(np.linalg.norm(b[1] - aim) > NEAR_PX for b in finder.boxes)))
@@ -231,6 +267,7 @@ def main():
     p.add_argument("--own", type=Path, nargs="*", default=[], help="自己的录像目录（video.avi + frames.csv），缺的跳过")
     p.add_argument("--conf", type=float, default=.1, help="和挂机程序一样（lie_shadow_conf 默认 0.1）")
     p.add_argument("--shape", action="store_true", help="多比一行形状匹配（接管实际用的），第一个模型当它的后备")
+    p.add_argument("--no-border-gate", action="store_true", help="关掉边界门（A/B 验证用）")
     p.add_argument("--output", type=Path, required=True)
     args = p.parse_args()
 
@@ -241,6 +278,9 @@ def main():
         p.error("至少要一个 --model 或 --results")
     if args.shape:
         models.append((SHAPE_NAME, models[0][1]))
+    if args.no_border_gate:
+        shadow.BORDER_GATE_PENALTY = 0.
+        print("边界门：关（A/B）", flush=True)
     for name, path in models:
         print(f"模型 {name}: {path}（{shadow.model_input_kind(str(path))}）", flush=True)
 
@@ -260,11 +300,22 @@ def main():
         if r not in own:
             print(f"跳过（没有 video.avi / frames.csv）：{r}", flush=True)
 
-    result = {"conf": args.conf, "models": {n: str(m) for n, m in models}, "bought": {}, "own": {}, "own_moved": {}}
-    cleaned = {}
+    result = {"conf": args.conf, "border_gate": not args.no_border_gate, "models": {n: str(m) for n, m in models},
+              "bought": {}, "own": {}, "own_moved": {}, "own_truth": {}}
+    cleaned, truths = {}, {}
     for recording in own:
         print(f"补准星：{recording.name}", flush=True)
-        cleaned[recording.name] = clean_recording(recording)
+        boards, aims, rows, step, last, origin = clean_recording(recording)
+        truth, kind = own_truth(recording, args.labels, origin, aims)
+        if truth is None:
+            print(f"  跳过（失败局的准星不能当答案，也没有回放标注）：{recording.name}", flush=True)
+            continue
+        if kind == "replay_label":
+            last = min(last, max(truth))  # 回放标注只到淡出后一段，黑屏尾巴不用跑
+        cleaned[recording.name] = (boards, aims, rows, step, last, origin)
+        truths[recording.name] = (truth, kind)
+        result["own_truth"][recording.name] = kind
+        print(f"  答案：{'回放标注' if kind == 'replay_label' else '录像准星'}（{len(truth)} 帧）", flush=True)
     for name, model in models:
         use_shape = name == SHAPE_NAME
         for video_name, video in sorted(bought.items()):
@@ -272,10 +323,14 @@ def main():
             result["bought"].setdefault(video_name, {})[name] = s
             print(f"[买来] {video_name} {name}: {s}", flush=True)
         for recording in own:
-            s = run_own(model, recording, args.conf, use_shape)
-            result["own"].setdefault(recording.name, {})[name] = s
-            print(f"[自己] {recording.name} {name}: {s}", flush=True)
-            s = run_own_moved(model, cleaned[recording.name], args.conf, use_shape)
+            if recording.name not in truths:
+                continue
+            truth, kind = truths[recording.name]
+            if kind == "cursor":  # 玩家自己玩的局才有「真准星」这一栏
+                s = run_own(model, recording, args.conf, use_shape)
+                result["own"].setdefault(recording.name, {})[name] = s
+                print(f"[自己] {recording.name} {name}: {s}", flush=True)
+            s = run_own_moved(model, cleaned[recording.name], args.conf, use_shape, truth)
             result["own_moved"].setdefault(recording.name, {})[name] = s
             print(f"[自己，程序拿鼠标] {recording.name} {name}: {s}", flush=True)
     result["overall"] = {group: {name: overall({v: m.get(name) for v, m in result[group].items()})

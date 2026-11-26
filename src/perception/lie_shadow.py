@@ -475,6 +475,19 @@ MATCH_DECAY = .92
 MATCH_FREE_PX = 40
 MATCH_JUMP_COST = .05
 """离上一步超过 MATCH_FREE_PX 后，每多 1px 从分数里扣这么多，位置不会随便跳到远处的诱饵上"""
+DIAG_PEAK_SEP_PX = 30.
+"""shadow.csv 诊断列里 top2 峰至少离 top1 这么远（px）；挨着的算同一个峰"""
+BORDER_GATE_PX = 80.
+"""边界门：画板外圈这么宽（px）的峰，在上一步离那条边还远时扣分。目标每步只挪 5~10px，
+不可能从内部一步跳到外圈。右下角诱饵的响应峰不在 (694,448) 正中心：分数摊开后最热点能到
+(674,423)，离两边约 76px，所以门要盖到 80px（扣分区再加 MATCH_SPREAD_PX 的摊开宽度）。
+20261120_023051、20261123_035209、20261126_125952、20261126_133352 四局都是被它带走的。"""
+BORDER_GATE_FAR_PX = 120.
+"""上一步离某条边超过这么远，才把那条边的外圈扣分：扣分区 95px + 目标每步最多 10px，还留 25px 余量。
+目标真贴边时上一步已经在边上，那条边的门自动关掉，不误伤贴边跟踪。四条边分开算——目标贴着下边时，
+右边角的诱饵仍然要拦。"""
+BORDER_GATE_PENALTY = 20.
+"""边界门扣多少分：诱饵峰比淡出目标高 10~20 分，跳 500px 的代价只有约 10 分。"""
 WHITE_OVER_S = .5
 """白色图形消失这么久后不再认白色：它淡出后不会回来，再看到的白色是「成功！」字之类。
 量过：8 段实机录像的白色阶段中间都没断过 0.15 秒以上。"""
@@ -531,6 +544,7 @@ class ShapeFinder:
         self.white_at: Optional[float] = None  # 最后一次看到白色图形的时刻
         self._tpl_small = None  # 新的一局图形可能变了，重建
         self.source = ""  # 这一步的位置哪来的：wait（还在等白色图形，没有位置）/ white / shape / model
+        self.diag = {}  # 这一步的分数诊断（只写 shadow.csv，不影响位置）：top1/top2 峰和上一步位置处的分数
 
     def _small(self, board, erased):
         """半分辨率的画板和抹准星掩码（形状匹配专用的差分在这里算；白图/先验/抹准星都用全分辨率原图）。"""
@@ -542,6 +556,7 @@ class ShapeFinder:
 
     def step(self, board, aim, t: float):
         """board：裁好的画板图（可能带准星）；aim：准星中心（画板坐标）或 None；t：秒。返回目标位置，还没锁定返回 None。"""
+        self.diag = {}
         raw = board
         if self.started_at is None:
             self.started_at = t
@@ -582,10 +597,26 @@ class ShapeFinder:
         response = (response - response.mean()) / (response.std() + 1e-6)
         self.score = response if self.score is None else cv2.dilate(self.score, self.spread_small) * MATCH_DECAY + response
         ranked = self.score
-        if self.pos is not None:
+        prev = self.pos
+        if prev is not None:
             ranked = ranked - (MATCH_JUMP_COST / SHAPE_SCALE) * np.clip(
-                np.hypot(xs - self.pos[0] / SHAPE_SCALE, ys - self.pos[1] / SHAPE_SCALE) - MATCH_FREE_PX / SHAPE_SCALE, 0, None)
+                np.hypot(xs - prev[0] / SHAPE_SCALE, ys - prev[1] / SHAPE_SCALE) - MATCH_FREE_PX / SHAPE_SCALE, 0, None)
+            # 边界门：按四条边分别判断——上一步离这条边远，目标这一步就不可能跑到这条边的外圈。
+            # 扣分区加上分数摊开的宽度（MATCH_SPREAD_PX），免得诱饵峰的边沿从扣分区里探出来。
+            m = max(1, int(round((BORDER_GATE_PX + MATCH_SPREAD_PX) / SHAPE_SCALE)))
+            gated = np.zeros(ranked.shape, bool)
+            if prev[1] > BORDER_GATE_FAR_PX:
+                gated[:m, :] = True
+            if BOARD_SIZE[1] - prev[1] > BORDER_GATE_FAR_PX:
+                gated[-m:, :] = True
+            if prev[0] > BORDER_GATE_FAR_PX:
+                gated[:, :m] = True
+            if BOARD_SIZE[0] - prev[0] > BORDER_GATE_FAR_PX:
+                gated[:, -m:] = True
+            if gated.any():
+                ranked[gated] -= BORDER_GATE_PENALTY
         y, x = np.unravel_index(np.argmax(ranked), ranked.shape)
+        self.diag = self._diag(ranked, x, y, prev)
         # 半分辨率峰值局部 ×4 放大再取一次：定位精度损失从 2px 降到半像素以内
         x0, y0 = max(0, x - 2), max(0, y - 2)
         crop = ranked[y0:y0 + 5, x0:x0 + 5]
@@ -595,6 +626,21 @@ class ShapeFinder:
         fy = (y0 * SHAPE_SCALE + by2 * SHAPE_SCALE / 4.)
         self.pos = np.array([np.clip(fx, 0, w * SHAPE_SCALE - 1), np.clip(fy, 0, h * SHAPE_SCALE - 1)])
         return self.pos.copy()
+
+    def _diag(self, ranked, x, y, prev):
+        """给 shadow.csv 的分数诊断：top1/top2 峰（画板 px）和上一步位置处的分数。
+        只读 ranked，不改选峰和位置；下一次跟丢时直接看这几列就知道是不是被远处的诱饵峰带走了。"""
+        r = max(1, int(round(DIAG_PEAK_SEP_PX / 2 / SHAPE_SCALE)))
+        masked = ranked.copy()
+        masked[max(0, y - r):y + r + 1, max(0, x - r):x + r + 1] = float(ranked.min()) - 1e3
+        y2, x2 = np.unravel_index(np.argmax(masked), masked.shape)
+        diag = {"peak1": (x * SHAPE_SCALE, y * SHAPE_SCALE, float(ranked[y, x])),
+                "peak2": (x2 * SHAPE_SCALE, y2 * SHAPE_SCALE, float(masked[y2, x2]))}
+        if prev is not None:
+            py = min(max(int(round(prev[1] / SHAPE_SCALE)), 0), ranked.shape[0] - 1)
+            px = min(max(int(round(prev[0] / SHAPE_SCALE)), 0), ranked.shape[1] - 1)
+            diag["prev_score"] = float(ranked[py, px])
+        return diag
 
 
 CLICK_POLL_S = .01
@@ -731,7 +777,10 @@ class LieShadow:
             out = csv.writer(f)
             out.writerow(["frame", "seconds", "state", "board_left", "board_top", "pred_client_x",
                           "pred_client_y", "aim_client_x", "aim_client_y", "boxes", "top_conf", "infer_ms", "control",
-                          "source"])
+                          "source", "peak1_x", "peak1_y", "peak1_score", "peak2_x", "peak2_y", "peak2_score",
+                          "prev_score"])
+            # peak*/prev_score：形状匹配这一步的分数诊断（画板坐标 px；prev_score 是上一步位置处的分数）。
+            # 只在 source=shape 的步骤有值，其他步骤留空；位置和鼠标控制都不看这几列。
             while not self._stop.is_set():
                 tick = time.perf_counter()
                 with self._lock:
@@ -746,7 +795,7 @@ class LieShadow:
                 origin = board_box(frame)
                 if origin is None:
                     finder.reset()
-                    out.writerow([index, f"{t:.4f}", "no_board"] + [""] * 9 + [control, ""])
+                    out.writerow([index, f"{t:.4f}", "no_board"] + [""] * 9 + [control, ""] + [""] * 7)
                 else:
                     bx, by = origin
                     board = np.ascontiguousarray(frame[by:by + BOARD_SIZE[1], bx:bx + BOARD_SIZE[0]])
@@ -764,13 +813,21 @@ class LieShadow:
                     top = max((b[0] for b in boxes), default=None)
                     if pred is not None and aim is not None and control != "program":  # 程序拿着鼠标时准星就是它自己放的
                         gaps.append(float(np.linalg.norm(pred - aim)))
-                    out.writerow([index, f"{t:.4f}", "tracking" if pred is not None else "searching", bx, by,
-                                  "" if pred is None else round(pred[0] + bx, 1),
-                                  "" if pred is None else round(pred[1] + by, 1),
-                                  "" if aim is None else round(aim[0] + bx, 1),
-                                  "" if aim is None else round(aim[1] + by, 1),
-                                  len(boxes), "" if top is None else round(float(top), 3),
-                                  round(timings[-1], 1), control, finder.source])
+                    diag = finder.diag
+                    row = [index, f"{t:.4f}", "tracking" if pred is not None else "searching", bx, by,
+                           "" if pred is None else round(pred[0] + bx, 1),
+                           "" if pred is None else round(pred[1] + by, 1),
+                           "" if aim is None else round(aim[0] + bx, 1),
+                           "" if aim is None else round(aim[1] + by, 1),
+                           len(boxes), "" if top is None else round(float(top), 3),
+                           round(timings[-1], 1), control, finder.source]
+                    if diag:
+                        row += [int(round(diag["peak1"][0])), int(round(diag["peak1"][1])), round(diag["peak1"][2], 1),
+                                int(round(diag["peak2"][0])), int(round(diag["peak2"][1])), round(diag["peak2"][2], 1),
+                                round(diag["prev_score"], 1) if "prev_score" in diag else ""]
+                    else:
+                        row += [""] * 7
+                    out.writerow(row)
                     if pred is not None:
                         spot = offset.cursor_spot(pred)
                         go_to = (spot[0] + bx, spot[1] + by)
